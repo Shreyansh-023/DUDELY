@@ -15,26 +15,12 @@ export default function Transcript({ messages, status }: { messages: ChatMessage
 
   if (!visible.length) {
     return (
-      <div className="flex-1 overflow-y-auto px-4 py-5 text-sm text-neutral-500">
-        <p className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400">Try asking</p>
-        <ul className="mt-2.5 space-y-2">
-          {[
-            "Newton ka second law samjhao",
-            "Why is 2/4 the same as 1/2?",
-            "Photosynthesis kaise hota hai?",
-            "Solve x² − 5x + 6 = 0 with me",
-          ].map((q) => (
-            <li
-              key={q}
-              className="rounded-xl border border-neutral-200/80 bg-white px-3.5 py-2.5 text-[13px] text-neutral-700 shadow-sm transition hover:border-amber-200 hover:bg-amber-50/40"
-            >
-              “{q}”
-            </li>
-          ))}
-        </ul>
-        <p className="mt-4 rounded-xl bg-amber-50/80 px-3.5 py-2.5 text-xs leading-relaxed text-amber-800 ring-1 ring-amber-100">
-          Draw your attempt on the board, then ask “is this right?”. Guru looks at what you drew.
-        </p>
+      <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+        <span className="mb-3 text-4xl" aria-hidden>
+          🪔
+        </span>
+        <h2 className="text-xl font-semibold tracking-tight text-neutral-900">Good to see you</h2>
+        <p className="mt-1.5 text-sm text-neutral-500">What would you like to learn today?</p>
       </div>
     );
   }

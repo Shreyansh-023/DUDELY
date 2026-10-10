@@ -2,12 +2,13 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { DEFAULT_LANGUAGE, LANGUAGES } from "@/lib/languages";
+import { DEFAULT_LANGUAGE } from "@/lib/languages";
 import type { Beat, HistoryMessage, TutorEvent } from "@/lib/schema";
 import { AsyncQueue, uid } from "@/lib/utils";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
 import { fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
 import Composer from "./Composer";
+import LanguageMenu from "./LanguageMenu";
 import Transcript from "./Transcript";
 import { useVoiceLoop } from "./useVoiceLoop";
 import type { Board } from "./Whiteboard";
@@ -50,16 +51,6 @@ function writeLocal(key: string, value: string) {
   try {
     localStorage.setItem(key, value);
   } catch {}
-}
-
-function FaceIcon() {
-  return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <circle cx="12" cy="12" r="9" />
-      <path d="M9 10h.01M15 10h.01" />
-      <path d="M9 15c.8.7 1.9 1 3 1s2.2-.3 3-1" />
-    </svg>
-  );
 }
 
 function HamburgerIcon() {
@@ -497,35 +488,14 @@ export default function Tutor() {
           </div>
           <div className="min-w-0 flex-1">
             <h1 className="text-base font-semibold leading-tight tracking-tight text-neutral-900">Guru</h1>
-            <p className="truncate text-[11px] text-neutral-500">AI whiteboard tutor for Bharat</p>
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              setVoiceMode(true);
-              setChatPanelOpen(false);
-            }}
-            title="Voice mode — full board with a talking Guru"
-            aria-label="Enter voice mode"
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-amber-200 bg-amber-50 text-amber-700 shadow-sm transition hover:border-amber-300 hover:bg-amber-100 active:scale-95"
-          >
-            <FaceIcon />
-          </button>
-          <select
+          <LanguageMenu
             value={language}
-            onChange={(e) => {
-              setLanguage(e.target.value);
-              writeLocal("guru.language", e.target.value);
+            onChange={(code) => {
+              setLanguage(code);
+              writeLocal("guru.language", code);
             }}
-            className="max-w-[118px] rounded-lg border border-neutral-200 bg-white px-2 py-1.5 text-xs text-neutral-700 shadow-sm outline-none transition hover:border-neutral-300 focus:border-amber-400 focus:ring-2 focus:ring-amber-200"
-            aria-label="Language"
-          >
-            {LANGUAGES.map((l) => (
-              <option key={l.code} value={l.code}>
-                {l.native} · {l.label}
-              </option>
-            ))}
-          </select>
+          />
         </header>
 
         <div className="flex items-center gap-2 border-b border-neutral-200/80 px-3 py-1.5">
@@ -578,10 +548,15 @@ export default function Tutor() {
           status={status}
           interim={interim}
           disabled={!board || !config}
+          voiceMode={voiceMode}
           onSend={(t) => void ask(t)}
           // In voice mode the hands-free loop owns the mic; the button pauses/resumes it.
           onToggleMic={voiceMode ? (guruListening ? voice.pause : voice.resume) : toggleMic}
           onStop={stopTurn}
+          onEnterVoice={() => {
+            setVoiceMode(true);
+            setChatPanelOpen(false);
+          }}
         />
       </aside>
       )}

@@ -1,4 +1,4 @@
-import { toWhisperLang } from "@/lib/languages";
+import { toSarvamLang, toWhisperLang } from "@/lib/languages";
 
 export const maxDuration = 30;
 
@@ -37,8 +37,9 @@ export async function POST(req: Request) {
     const out = new FormData();
     out.append("file", audio, filename);
     out.append("model", process.env.SARVAM_STT_MODEL || "saaras:v4");
-    // Hinglish speakers usually pick "English / Hinglish"; let Sarvam auto-detect in that case.
-    out.append("language_code", language === "en-IN" || language === "auto" ? "unknown" : language);
+    // Hinglish speakers pick "Hinglish" (en-IN); let Sarvam auto-detect the code-mixing
+    // there. "English only" (en) forces the English model via toSarvamLang → en-IN.
+    out.append("language_code", language === "en-IN" || language === "auto" ? "unknown" : toSarvamLang(language));
     const r = await fetch("https://api.sarvam.ai/speech-to-text", {
       method: "POST",
       headers: { "api-subscription-key": sarvam },

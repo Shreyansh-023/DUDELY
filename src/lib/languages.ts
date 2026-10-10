@@ -4,7 +4,8 @@
  * the few differences are mapped in `toWebSpeechLang` / `toWhisperLang`.
  */
 export const LANGUAGES = [
-  { code: "en-IN", label: "English / Hinglish", native: "English" },
+  { code: "en", label: "English only", native: "English" },
+  { code: "en-IN", label: "English + Hindi", native: "Hinglish" },
   { code: "hi-IN", label: "Hindi", native: "हिन्दी" },
   { code: "bn-IN", label: "Bengali", native: "বাংলা" },
   { code: "ta-IN", label: "Tamil", native: "தமிழ்" },
@@ -25,14 +26,25 @@ export function isSupportedLanguage(code: string): code is LanguageCode {
   return LANGUAGES.some((l) => l.code === code);
 }
 
-/** Sarvam uses od-IN for Odia; browsers use or-IN. */
+/**
+ * Sarvam has no "generic English" code — its voices/models are keyed to en-IN.
+ * Pure English ("en") therefore uses the en-IN voice; only the LLM prompt differs.
+ */
+export function toSarvamLang(code: string): string {
+  return code === "en" ? "en-IN" : code;
+}
+
+/** Sarvam uses od-IN for Odia; browsers use or-IN. Pure English → en-US voice. */
 export function toWebSpeechLang(code: string): string {
-  return code === "od-IN" ? "or-IN" : code;
+  if (code === "od-IN") return "or-IN";
+  if (code === "en") return "en-US";
+  return code;
 }
 
 /** Whisper (Groq) wants ISO-639-1 two-letter codes. */
 export function toWhisperLang(code: string): string | undefined {
   const map: Record<string, string> = {
+    en: "en",
     "en-IN": "en",
     "hi-IN": "hi",
     "bn-IN": "bn",
@@ -58,6 +70,10 @@ export function languageLabel(code: string): string {
  * these never enter the chat transcript or the LLM history.
  */
 export const VOICE_PROMPTS: Record<LanguageCode, { greeting: string; reprompt: string }> = {
+  en: {
+    greeting: "Hello! What should we learn today?",
+    reprompt: "I didn't hear anything. What would you like to learn?",
+  },
   "en-IN": {
     greeting: "Hello! What should we learn today?",
     reprompt: "I didn't hear anything. What would you like to learn?",

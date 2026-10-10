@@ -31,6 +31,12 @@ export class BoardPlayer {
   private currentTurn = 0;
   /** The last turn we auto-recentered on, so we jump once at the start of each turn. */
   private recenteredTurn = 0;
+  /**
+   * When collision avoidance pushes a shape down, every later op in the same
+   * turn is shifted by the same amount, so a diagram keeps its internal layout
+   * (arrows drawn next still meet the shape where the model expected it).
+   */
+  private turnShift = { turn: 0, dy: 0 };
 
   constructor(private api: ExcalidrawImperativeAPI) {}
 
@@ -99,6 +105,7 @@ export class BoardPlayer {
       const next = this.all().map((e) => (e.isDeleted ? e : newElementWith(e, { isDeleted: true })));
       this.commit(next);
       this.idMap.clear();
+      this.turnShift = { turn: 0, dy: 0 };
       return [];
     }
     if (op.op === "erase") {
@@ -108,18 +115,33 @@ export class BoardPlayer {
       return [];
     }
 
+    // Carry forward any downward shift collision avoidance made earlier in this turn.
+    const shift = this.turnShift.turn === turn ? this.turnShift.dy : 0;
     const elementId = this.resolveId(op.id);
-    const skeleton = opToSkeleton(op, turn, elementId);
+    const skeleton = opToSkeleton(shiftOpDown(op, shift), turn, elementId);
     if (!skeleton) return [];
 
     const converted = convertToExcalidrawElements([skeleton], { regenerateIds: false });
     if (!converted.length) return [];
 
     // Shapes with labels come back as [container, boundText].
-    const rest = converted.slice(1);
-    // Keep free-standing text from landing on top of anything already drawn.
-    const primary: ExcalidrawElement =
-      converted[0].type === "text" ? this.avoidOverlap(converted[0] as ExcalidrawTextElement) : converted[0];
+    let rest = converted.slice(1);
+    let primary: ExcalidrawElement = converted[0];
+    if (primary.type === "text") {
+      // Keep free-standing text from landing on top of anything already drawn.
+      primary = this.avoidOverlap(primary as ExcalidrawTextElement);
+    } else if (op.op === "rect" || op.op === "ellipse" || op.op === "diamond") {
+      // Shapes dodge existing content too — and drag the rest of the turn with
+      // them, so arrows drawn next still connect where the model expected.
+      const dy = this.collisionShift(primary);
+      if (dy > 0) {
+        primary = newElementWith(primary, { y: primary.y + dy });
+        rest = rest.map((e) => newElementWith(e, { y: e.y + dy }));
+        this.turnShift = { turn, dy: shift + dy };
+      }
+    }
+    // Highlights and arrows/lines keep their coordinates: highlights overlay
+    // content on purpose, arrows deliberately touch the things they point at.
 
     if (primary.type === "text") {
       await this.typeText(primary as ExcalidrawTextElement, signal);
@@ -132,19 +154,33 @@ export class BoardPlayer {
   }
 
   /**
-   * Collision avoidance: if this element's box overlaps anything already on the
-   * board, push it straight down to just below the lowest thing it hits. Models
-   * pick absolute coordinates and often stack labels on the same row; this keeps
-   * the board readable no matter what coordinates arrive. Only free-standing text
-   * is relocated — shapes, arrows and their bound labels keep their coordinates so
-   * diagrams and the things they point at stay put.
+   * Collision avoidance: if this text's box overlaps anything already on the
+   * board, push it straight down to just below the lowest thing it hits.
    */
   private avoidOverlap(el: ExcalidrawTextElement): ExcalidrawTextElement {
+    const dy = this.collisionShift(el);
+    return dy > 0 ? newElementWith(el, { y: el.y + dy }) : el;
+  }
+
+  /**
+   * How far down (px) this element must move for its box to clear everything
+   * already on the board; 0 when it is already clear. Models pick absolute
+   * coordinates and often misjudge rendered sizes; this keeps the board
+   * readable no matter what coordinates arrive. Arrows and lines are not
+   * obstacles — they are thin, and labels/shapes legitimately sit on them.
+   */
+  private collisionShift(el: ExcalidrawElement): number {
     const gap = 14;
     const obstacles = this.all().filter(
-      (e) => !e.isDeleted && e.id !== el.id && e.width > 0 && e.height > 0,
+      (e) =>
+        !e.isDeleted &&
+        e.id !== el.id &&
+        e.type !== "arrow" &&
+        e.type !== "line" &&
+        e.width > 0 &&
+        e.height > 0,
     );
-    if (!obstacles.length) return el;
+    if (!obstacles.length) return 0;
 
     const x1 = el.x;
     const x2 = el.x + el.width;
@@ -165,7 +201,7 @@ export class BoardPlayer {
       y1 += dy;
       y2 += dy;
     }
-    return y1 === el.y ? el : newElementWith(el, { y: y1 });
+    return y1 - el.y;
   }
 
   /** Text: insert with empty text, then reveal characters. */
@@ -262,5 +298,14 @@ export class BoardPlayer {
     const next = this.all().map((e) => (e.isDeleted ? e : newElementWith(e, { isDeleted: true })));
     this.commit(next);
     this.idMap.clear();
+    this.turnShift = { turn: 0, dy: 0 };
   }
+}
+
+/** A copy of the op moved down by dy (start and end points alike). */
+function shiftOpDown(op: DrawOp, dy: number): DrawOp {
+  if (!dy) return op;
+  const out: DrawOp = { ...op, y: (op.y ?? 0) + dy };
+  if ((op.op === "arrow" || op.op === "line") && typeof op.y2 === "number") out.y2 = op.y2 + dy;
+  return out;
 }

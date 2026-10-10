@@ -1,4 +1,4 @@
-import { isSupportedLanguage } from "@/lib/languages";
+import { isSupportedLanguage, toSarvamLang } from "@/lib/languages";
 
 export const maxDuration = 30;
 
@@ -15,7 +15,7 @@ export async function POST(req: Request) {
   const clean = (text ?? "").trim();
   if (!clean) return new Response(null, { status: 204 });
 
-  const language_code = lang && isSupportedLanguage(lang) ? lang : "hi-IN";
+  const language_code = lang && isSupportedLanguage(lang) ? toSarvamLang(lang) : "hi-IN";
   const r = await fetch("https://api.sarvam.ai/text-to-speech", {
     method: "POST",
     headers: { "api-subscription-key": key, "content-type": "application/json" },

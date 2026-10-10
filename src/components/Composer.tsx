@@ -1,26 +1,48 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 type Props = {
   status: "idle" | "listening" | "transcribing" | "thinking" | "teaching";
   interim: string;
   disabled: boolean;
+  voiceMode: boolean;
   onSend: (text: string) => void;
   onToggleMic: () => void;
   onStop: () => void;
+  onEnterVoice: () => void;
 };
 
-export default function Composer({ status, interim, disabled, onSend, onToggleMic, onStop }: Props) {
+export default function Composer({
+  status,
+  interim,
+  disabled,
+  voiceMode,
+  onSend,
+  onToggleMic,
+  onStop,
+  onEnterVoice,
+}: Props) {
   const [text, setText] = useState("");
+  const taRef = useRef<HTMLTextAreaElement>(null);
   const listening = status === "listening";
   const busy = status === "thinking" || status === "teaching";
+  const hasText = text.trim().length > 0;
+
+  // Auto-grow the field like ChatGPT: one line at rest, up to a cap, then scroll.
+  const autosize = () => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  };
 
   const submit = () => {
     const t = text.trim();
     if (!t) return;
     onSend(t);
     setText("");
+    requestAnimationFrame(autosize);
   };
 
   return (
@@ -37,25 +59,16 @@ export default function Composer({ status, interim, disabled, onSend, onToggleMi
       {status === "transcribing" && (
         <div className="mb-2 rounded-lg bg-neutral-100 px-3 py-1.5 text-xs text-neutral-600">Transcribing…</div>
       )}
-      <div className="flex items-end gap-2">
-        <button
-          type="button"
-          onClick={onToggleMic}
-          disabled={disabled || status === "transcribing"}
-          aria-label={listening ? "Stop listening" : "Start listening"}
-          title={listening ? "Stop" : "Speak (or hold Space)"}
-          className={
-            "grid h-11 w-11 shrink-0 place-items-center rounded-full text-white shadow-md transition hover:scale-105 active:scale-95 disabled:opacity-40 disabled:hover:scale-100 " +
-            (listening
-              ? "bg-red-500 shadow-red-500/30 hover:bg-red-600"
-              : "bg-linear-to-b from-amber-400 to-amber-500 shadow-amber-500/30 hover:from-amber-500 hover:to-amber-600")
-          }
-        >
-          {listening ? <StopIcon /> : <MicIcon />}
-        </button>
+
+      {/* One rounded box, ChatGPT-style: the field and every control live inside it. */}
+      <div className="flex items-end gap-1 rounded-3xl border border-neutral-200 bg-white px-2 py-1.5 shadow-sm transition focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-200">
         <textarea
+          ref={taRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            autosize();
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
@@ -65,35 +78,69 @@ export default function Composer({ status, interim, disabled, onSend, onToggleMi
           rows={1}
           placeholder="Ask in Hindi, English, Tamil…"
           disabled={disabled}
-          className="min-h-11 max-h-32 flex-1 resize-none rounded-xl border border-neutral-200 bg-neutral-50 px-3.5 py-2.5 text-sm shadow-sm outline-none transition focus:border-amber-400 focus:bg-white focus:ring-2 focus:ring-amber-200 disabled:opacity-50"
+          className="min-h-9 max-h-40 flex-1 resize-none self-center bg-transparent px-2.5 py-2 text-sm leading-6 outline-none placeholder:text-neutral-400 disabled:opacity-50"
         />
+
+        {/* Mic — a quiet in-box control (push-to-talk / pause-resume in voice mode). */}
+        <button
+          type="button"
+          onClick={onToggleMic}
+          disabled={disabled || status === "transcribing"}
+          aria-label={listening ? "Stop listening" : "Start listening"}
+          title={listening ? "Stop" : "Speak (or hold Space)"}
+          className={
+            "grid h-9 w-9 shrink-0 place-items-center rounded-full transition active:scale-95 disabled:opacity-40 " +
+            (listening
+              ? "bg-red-500 text-white hover:bg-red-600"
+              : "text-neutral-500 hover:bg-neutral-100 hover:text-amber-600")
+          }
+        >
+          {listening ? <StopIcon /> : <MicIcon />}
+        </button>
+
+        {/* Primary action, same slot throughout:
+            busy → Stop · text typed → send (up-arrow) · empty → voice mode (waveform). */}
         {busy ? (
           <button
             type="button"
             onClick={onStop}
-            className="h-11 shrink-0 rounded-xl bg-neutral-800 px-4 text-sm font-medium text-white shadow-sm transition hover:bg-neutral-900 active:scale-95"
+            aria-label="Stop"
+            title="Stop"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-neutral-800 text-white transition hover:bg-neutral-900 active:scale-95"
           >
-            Stop
+            <SquareIcon />
           </button>
-        ) : (
+        ) : hasText ? (
           <button
             type="button"
             onClick={submit}
-            disabled={disabled || !text.trim()}
-            className="h-11 shrink-0 rounded-xl bg-amber-500 px-4 text-sm font-semibold text-white shadow-sm shadow-amber-500/30 transition hover:bg-amber-600 active:scale-95 disabled:opacity-40 disabled:hover:bg-amber-500"
+            disabled={disabled}
+            aria-label="Send"
+            title="Send"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-amber-500 text-white shadow-sm shadow-amber-500/30 transition hover:scale-105 hover:bg-amber-600 active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
           >
-            Ask
+            <ArrowUpIcon />
           </button>
-        )}
+        ) : !voiceMode ? (
+          <button
+            type="button"
+            onClick={onEnterVoice}
+            disabled={disabled}
+            aria-label="Voice mode"
+            title="Voice mode — full board with a talking Guru"
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-linear-to-b from-amber-500 to-amber-600 text-white shadow-sm shadow-amber-500/30 transition hover:scale-105 hover:from-amber-600 hover:to-amber-700 active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
+          >
+            <VoiceIcon />
+          </button>
+        ) : null}
       </div>
-      <p className="mt-1.5 text-[11px] text-neutral-400">Hold Space to talk · Esc to interrupt Guru</p>
     </div>
   );
 }
 
 function MicIcon() {
   return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
       <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
       <line x1="12" y1="19" x2="12" y2="23" />
@@ -104,8 +151,37 @@ function MicIcon() {
 
 function StopIcon() {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
       <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  );
+}
+
+function SquareIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+      <rect x="5" y="5" width="14" height="14" rx="2.5" />
+    </svg>
+  );
+}
+
+function ArrowUpIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="19" x2="12" y2="5" />
+      <path d="M6 11l6-6 6 6" />
+    </svg>
+  );
+}
+
+function VoiceIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <rect x="2.5" y="9" width="2" height="6" rx="1" />
+      <rect x="6.5" y="6.5" width="2" height="11" rx="1" />
+      <rect x="10.5" y="3.5" width="2" height="17" rx="1" />
+      <rect x="14.5" y="6.5" width="2" height="11" rx="1" />
+      <rect x="18.5" y="9" width="2" height="6" rx="1" />
     </svg>
   );
 }
