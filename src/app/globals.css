@@ -27,12 +27,50 @@ body {
   width: 100%;
 }
 
+/* The canvas is transparent so the premium `.board-surface` behind it shows
+   through and Guru draws on top of it. */
+.excalidraw,
+.excalidraw .excalidraw__canvas {
+  background: transparent !important;
+}
+
+/* Premium teaching surface: warm cream base, soft amber/orange glows in two
+   corners, and a faint dot grid that fades toward the edges — the "work
+   surface" look, kept low-contrast so Guru's writing stays the focus. Used
+   behind the board in both chat and voice mode. */
+.board-surface {
+  background-color: #fffdf7;
+  background-image:
+    radial-gradient(62% 55% at 16% 10%, rgba(251, 191, 36, 0.14), transparent 72%),
+    radial-gradient(58% 55% at 88% 92%, rgba(249, 115, 22, 0.1), transparent 72%);
+}
+.board-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(rgba(146, 93, 24, 0.16) 1.3px, transparent 1.4px);
+  background-size: 24px 24px;
+  -webkit-mask-image: radial-gradient(ellipse 78% 78% at 50% 42%, #000 58%, transparent 100%);
+  mask-image: radial-gradient(ellipse 78% 78% at 50% 42%, #000 58%, transparent 100%);
+  pointer-events: none;
+}
+
 /* The board runs in view mode: Excalidraw's hamburger menu (actions all disabled)
    and its shortcuts-help button only duplicate / clutter the app's own controls.
-   Zoom controls stay. Presentation only — nothing behind them is used. */
+   Presentation only — nothing behind them is used. */
 .excalidraw .main-menu-trigger,
 .excalidraw .help-icon {
   display: none !important;
+}
+
+/* Zoom controls (− 100% +) only belong on screen while Guru is teaching; the
+   wrapper gets the `guru-teaching` class then. Hidden at rest so the home
+   screen stays clean. */
+.excalidraw .zoom-actions {
+  display: none !important;
+}
+.guru-teaching .excalidraw .zoom-actions {
+  display: flex !important;
 }
 
 /* Slim, quiet scrollbars (chat panel, captions). */

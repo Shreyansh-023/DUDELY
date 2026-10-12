@@ -1,4 +1,5 @@
 import { streamText, type ModelMessage } from "ai";
+import type { Grade, SubjectId } from "@/lib/curriculum";
 import { detectProvider, getModel } from "@/lib/llm";
 import { mockLesson } from "@/lib/mock-lesson";
 import { buildSystemPrompt, buildUserTurn } from "@/lib/prompt";
@@ -24,6 +25,16 @@ export async function POST(req: Request) {
     return Response.json({ error: "Bad request", issues: parsed.error.issues }, { status: 400 });
   }
   const { messages, canvas, language, profile } = parsed.data;
+  const grade = (parsed.data.grade ?? null) as Grade | null;
+  const subject = (parsed.data.subject ?? null) as SubjectId | null;
+
+  // The chosen class + subject name one NCERT textbook. The RAG backend (built
+  // separately) uses this to restrict vector search to that book's embeddings.
+  // When that service is ready, derive the key with textbookKey(grade, subject),
+  // retrieve the top passages for the latest question, and pass them into
+  // buildSystemPrompt as a `context` argument.
+  // TODO(rag): const book = textbookKey(grade, subject);
+  //            const passages = book ? await retrieveTextbookContext(book, messages.at(-1)?.text) : [];
 
   if (detectProvider() === "mock") return mockResponse(messages, language);
 
@@ -34,7 +45,7 @@ export async function POST(req: Request) {
     return Response.json({ error: (err as Error).message }, { status: 500 });
   }
 
-  const system = buildSystemPrompt({ language, profile });
+  const system = buildSystemPrompt({ language, profile, grade, subject });
   const last = messages.length - 1;
   const modelMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };

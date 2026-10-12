@@ -10,6 +10,7 @@ import "@excalidraw/excalidraw/index.css";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 import { BoardPlayer } from "@/lib/canvas/player";
 import { isTutorElement, summarizeScene } from "@/lib/canvas/summary";
+import { LogoMark } from "./Logo";
 
 export type Board = {
   api: ExcalidrawImperativeAPI;
@@ -29,7 +30,9 @@ export default function Whiteboard({ onReady }: { onReady: (board: Board) => voi
       excalidrawAPI={(api) => onReady({ api, player: new BoardPlayer(api), isTutorElement, summarizeScene })}
       initialData={{
         appState: {
-          viewBackgroundColor: "#fffdf7",
+          // Transparent so the decorative `.board-surface` behind the canvas
+          // shows through; Guru's strokes are drawn on top of it.
+          viewBackgroundColor: "transparent",
           currentItemStrokeColor: "#1971c2",
           currentItemStrokeWidth: 2,
           currentItemFontFamily: 5,
@@ -51,9 +54,11 @@ export default function Whiteboard({ onReady }: { onReady: (board: Board) => voi
       <WelcomeScreen>
         <WelcomeScreen.Center>
           <WelcomeScreen.Center.Logo>
-            <span style={{ fontSize: 40 }}>🪔</span>
+            <span style={{ color: "#f59e0b", opacity: 0.38, display: "inline-flex" }}>
+              <LogoMark className="h-9 w-auto" />
+            </span>
           </WelcomeScreen.Center.Logo>
-          <WelcomeScreen.Center.Heading>Ask Guru anything — type or talk. Guru explains here on the board.</WelcomeScreen.Center.Heading>
+          <WelcomeScreen.Center.Heading>Ask Indica anything — type or talk. Indica explains here on the board.</WelcomeScreen.Center.Heading>
         </WelcomeScreen.Center>
       </WelcomeScreen>
     </Excalidraw>

@@ -7,6 +7,7 @@ type Props = {
   interim: string;
   disabled: boolean;
   voiceMode: boolean;
+  placeholder: string;
   onSend: (text: string) => void;
   onToggleMic: () => void;
   onStop: () => void;
@@ -18,6 +19,7 @@ export default function Composer({
   interim,
   disabled,
   voiceMode,
+  placeholder,
   onSend,
   onToggleMic,
   onStop,
@@ -46,7 +48,7 @@ export default function Composer({
   };
 
   return (
-    <div className="border-t border-neutral-200 bg-white/80 p-3 backdrop-blur">
+    <div className="p-3">
       {listening && (
         <div className="mb-2 flex items-center gap-2 rounded-lg bg-red-50 px-3 py-1.5 text-xs text-red-700">
           <span className="relative flex h-2 w-2">
@@ -61,7 +63,7 @@ export default function Composer({
       )}
 
       {/* One rounded box, ChatGPT-style: the field and every control live inside it. */}
-      <div className="flex items-end gap-1 rounded-3xl border border-neutral-200 bg-white px-2 py-1.5 shadow-sm transition focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-200">
+      <div className="flex items-end gap-1 rounded-3xl border border-amber-100 bg-white px-2 py-1.5 shadow-md shadow-amber-900/5 transition focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-200">
         <textarea
           ref={taRef}
           value={text}
@@ -76,7 +78,7 @@ export default function Composer({
             }
           }}
           rows={1}
-          placeholder="Ask in Hindi, English, Tamil…"
+          placeholder={placeholder}
           disabled={disabled}
           className="min-h-9 max-h-40 flex-1 resize-none self-center bg-transparent px-2.5 py-2 text-sm leading-6 outline-none placeholder:text-neutral-400 disabled:opacity-50"
         />
@@ -127,7 +129,7 @@ export default function Composer({
             onClick={onEnterVoice}
             disabled={disabled}
             aria-label="Voice mode"
-            title="Voice mode — full board with a talking Guru"
+            title="Voice mode — full board with a talking Indica"
             className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-linear-to-b from-amber-500 to-amber-600 text-white shadow-sm shadow-amber-500/30 transition hover:scale-105 hover:from-amber-600 hover:to-amber-700 active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
           >
             <VoiceIcon />

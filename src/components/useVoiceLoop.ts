@@ -28,6 +28,12 @@ export type VoicePhase = "off" | "greeting" | "listening" | "capturing" | "proce
 
 /** After this many unanswered re-prompts Guru goes quiet until tapped. */
 const MAX_REPROMPTS = 1;
+/**
+ * How many statement turns Guru may teach back-to-back before pausing to listen.
+ * The prompt asks a checkpoint question roughly every third turn, so this cap is
+ * only a safety net against a model that never stops to check in.
+ */
+const MAX_AUTO_CONTINUE = 8;
 /** Browser STT: abort if not even an interim result arrives within this window. */
 const NO_INTERIM_TIMEOUT_MS = 5000;
 
@@ -39,6 +45,10 @@ type Deps = {
   boardReady: boolean;
   hasConversation: boolean; // read once at entry: greet only on a fresh session
   ask: (text: string) => void;
+  /** True when the last turn ended on a statement and Guru should keep teaching. */
+  shouldContinue: () => boolean;
+  /** Ask the model to teach the next small step (a hidden, unspoken-by-student turn). */
+  continueLesson: () => void;
   setInterim: (t: string) => void;
   setError: (e: string | null) => void;
   configRef: RefObject<Config | null>;
@@ -68,6 +78,7 @@ export function useVoiceLoop(deps: Deps): {
   const browserRecRef = useRef<{ stop: () => void; abort: () => void } | null>(null);
   const noInterimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const repromptCountRef = useRef(0);
+  const autoContinueRef = useRef(0);
   const prevStatusRef = useRef<Status>("idle");
 
   const setPhase = useCallback((p: VoicePhase) => {
@@ -124,6 +135,7 @@ export function useVoiceLoop(deps: Deps): {
     (text: string, gen: number) => {
       if (gen !== genRef.current) return;
       repromptCountRef.current = 0;
+      autoContinueRef.current = 0; // the student spoke; start a fresh teaching run
       setPhase("processing"); // the resume effect listens again once the turn ends
       depsRef.current.ask(text);
     },
@@ -258,6 +270,7 @@ export function useVoiceLoop(deps: Deps): {
     greetAbortRef.current = null;
     cancelCapture();
     repromptCountRef.current = 0;
+    autoContinueRef.current = 0;
     setVoiceCaption(null);
     setPhase("off");
   }, [cancelCapture, setPhase]);
@@ -284,8 +297,16 @@ export function useVoiceLoop(deps: Deps): {
     prevStatusRef.current = deps.status;
     if (!deps.enabled) return;
     if (phase === "processing" && deps.status === "idle" && prev !== "idle") {
-      // Guru finished (or was interrupted) — the student's turn again.
-      void listenOnceRef.current(++genRef.current);
+      // Guru finished a turn. If it ended on a statement ("ready to continue"),
+      // keep teaching the next step instead of waiting for the student. If it
+      // ended on a question (or was interrupted), hand the floor back and listen.
+      if (autoContinueRef.current < MAX_AUTO_CONTINUE && depsRef.current.shouldContinue()) {
+        autoContinueRef.current += 1;
+        depsRef.current.continueLesson(); // stays in "processing"; we land back here when it ends
+      } else {
+        autoContinueRef.current = 0;
+        void listenOnceRef.current(++genRef.current);
+      }
     } else if (
       (phase === "listening" || phase === "capturing") &&
       (deps.status === "thinking" || deps.status === "teaching")
@@ -301,6 +322,7 @@ export function useVoiceLoop(deps: Deps): {
   const resume = useCallback(() => {
     if (!depsRef.current.enabled) return;
     repromptCountRef.current = 0;
+    autoContinueRef.current = 0;
     depsRef.current.setError(null);
     void listenOnceRef.current(++genRef.current);
   }, []);
@@ -310,6 +332,7 @@ export function useVoiceLoop(deps: Deps): {
     greetAbortRef.current?.abort();
     greetAbortRef.current = null;
     cancelCapture();
+    autoContinueRef.current = 0;
     setVoiceCaption(null);
     setPhase("paused");
   }, [cancelCapture, setPhase]);

@@ -1,14 +1,24 @@
+import { textbookLabel, type Grade, type SubjectId } from "./curriculum";
 import { languageLabel } from "./languages";
 
 /**
  * The tutor "mastery" system prompt. This is where the Dudely feel comes from:
  * the model is not allowed to answer, it has to diagnose, draw and ask.
  */
-export function buildSystemPrompt(opts: { language: string; profile: string }): string {
+export function buildSystemPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+}): string {
   const lang = `${languageLabel(opts.language)} (${opts.language})`;
   const profile = opts.profile.trim() || "Not provided. Infer the level from how the student talks and adapt.";
+  const book = textbookLabel(opts.grade ?? null, opts.subject ?? null);
+  const curriculum = book
+    ? `The student is studying ${book}. Pitch every explanation at NCERT Class ${opts.grade} level and keep examples and terminology aligned with that textbook. If the student asks about something outside this class/subject, help briefly but gently steer back to ${book}.`
+    : "The student has not picked a class and subject yet. Teach at a level you infer from how they talk, and you may invite them to pick their class and subject so you can follow their NCERT textbook.";
 
-  return `You are "Guru", a warm, patient, world-class tutor for Indian students (school up to early college). You teach LIVE on a shared whiteboard: you speak out loud and draw on the board at the same time, like a great teacher at a blackboard.
+  return `You are "Indica", a warm, patient, world-class tutor for Indian students (school up to early college). You teach LIVE on a shared whiteboard: you speak out loud and draw on the board at the same time, like a great teacher at a blackboard.
 
 # Core pedagogy (never break these)
 1. NEVER hand over the final answer when the student first asks. Teach so the student reaches it themselves.
@@ -68,6 +78,9 @@ Coordinates are absolute pixels. x grows to the right, y grows downward, (0,0) i
 {"say":"Yeh ek pizza hai jisko maine 4 barabar tukdon mein kaata.","lang":"hi-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
 {"say":"Tumne 2 tukde kha liye, matlab 2 by 4.","lang":"hi-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"khaye = 2 tukde of 4","color":"blue"}]}
 {"say":"Ab dekho, yeh highlighted hissa pure pizza ka kitna hai? Aadha, ya kam?","lang":"hi-IN","draw":[]}
+
+# Curriculum
+${curriculum}
 
 # Student profile
 ${profile}`;

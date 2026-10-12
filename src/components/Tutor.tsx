@@ -2,12 +2,15 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { DEFAULT_LANGUAGE } from "@/lib/languages";
+import { isGrade, isSubject, type Grade, type SubjectId } from "@/lib/curriculum";
+import { askPlaceholder, DEFAULT_LANGUAGE } from "@/lib/languages";
 import type { Beat, HistoryMessage, TutorEvent } from "@/lib/schema";
 import { AsyncQueue, uid } from "@/lib/utils";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
 import { fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
+import ClassSubjectPicker from "./ClassSubjectPicker";
 import Composer from "./Composer";
+import { LogoTile, Wordmark } from "./Logo";
 import LanguageMenu from "./LanguageMenu";
 import Transcript from "./Transcript";
 import { useVoiceLoop } from "./useVoiceLoop";
@@ -24,11 +27,20 @@ const Whiteboard = dynamic(() => import("./Whiteboard"), {
 // The 3D avatar (three.js) is browser-only too — load it on demand, only for voice mode.
 const Avatar = dynamic(() => import("./Avatar"), {
   ssr: false,
-  loading: () => <div className="grid h-full w-full place-items-center text-[11px] text-white/70">Loading Guru…</div>,
+  loading: () => <div className="grid h-full w-full place-items-center text-[11px] text-white/70">Loading Indica…</div>,
 });
 
 export type Status = "idle" | "listening" | "transcribing" | "thinking" | "teaching";
-export type ChatMessage = HistoryMessage & { id: string; pending?: boolean };
+// `hidden` messages are sent to the model but never rendered in the transcript —
+// used for the voice loop's silent "keep teaching" nudge after a statement turn.
+export type ChatMessage = HistoryMessage & { id: string; pending?: boolean; hidden?: boolean };
+
+// A statement turn ends "ready to continue"; a question turn ends on "?". We use
+// the last character of the spoken reply to tell the two apart.
+const isQuestionEnding = (t: string) => /[?？]\s*$/.test(t.trim());
+// Hidden user turn that asks the model to teach the next small step. Phrased as
+// plain language so the model (which mirrors the student's language) just carries on.
+const CONTINUE_NUDGE = "Continue to the next step.";
 type Config = { llm: string | null; stt: SttMode; tts: TtsMode };
 type QueuedBeat = { beat: Beat; audio: Promise<Blob | null> | null };
 
@@ -36,8 +48,8 @@ const STATUS_LABEL: Record<Status, string> = {
   idle: "Ready",
   listening: "Listening…",
   transcribing: "Transcribing…",
-  thinking: "Guru is thinking…",
-  teaching: "Guru is teaching…",
+  thinking: "Indica is thinking…",
+  teaching: "Indica is teaching…",
 };
 
 function readLocal(key: string, fallback: string): string {
@@ -72,15 +84,6 @@ function CloseIcon() {
   );
 }
 
-function UserIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <circle cx="12" cy="8" r="4" />
-      <path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5" />
-    </svg>
-  );
-}
-
 function PlusIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden>
@@ -104,8 +107,8 @@ export default function Tutor() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [config, setConfig] = useState<Config | null>(null);
   const [language, setLanguage] = useState<string>(DEFAULT_LANGUAGE);
-  const [profile, setProfile] = useState<string>("");
-  const [showProfile, setShowProfile] = useState(false);
+  const [grade, setGrade] = useState<Grade | null>(null);
+  const [subject, setSubject] = useState<SubjectId | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [interim, setInterim] = useState("");
   const [voiceMode, setVoiceMode] = useState(false); // avatar-only stage, chat hidden
@@ -116,7 +119,8 @@ export default function Tutor() {
   const messagesRef = useRef<ChatMessage[]>([]);
   const configRef = useRef<Config | null>(null);
   const languageRef = useRef(language);
-  const profileRef = useRef(profile);
+  const gradeRef = useRef(grade);
+  const subjectRef = useRef(subject);
   const statusRef = useRef<Status>("idle");
   const voiceModeRef = useRef(false);
   useEffect(() => {
@@ -124,13 +128,22 @@ export default function Tutor() {
     messagesRef.current = messages;
     configRef.current = config;
     languageRef.current = language;
-    profileRef.current = profile;
+    gradeRef.current = grade;
+    subjectRef.current = subject;
     statusRef.current = status;
     voiceModeRef.current = voiceMode;
-  }, [board, messages, config, language, profile, status, voiceMode]);
+  }, [board, messages, config, language, grade, subject, status, voiceMode]);
 
   const turnRef = useRef<AbortController | null>(null);
   const turnCounter = useRef(0);
+  // Spoken text accumulated for the in-flight turn, and a record of how the last
+  // turn ended — both read by the voice loop to decide listen-vs-keep-teaching.
+  const turnTextRef = useRef("");
+  const lastTurnRef = useRef<{ aborted: boolean; hadText: boolean; endedWithQuestion: boolean }>({
+    aborted: true,
+    hadText: false,
+    endedWithQuestion: false,
+  });
   const lastSeen = useRef(new Map<string, number>());
   const recorderRef = useRef<Recorder | null>(null);
   const browserRecRef = useRef<{ stop: () => void } | null>(null);
@@ -145,7 +158,10 @@ export default function Tutor() {
         if (cancelled) return;
         setConfig(c);
         setLanguage(readLocal("guru.language", DEFAULT_LANGUAGE));
-        setProfile(readLocal("guru.profile", ""));
+        const savedGrade = Number(readLocal("guru.grade", ""));
+        if (isGrade(savedGrade)) setGrade(savedGrade);
+        const savedSubject = readLocal("guru.subject", "");
+        if (isSubject(savedSubject)) setSubject(savedSubject);
       });
     return () => {
       cancelled = true;
@@ -166,6 +182,8 @@ export default function Tutor() {
     if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
     // Settle pending replies; drop ones that never got any text so no empty bubble lingers.
     setMessages((m) => m.flatMap((x) => (x.pending ? (x.text ? [{ ...x, pending: false }] : []) : [x])));
+    // An interrupted turn must not auto-continue: the student stopped it to speak.
+    lastTurnRef.current = { aborted: true, hadText: false, endedWithQuestion: false };
     setStatus("idle");
   }, []);
 
@@ -195,6 +213,9 @@ export default function Tutor() {
         setMessages((m) =>
           m.map((x) => (x.id === assistantId ? { ...x, text: x.text ? `${x.text} ${beat.say}` : beat.say } : x)),
         );
+        // Mirror the accumulating reply into a ref so the voice loop can inspect
+        // how this turn ended without waiting on the messages state to settle.
+        turnTextRef.current = turnTextRef.current ? `${turnTextRef.current} ${beat.say}` : beat.say;
         await Promise.all([player.applyBeat(beat.draw ?? [], turn, signal), speakBeat(beat, audio, signal)]);
       }
     },
@@ -202,13 +223,14 @@ export default function Tutor() {
   );
 
   const ask = useCallback(
-    async (rawText: string) => {
+    async (rawText: string, opts?: { hidden?: boolean }) => {
       const text = rawText.trim();
       const b = boardRef.current;
       if (!text || !b) return;
       stopTurn();
       setError(null);
       setInterim("");
+      turnTextRef.current = "";
 
       const ac = new AbortController();
       turnRef.current = ac;
@@ -224,7 +246,7 @@ export default function Tutor() {
       for (const e of studentEls) lastSeen.current.set(e.id, e.version);
       const canvas = b.summarizeScene(elements, new Set(changed.map((e) => e.id)));
 
-      const userMsg: ChatMessage = { id: uid("u"), role: "user", text };
+      const userMsg: ChatMessage = { id: uid("u"), role: "user", text, hidden: opts?.hidden };
       const assistantId = uid("a");
       const history = [...messagesRef.current.filter((m) => !m.pending), userMsg];
       setMessages([...history, { id: assistantId, role: "assistant", text: "", pending: true }]);
@@ -242,7 +264,10 @@ export default function Tutor() {
             messages: history.slice(-12).map((m) => ({ role: m.role, text: m.text })),
             canvas,
             language: lang,
-            profile: profileRef.current,
+            // Class + subject name the NCERT textbook; the RAG backend uses this
+            // pair to restrict retrieval to that book's embeddings.
+            grade: gradeRef.current,
+            subject: subjectRef.current,
           }),
         });
         if (!res.ok || !res.body) {
@@ -273,6 +298,14 @@ export default function Tutor() {
       await playing;
       if (turnRef.current === ac) {
         turnRef.current = null;
+        // Record how this turn ended so the voice loop can decide whether to
+        // listen (a question was asked) or keep teaching (a statement turn).
+        const finalText = turnTextRef.current;
+        lastTurnRef.current = {
+          aborted: false,
+          hadText: !!finalText.trim(),
+          endedWithQuestion: isQuestionEnding(finalText),
+        };
         // Same policy as stopTurn: a reply that produced no text (e.g. the model
         // errored out) disappears instead of leaving an empty bubble.
         setMessages((m) => m.flatMap((x) => (x.id === assistantId ? (x.text ? [{ ...x, pending: false }] : []) : [x])));
@@ -282,6 +315,15 @@ export default function Tutor() {
     [playQueue, stopTurn],
   );
 
+  // Voice-loop hooks: after a statement turn, keep teaching instead of waiting.
+  const continueLesson = useCallback(() => {
+    void ask(CONTINUE_NUDGE, { hidden: true });
+  }, [ask]);
+  const shouldContinueLesson = useCallback(() => {
+    const t = lastTurnRef.current;
+    return !t.aborted && t.hadText && !t.endedWithQuestion;
+  }, []);
+
   // Hands-free conversation loop for voice mode: greets, listens, end-points
   // the student's sentence, submits it, and listens again after each turn.
   const voice = useVoiceLoop({
@@ -290,6 +332,8 @@ export default function Tutor() {
     boardReady: !!board && !!config,
     hasConversation: messages.length > 0,
     ask,
+    shouldContinue: shouldContinueLesson,
+    continueLesson,
     setInterim,
     setError,
     configRef,
@@ -450,44 +494,30 @@ export default function Tutor() {
   const caption = studentSpeaking ? interim : (voice.voiceCaption ?? lastAssistant);
   const voiceChip =
     voice.phase === "greeting"
-      ? "Guru is speaking…"
+      ? "Indica is speaking…"
       : guruListening
         ? "Listening…"
         : voice.phase === "paused"
-          ? "Paused — tap Guru or press Space"
+          ? "Paused — tap Indica or press Space"
           : status === "thinking"
-            ? "Guru is thinking…"
+            ? "Indica is thinking…"
             : status === "teaching"
-              ? "Guru is teaching… · Esc to skip"
+              ? "Indica is teaching… · Esc to skip"
               : "One moment…";
 
   return (
     <main className="flex h-dvh w-full flex-col-reverse bg-neutral-100 md:flex-row">
       {/* Sidebar (chat). Always shown in normal mode; in voice mode only when reopened. */}
       {showChat && (
-      <aside className="flex h-[42dvh] w-full shrink-0 flex-col border-t border-neutral-200 bg-neutral-50 md:h-full md:w-[380px] md:border-r md:border-t-0">
-        <header className="flex items-center gap-2.5 border-b border-neutral-200/80 bg-white/70 px-3 py-2.5 backdrop-blur">
-          <div
-            className="relative grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-linear-to-br from-amber-100 to-orange-100 text-lg ring-1 ring-amber-200/70"
-            title={STATUS_LABEL[status]}
-          >
-            <span aria-hidden>🪔</span>
-            {/* Status dot replaces the old provider/status bar — color only, no model names. */}
-            <span
-              role="status"
-              aria-label={STATUS_LABEL[status]}
-              className={
-                "absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-white " +
-                (status === "idle"
-                  ? "bg-emerald-500"
-                  : status === "listening"
-                    ? "animate-pulse bg-red-500"
-                    : "animate-pulse bg-amber-500")
-              }
-            />
+      <aside className="flex h-[42dvh] w-full shrink-0 flex-col border-t border-amber-100/80 bg-linear-to-b from-[#fffdf8] via-[#fdfaf2] to-[#fbf5ea] md:h-full md:w-[384px] md:border-r md:border-t-0">
+        <header className="flex items-center gap-2.5 border-b border-amber-100/70 bg-linear-to-b from-white/85 to-white/45 px-3.5 py-3 backdrop-blur-md">
+          <div className="h-9 w-9 shrink-0 overflow-hidden rounded-xl shadow-sm shadow-orange-500/25 ring-1 ring-black/5">
+            <LogoTile className="h-full w-full" />
           </div>
           <div className="min-w-0 flex-1">
-            <h1 className="text-base font-semibold leading-tight tracking-tight text-neutral-900">Guru</h1>
+            <h1 className="text-[1.15rem] leading-none">
+              <Wordmark />
+            </h1>
           </div>
           <LanguageMenu
             value={language}
@@ -498,17 +528,17 @@ export default function Tutor() {
           />
         </header>
 
-        <div className="flex items-center gap-2 border-b border-neutral-200/80 px-3 py-1.5">
-          <button
-            type="button"
-            onClick={() => setShowProfile((s) => !s)}
-            className="flex min-w-0 items-center gap-1.5 rounded-full px-2 py-1 text-[11px] font-medium text-amber-700 transition hover:bg-amber-50"
-          >
-            <UserIcon />
-            <span className="truncate">
-              {showProfile ? "Hide student profile" : profile ? `Student: ${profile.slice(0, 40)}` : "Set student profile"}
-            </span>
-          </button>
+        <div className="flex items-center gap-2 border-b border-amber-100/60 px-3.5 py-2">
+          <ClassSubjectPicker
+            grade={grade}
+            subject={subject}
+            onChange={(next) => {
+              setGrade(next.grade);
+              setSubject(next.subject);
+              writeLocal("guru.grade", next.grade == null ? "" : String(next.grade));
+              writeLocal("guru.subject", next.subject ?? "");
+            }}
+          />
           <button
             type="button"
             onClick={newTopic}
@@ -517,19 +547,6 @@ export default function Tutor() {
             <PlusIcon /> New topic
           </button>
         </div>
-        {showProfile && (
-          <div className="border-b border-neutral-200 px-3 py-2">
-            <input
-              value={profile}
-              onChange={(e) => {
-                setProfile(e.target.value);
-                writeLocal("guru.profile", e.target.value);
-              }}
-              placeholder="e.g. Class 10 CBSE, preparing for boards, weak in algebra"
-              className="w-full rounded-lg border border-neutral-200 bg-white px-2.5 py-1.5 text-xs shadow-sm outline-none transition focus:border-amber-400 focus:ring-2 focus:ring-amber-200"
-            />
-          </div>
-        )}
 
         {error && (
           <div className="mx-3 mt-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs leading-relaxed text-red-700 shadow-sm">
@@ -549,6 +566,7 @@ export default function Tutor() {
           interim={interim}
           disabled={!board || !config}
           voiceMode={voiceMode}
+          placeholder={askPlaceholder(language)}
           onSend={(t) => void ask(t)}
           // In voice mode the hands-free loop owns the mic; the button pauses/resumes it.
           onToggleMic={voiceMode ? (guruListening ? voice.pause : voice.resume) : toggleMic}
@@ -565,7 +583,9 @@ export default function Tutor() {
           so right-anchored overlays never get pushed off-screen. In voice mode
           (md+) the board stops before Guru's rail so writing never hides behind him. */}
       <section className="relative min-h-0 min-w-0 flex-1">
-        <div className={"absolute inset-0" + (voiceMode ? " md:right-60" : "")}>
+        {/* Premium teaching surface painted behind the (transparent) canvas. */}
+        <div aria-hidden className="board-surface pointer-events-none absolute inset-0" />
+        <div className={"absolute inset-0" + (voiceMode ? " md:right-60" : "") + (status === "teaching" ? " guru-teaching" : "")}>
           <Whiteboard onReady={onReady} />
         </div>
         {busy && !voiceMode && (
@@ -573,11 +593,11 @@ export default function Tutor() {
             {STATUS_LABEL[status]} <span className="opacity-60">· Esc to interrupt</span>
           </div>
         )}
-        {board && (
+        {board && status === "teaching" && (
           <button
             type="button"
             onClick={() => board.player.recenter()}
-            title="Jump to where Guru is teaching"
+            title="Jump to where Indica is teaching"
             className={
               "absolute right-3 z-10 flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium shadow ring-1 ring-black/5 backdrop-blur transition hover:brightness-105 " +
               (voiceMode ? "top-16 md:top-3 md:right-63 " : "top-3 ") +
@@ -588,7 +608,7 @@ export default function Tutor() {
               <circle cx="12" cy="12" r="3.5" />
               <path d="M12 2v3.5M12 18.5V22M2 12h3.5M18.5 12H22" />
             </svg>
-            Jump to Guru
+            Jump to Indica
           </button>
         )}
 

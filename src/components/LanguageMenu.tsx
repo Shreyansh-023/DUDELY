@@ -47,7 +47,7 @@ export default function LanguageMenu({ value, onChange }: { value: string; onCha
       {open && (
         <ul
           role="listbox"
-          className="absolute right-0 z-50 mt-1.5 max-h-[min(60vh,22rem)] w-56 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-1 shadow-xl ring-1 ring-black/5"
+          className="absolute right-0 z-50 mt-1.5 max-h-[min(60vh,22rem)] w-44 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-1 shadow-xl ring-1 ring-black/5"
         >
           {LANGUAGES.map((l) => {
             const active = l.code === value;

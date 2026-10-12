@@ -93,3 +93,26 @@ export const VOICE_PROMPTS: Record<LanguageCode, { greeting: string; reprompt: s
 export function voicePrompts(code: string): { greeting: string; reprompt: string } {
   return VOICE_PROMPTS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
 }
+
+/**
+ * Composer placeholder, written in the script of the selected language so the
+ * input invites the student in the language they chose.
+ */
+export const ASK_PLACEHOLDERS: Record<LanguageCode, string> = {
+  en: "Ask anything…",
+  "en-IN": "Kuch bhi poocho…",
+  "hi-IN": "कुछ भी पूछें…",
+  "bn-IN": "যা খুশি জিজ্ঞাসা করুন…",
+  "ta-IN": "எதையும் கேளுங்கள்…",
+  "te-IN": "ఏదైనా అడగండి…",
+  "mr-IN": "काहीही विचारा…",
+  "gu-IN": "કંઈપણ પૂછો…",
+  "kn-IN": "ಏನಾದರೂ ಕೇಳಿ…",
+  "ml-IN": "എന്തും ചോദിക്കൂ…",
+  "pa-IN": "ਕੁਝ ਵੀ ਪੁੱਛੋ…",
+  "od-IN": "ଯାହା ବି ପଚାରନ୍ତୁ…",
+};
+
+export function askPlaceholder(code: string): string {
+  return ASK_PLACEHOLDERS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}

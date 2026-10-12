@@ -103,6 +103,10 @@ export const TutorRequestSchema = z.object({
   canvas: z.string().default(""),
   /** Session language, BCP-47 (en-IN, hi-IN, ...). */
   language: z.string().default("en-IN"),
+  /** NCERT class 1-12 the student picked, or null if not chosen yet. */
+  grade: z.number().int().min(1).max(12).nullish(),
+  /** Subject the student picked. Values mirror SUBJECTS in lib/curriculum. */
+  subject: z.enum(["maths", "science"]).nullish(),
   /** Free text about the student: "Class 10, CBSE, weak in algebra". */
   profile: z.string().default(""),
 });
