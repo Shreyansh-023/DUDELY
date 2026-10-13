@@ -114,7 +114,8 @@ export type TutorRequest = z.infer<typeof TutorRequestSchema>;
 
 /** NDJSON events streamed from /api/tutor to the browser. */
 export type TutorEvent =
-  | { type: "meta"; model: string }
+  // sources: textbook passages that grounded this turn (for debugging; the UI ignores it)
+  | { type: "meta"; model: string; sources?: string[] }
   | { type: "beat"; beat: Beat }
   | { type: "done" }
   | { type: "error"; message: string };

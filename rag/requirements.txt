@@ -1,0 +1,4 @@
+# Offline ingestion for textbook RAG (see rag/common.py). Runtime retrieval is in src/lib/rag.ts.
+# Also needs Ollama with: gemma4:e4b (page transcription) and bge-m3 (embeddings).
+pymupdf>=1.24
+httpx>=0.27

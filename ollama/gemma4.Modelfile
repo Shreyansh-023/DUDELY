@@ -1,0 +1,12 @@
+# Local Gemma 4 for the tutor, with a larger context window.
+#
+# Ollama's OpenAI-compatible endpoint (which the app uses) runs models with a 4096-token
+# context by default, and that endpoint cannot change it per request. The tutor's system
+# prompt alone is ~2,700 tokens, so a reply, conversation history and textbook passages
+# would overflow 4096 and be silently cut. This variant raises the window to 16384.
+#
+#   ollama create dudely-gemma4 -f ollama/gemma4.Modelfile
+#   LLM_PROVIDER=ollama LLM_MODEL=dudely-gemma4 npm run dev
+
+FROM gemma4:e4b
+PARAMETER num_ctx 16384

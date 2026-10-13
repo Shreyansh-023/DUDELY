@@ -1,5 +1,6 @@
 import { textbookLabel, type Grade, type SubjectId } from "./curriculum";
-import { languageLabel } from "./languages";
+import { languageLabel, replyLanguage } from "./languages";
+import type { Passage } from "./rag";
 
 /**
  * The tutor "mastery" system prompt. This is where the Dudely feel comes from:
@@ -39,6 +40,7 @@ export function buildSystemPrompt(opts: {
 - Session language: ${lang}.
 - If the session language is "English only" (en), ALWAYS reply in plain English, no matter how the student writes — never Hindi, never Hinglish.
 - Otherwise mirror the student's language AND script exactly. Hinglish in Latin script -> reply in Hinglish in Latin script. Devanagari in -> Devanagari out. Tamil in -> Tamil out. If the student has not spoken yet, use the session language.
+- The student's message ends with a REPLY LANGUAGE line worked out from the session language and the script the student typed in. Follow it exactly for every \`say\`.
 - Technical terms may stay in English, the way Indian teachers speak ("velocity", "numerator").
 - \`say\` is spoken by a text-to-speech voice: natural speech only. No markdown, no bullets, no asterisks, no LaTeX, no "step 1:" labels. Read formulas as words: "F equals m into a", "x square plus two x".
 - Board text (\`draw\`) can be in English or the student's language. Keep math in standard symbols.
@@ -78,6 +80,16 @@ Coordinates are absolute pixels. x grows to the right, y grows downward, (0,0) i
 {"say":"Yeh ek pizza hai jisko maine 4 barabar tukdon mein kaata.","lang":"hi-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
 {"say":"Tumne 2 tukde kha liye, matlab 2 by 4.","lang":"hi-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"khaye = 2 tukde of 4","color":"blue"}]}
 {"say":"Ab dekho, yeh highlighted hissa pure pizza ka kitna hai? Aadha, ya kam?","lang":"hi-IN","draw":[]}
+# If the student had written in Devanagari, every say would be in Devanagari too. Same first beat:
+{"say":"अच्छा, चलो इसे पिज़्ज़ा से समझते हैं।","lang":"hi-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
+
+# Textbook passages
+When the student's message includes a TEXTBOOK block, it holds passages from their NCERT textbook, found for this question.
+- Keep definitions, formulas, method names, notation and terminology the same as the book. Call a method by the book's name for it.
+- Refer to a book example, exercise or section only if it appears in the passages, with its number exactly as written there. Never invent example, exercise, section or page numbers.
+- Passages marked ANSWER KEY are for checking the student's work only. Never read a final answer out of them.
+- Passages may be partly or wholly off-topic: use only what helps and never mention the search itself.
+- Keep teaching your way (diagnose, draw, ask). The passages are reference material, not a script to read aloud.
 
 # Curriculum
 ${curriculum}
@@ -86,8 +98,34 @@ ${curriculum}
 ${profile}`;
 }
 
-/** Builds the CANVAS block appended to the latest user message. */
-export function buildUserTurn(opts: { text: string; canvas: string }): string {
+/**
+ * Builds the latest user message: the student's text, the CANVAS block, and a short
+ * reminder of the two rules models most often drift from (reply language, first-beat
+ * length). The reminder sits last because models weight the end of the prompt most.
+ */
+export function buildUserTurn(opts: {
+  text: string;
+  canvas: string;
+  language: string;
+  textbook?: Passage[];
+}): string {
   const canvas = opts.canvas.trim() || "(board is empty)\nSuggested top-left for new content: (80, 80)";
-  return `${opts.text.trim()}\n\n---\nCANVAS\n${canvas}`;
+  const reply = replyLanguage(opts.language, opts.text);
+  const textbook = opts.textbook?.length ? `\n\n---\nTEXTBOOK\n${formatPassages(opts.textbook)}` : "";
+  // The reply language is stated before the student's text as well as at the end: with
+  // textbook passages in between, small models lose track of a rule stated only once.
+  return (
+    `(Reply in: ${reply})\n${opts.text.trim()}\n\n---\nCANVAS\n${canvas}${textbook}\n\n---\n` +
+    `REPLY LANGUAGE: ${reply}. The first beat's say must be under 10 words.`
+  );
+}
+
+/**
+ * Numbered passages for the TEXTBOOK block. Page numbers are deliberately left out:
+ * the index stores PDF page positions, which differ from the numbers printed in the book.
+ */
+function formatPassages(passages: Passage[]): string {
+  return passages
+    .map((p, i) => `[${i + 1}] ${p.kind === "answers" ? "ANSWER KEY: " : ""}${p.label}\n${p.text}`)
+    .join("\n\n");
 }

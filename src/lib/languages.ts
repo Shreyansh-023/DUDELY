@@ -64,6 +64,73 @@ export function languageLabel(code: string): string {
   return LANGUAGES.find((l) => l.code === code)?.label ?? code;
 }
 
+/** Unicode blocks of the Indic scripts the tutor supports, with the language each one implies. */
+const SCRIPTS: { name: string; re: RegExp; language: string }[] = [
+  { name: "Devanagari", re: /[ऀ-ॿ]/g, language: "Hindi" },
+  { name: "Bengali", re: /[ঀ-৿]/g, language: "Bengali" },
+  { name: "Gurmukhi", re: /[਀-੿]/g, language: "Punjabi" },
+  { name: "Gujarati", re: /[઀-૿]/g, language: "Gujarati" },
+  { name: "Odia", re: /[଀-୿]/g, language: "Odia" },
+  { name: "Tamil", re: /[஀-௿]/g, language: "Tamil" },
+  { name: "Telugu", re: /[ఀ-౿]/g, language: "Telugu" },
+  { name: "Kannada", re: /[ಀ-೿]/g, language: "Kannada" },
+  { name: "Malayalam", re: /[ഀ-ൿ]/g, language: "Malayalam" },
+];
+
+/** Common Hindi words as they are typed in Latin script; two or more mark a message as Hinglish. */
+const HINGLISH_WORDS = new Set(
+  ("kya hai hain hota hoti hote kaise kaisa kyun kyon kyu ka ki ke ko se mein aur nahi nahin " +
+    "samjhao samjha samjhaiye batao bataiye karo karte karna yeh ye woh wo matlab kitna kitne kaun " +
+    "kab kahan chahiye sakte raha rahe rahi tha thi accha achha haan bhai na")
+    .split(" "),
+);
+
+/**
+ * The language and script the tutor should reply in for this turn, worked out from
+ * the session language and how the student wrote. Stated explicitly in every turn,
+ * because smaller models do not reliably infer "mirror the student" on their own.
+ */
+export function replyLanguage(sessionCode: string, studentText: string): string {
+  if (sessionCode === "en") return "English";
+
+  const letters = studentText.match(/\p{L}/gu)?.length ?? 0;
+  const dominant = SCRIPTS.map((s) => ({ ...s, n: studentText.match(s.re)?.length ?? 0 })).sort(
+    (a, b) => b.n - a.n,
+  )[0];
+  if (letters > 0 && dominant.n / letters >= 0.3) {
+    const language = dominant.name === "Devanagari" && sessionCode === "mr-IN" ? "Marathi" : dominant.language;
+    return `${language}, written in ${dominant.name} script${scriptExample(language)}`;
+  }
+
+  const wordsTyped = studentText.toLowerCase().match(/[a-z]+/g) ?? [];
+  const hindiWords = new Set(wordsTyped.filter((w) => HINGLISH_WORDS.has(w))).size;
+  if (wordsTyped.length > 0) {
+    if (hindiWords >= 2) return "Hinglish: Hindi written in Latin letters, with maths terms in English";
+    if (sessionCode === "en-IN" || sessionCode === "hi-IN") return "English";
+    // e.g. a Tamil session typed in Latin letters: Tanglish and plain English look alike here.
+    return `the language the student wrote in, in Latin letters (plain English if they wrote in English)`;
+  }
+
+  // Nothing typed yet (e.g. a voice turn that came through empty): use the session language.
+  if (sessionCode === "en-IN") return "Hinglish: Hindi written in Latin letters, with maths terms in English";
+  const script = { "hi-IN": "Devanagari", "mr-IN": "Devanagari" }[sessionCode];
+  const label = languageLabel(sessionCode);
+  return script ? `${label}, written in ${script} script${scriptExample(label)}` : label;
+}
+
+/**
+ * A one-line example in the target script. Small models copy the (Hinglish) examples in
+ * the system prompt and keep speaking in Latin letters; an in-script sample fixes that.
+ */
+function scriptExample(language: string): string {
+  const examples: Record<string, string> = {
+    Hindi: "अच्छा, चलो इसे बोर्ड पर समझते हैं।",
+    Marathi: "बरं, चला हे बोर्डवर समजून घेऊया.",
+  };
+  const ex = examples[language];
+  return ex ? `, every say in this script (like "${ex}"), not in Latin letters` : "";
+}
+
 /**
  * What Guru says out loud in hands-free voice mode: the opening question when
  * there is no conversation yet, and the nudge after 5s of silence. Spoken only —
