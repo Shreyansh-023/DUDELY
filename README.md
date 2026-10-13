@@ -6,7 +6,7 @@ question before moving on. Draw your own attempt on the board and Guru looks at 
 
 ```
 Next.js 16 (App Router) · Excalidraw canvas · Vercel AI SDK 7 (Gemini / Groq / OpenAI / Claude)
-Sarvam AI for Indic speech (Saaras v4 STT, Bulbul v3 TTS) with free browser fallbacks
+Sarvam AI for Indic speech (Saaras v4 STT, Bulbul v4 Flash TTS) with free browser fallbacks
 ```
 
 ## Run it
@@ -78,7 +78,7 @@ plus a JPEG of the region the student just changed, and sends both. The model ca
 | `src/lib/canvas/summary.ts` | Board → text summary; student-region snapshot for vision |
 | `src/lib/voice/stt.ts`, `tts.ts` | Mic recording / Web Speech fallback; audio playback / speechSynthesis fallback |
 | `src/app/api/tutor` | Streams NDJSON beats from the LLM (`Output.array` + `elementStream`) |
-| `src/app/api/stt`, `tts` | Sarvam Saaras v4 / Groq Whisper; Sarvam Bulbul v3 |
+| `src/app/api/stt`, `tts` | Sarvam Saaras v4 / Groq Whisper; Sarvam Bulbul v4 Flash |
 | `src/components/Tutor.tsx` | Orchestrator: turn lifecycle, beat queue, barge-in, push-to-talk |
 | `src/components/Whiteboard.tsx` | Client-only Excalidraw wrapper |
 
@@ -130,8 +130,10 @@ LLM_PROVIDER=anthropic LLM_MODEL=claude-sonnet-5-5
 - Dudely: live whiteboard + voice + "checks that you actually understand before it moves on";
   free tier 10 min/day ([f4.fund](https://f4.fund/startups/dudely)).
 - Sarvam AI: STT `saaras:v4` (22 Indic languages + Indian/Global English, auto-detect via
-  `language_code=unknown`), realtime `saaras:v3-realtime` over WebSocket; TTS `bulbul:v3` stable
-  with 30+ voices, `output_audio_codec` mp3/wav/opus ([docs.sarvam.ai](https://docs.sarvam.ai)).
+  `language_code=unknown`), realtime `saaras:v3-realtime` over WebSocket; TTS `bulbul:v4-flash`
+  (~1/3 the cost of v3, ₹1/1K chars) with 200+ voices and pace/pitch/loudness control. Personas are
+  `name_language_style` ids (e.g. `ishita_hi_edtech`), `output_audio_codec` mp3/wav/flac/aac
+  ([docs.sarvam.ai](https://docs.sarvam.ai)).
 - Gemini: `gemini-3.8-flash` is the current stable Flash, `gemini-3.8-live` the Live API model,
   `gemini-3.5-flash` / `-lite` cheaper legacy ([ai.google.dev](https://ai.google.dev/gemini-api/docs/models)).
 - Groq: `llama-3.3-70b-versatile`, `openai/gpt-oss-120b`; STT `whisper-large-v3-turbo`

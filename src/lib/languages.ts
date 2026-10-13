@@ -34,6 +34,43 @@ export function toSarvamLang(code: string): string {
   return code === "en" ? "en-IN" : code;
 }
 
+/**
+ * Which Sarvam TTS model + voice to use per language.
+ *
+ * Bulbul v4-flash is ~1/3 the cost of v3 (₹1 vs ₹3 /1K chars) and adds pitch +
+ * loudness control, but its personas are language-tagged (name_language_style)
+ * and it has NO voices yet for Tamil, Malayalam, Odia or Punjabi — those four
+ * fall back to v3, whose shared voices cover all 11 languages. Personas are
+ * female education/conversational voices to match the tutor.
+ *
+ * A global override is still available: setting SARVAM_TTS_MODEL and/or
+ * SARVAM_TTS_SPEAKER forces that value for every language (see /api/tts).
+ */
+export type SarvamVoice = { model: string; speaker: string };
+
+const V3_FALLBACK: SarvamVoice = { model: "bulbul:v3", speaker: "priya" };
+
+const TTS_VOICES: Record<LanguageCode, SarvamVoice> = {
+  en: { model: "bulbul:v4-flash", speaker: "aparna_en_edtech" },
+  "en-IN": { model: "bulbul:v4-flash", speaker: "sanchita_enhi_companion" },
+  "hi-IN": { model: "bulbul:v4-flash", speaker: "ishita_hi_edtech" },
+  "bn-IN": { model: "bulbul:v4-flash", speaker: "roopa_bn_conversational" },
+  "te-IN": { model: "bulbul:v4-flash", speaker: "kavitha_te_conversation" },
+  "mr-IN": { model: "bulbul:v4-flash", speaker: "ishita_mr_conversational" },
+  "gu-IN": { model: "bulbul:v4-flash", speaker: "pooja_gu_conversational" },
+  "kn-IN": { model: "bulbul:v4-flash", speaker: "chaitra_kn_conversation" },
+  // No suitable v4-flash persona yet — v3 covers these languages.
+  "ta-IN": V3_FALLBACK,
+  "ml-IN": V3_FALLBACK,
+  "pa-IN": V3_FALLBACK,
+  "od-IN": V3_FALLBACK,
+};
+
+/** TTS model + voice for a language, falling back to the default language's voice. */
+export function sarvamVoice(code: string): SarvamVoice {
+  return TTS_VOICES[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
 /** Sarvam uses od-IN for Odia; browsers use or-IN. Pure English → en-US voice. */
 export function toWebSpeechLang(code: string): string {
   if (code === "od-IN") return "or-IN";
