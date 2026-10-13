@@ -3,11 +3,12 @@
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isGrade, isSubject, type Grade, type SubjectId } from "@/lib/curriculum";
-import { askPlaceholder, DEFAULT_LANGUAGE } from "@/lib/languages";
+import { askPlaceholder, DEFAULT_LANGUAGE, voicePrompts } from "@/lib/languages";
 import type { Beat, HistoryMessage, TutorEvent } from "@/lib/schema";
 import { AsyncQueue, uid } from "@/lib/utils";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
 import { fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
+import { isPlaybackPaused, pausePlayback, resumePlayback } from "@/lib/voice/playback";
 import ClassSubjectPicker from "./ClassSubjectPicker";
 import Composer from "./Composer";
 import { LogoTile, Wordmark } from "./Logo";
@@ -75,15 +76,6 @@ function HamburgerIcon() {
   );
 }
 
-function CloseIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden>
-      <line x1="6" y1="6" x2="18" y2="18" />
-      <line x1="18" y1="6" x2="6" y2="18" />
-    </svg>
-  );
-}
-
 function PlusIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden>
@@ -101,6 +93,103 @@ function PlayIcon() {
   );
 }
 
+function PauseIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <rect x="6.5" y="5" width="4" height="14" rx="1.2" />
+      <rect x="13.5" y="5" width="4" height="14" rx="1.2" />
+    </svg>
+  );
+}
+
+// ---- subtitle helpers ------------------------------------------------------
+
+/** Clip to one subtitle line, keeping the END (live interim speech grows there). */
+function tailOf(s: string): string {
+  return s.length > 52 ? "…" + s.slice(-52).trimStart() : s;
+}
+
+/** Breaks a sentence into subtitle-sized word groups (≈42 chars per line). */
+function chunkCaption(text: string): string[][] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const chunks: string[][] = [];
+  let line: string[] = [];
+  let len = 0;
+  for (const w of words) {
+    if (line.length && len + 1 + w.length > 42) {
+      chunks.push(line);
+      line = [];
+      len = 0;
+    }
+    line.push(w);
+    len += (len ? 1 : 0) + w.length;
+  }
+  if (line.length) chunks.push(line);
+  return chunks;
+}
+
+/**
+ * One subtitle line of the sentence being spoken: shows only the chunk that
+ * contains the current word, with that word highlighted — spoken words in ink,
+ * upcoming words muted, like karaoke. Height never changes. When the chunk is
+ * wider than the strip (phones, wide scripts), the active word is scrolled to
+ * the centre so the highlight is always on screen.
+ */
+function KaraokeLine({ text, word }: { text: string; word: number }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const activeRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    const active = activeRef.current;
+    if (!wrap) return;
+    if (!active) {
+      wrap.scrollLeft = 0;
+      return;
+    }
+    // Centre the spoken word; a strip wide enough for the whole chunk has no
+    // scroll range, so this is a no-op there.
+    wrap.scrollLeft = Math.max(0, active.offsetLeft - (wrap.clientWidth - active.offsetWidth) / 2);
+  }, [text, word]);
+
+  const chunks = chunkCaption(text);
+  let lineStart = 0;
+  let line: string[] | null = null;
+  for (const c of chunks) {
+    if (word < lineStart + c.length) {
+      line = c;
+      break;
+    }
+    lineStart += c.length;
+  }
+  if (!line) {
+    line = chunks[chunks.length - 1] ?? [];
+    lineStart -= line.length;
+  }
+  return (
+    <div ref={wrapRef} className="relative overflow-hidden whitespace-nowrap text-center">
+      {line.map((w, i) => {
+        const idx = lineStart + i;
+        return (
+          <span
+            key={idx}
+            ref={idx === word ? activeRef : undefined}
+            className={
+              idx === word
+                ? "font-medium text-amber-700"
+                : idx < word
+                  ? "text-neutral-500"
+                  : "text-neutral-400"
+            }
+          >
+            {i > 0 ? " " : ""}
+            {w}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function Tutor() {
   const [board, setBoard] = useState<Board | null>(null);
   const [status, setStatus] = useState<Status>("idle");
@@ -112,7 +201,17 @@ export default function Tutor() {
   const [error, setError] = useState<string | null>(null);
   const [interim, setInterim] = useState("");
   const [voiceMode, setVoiceMode] = useState(false); // avatar-only stage, chat hidden
+  // The sentence being spoken right now and how far the voice has got into it.
+  // Set at playback start (never earlier), advanced word-by-word, cleared at turn
+  // end. `id` ties updates to one beat, so two beats with identical text (a
+  // repeated "ठीक है?") can never advance each other's caption.
+  const [liveCaption, setLiveCaption] = useState<{ id: number; text: string; word: number } | null>(null);
+  const capSeqRef = useRef(0);
   const [chatPanelOpen, setChatPanelOpen] = useState(false); // in voice mode, the hamburger brings chat back
+  // The student froze Guru mid-sentence (voice is paused, not stopped) and a
+  // resume carries on from the same spot. Listening is paused through the voice
+  // loop's own "paused" phase instead, so this is only ever true while speaking.
+  const [speechPaused, setSpeechPaused] = useState(false);
 
   // Latest values for use inside async callbacks (kept in sync in an effect, never during render).
   const boardRef = useRef<Board | null>(null);
@@ -123,6 +222,8 @@ export default function Tutor() {
   const subjectRef = useRef(subject);
   const statusRef = useRef<Status>("idle");
   const voiceModeRef = useRef(false);
+  const chatPanelOpenRef = useRef(false);
+  const speechPausedRef = useRef(false);
   useEffect(() => {
     boardRef.current = board;
     messagesRef.current = messages;
@@ -132,7 +233,9 @@ export default function Tutor() {
     subjectRef.current = subject;
     statusRef.current = status;
     voiceModeRef.current = voiceMode;
-  }, [board, messages, config, language, grade, subject, status, voiceMode]);
+    chatPanelOpenRef.current = chatPanelOpen;
+    speechPausedRef.current = speechPaused;
+  }, [board, messages, config, language, grade, subject, status, voiceMode, chatPanelOpen, speechPaused]);
 
   const turnRef = useRef<AbortController | null>(null);
   const turnCounter = useRef(0);
@@ -180,22 +283,73 @@ export default function Tutor() {
     turnRef.current?.abort();
     turnRef.current = null;
     if (typeof window !== "undefined" && "speechSynthesis" in window) window.speechSynthesis.cancel();
+    // Interrupting clears any freeze so the next turn isn't born paused.
+    resumePlayback();
+    setSpeechPaused(false);
     // Settle pending replies; drop ones that never got any text so no empty bubble lingers.
     setMessages((m) => m.flatMap((x) => (x.pending ? (x.text ? [{ ...x, pending: false }] : []) : [x])));
     // An interrupted turn must not auto-continue: the student stopped it to speak.
     lastTurnRef.current = { aborted: true, hadText: false, endedWithQuestion: false };
+    setLiveCaption(null);
     setStatus("idle");
   }, []);
 
   const speakBeat = useCallback(async (beat: Beat, audio: Promise<Blob | null> | null, signal: AbortSignal) => {
-    if (!beat.say.trim()) return;
+    const say = beat.say.trim();
+    if (!say) return;
     const lang = beat.lang || languageRef.current;
-    if (audio) {
-      const blob = await audio;
-      if (signal.aborted) return;
-      if (blob) return playBlob(blob, signal);
+    const nWords = say.split(/\s+/).length;
+    const id = ++capSeqRef.current;
+    // Advance the caption only while this exact beat is still the live one
+    // (a later beat or stopTurn may have replaced it).
+    const advance = (word: number) =>
+      setLiveCaption((c) =>
+        c && c.id === id ? { id, text: say, word: Math.max(c.word, Math.min(nWords - 1, word)) } : c,
+      );
+    // Some browser engines report no progress at all (Chrome's Google-hosted
+    // voices fire no boundary events), so a steady ~150wpm pacer keeps the
+    // highlight moving on that path only. We never run it alongside real audio:
+    // the pacer is faster than most speech, and via max() it would otherwise
+    // drag the highlight ahead of the voice — the visible lag we're avoiding.
+    let est = 0;
+    let pacer: ReturnType<typeof setInterval> | null = null;
+    const begin = () => setLiveCaption({ id, text: say, word: 0 });
+    const startPacer = () => {
+      pacer = setInterval(() => {
+        if (!isPlaybackPaused()) advance(++est); // freeze the karaoke with the voice
+      }, 380);
+    };
+    try {
+      if (audio) {
+        const blob = await audio;
+        if (signal.aborted) return;
+        if (blob) {
+          // Caption appears the moment the voice starts, never before. Sarvam has
+          // no word timestamps, so pace words by elapsed fraction of the audio —
+          // this is the sole driver here, so the highlight tracks the real voice.
+          begin();
+          await playBlob(blob, signal, (f) => advance(Math.floor(f * nWords)));
+        } else {
+          begin();
+          startPacer();
+          // Browser TTS word boundaries: chars before the boundary = words spoken.
+          await speakBrowser(say, lang, signal, (charIndex) =>
+            advance(say.slice(0, charIndex).split(/\s+/).filter(Boolean).length),
+          );
+        }
+      } else {
+        begin();
+        startPacer();
+        await speakBrowser(say, lang, signal, (charIndex) =>
+          advance(say.slice(0, charIndex).split(/\s+/).filter(Boolean).length),
+        );
+      }
+    } finally {
+      if (pacer) clearInterval(pacer);
+      // Speech is over: push the word index past the end so no word renders as
+      // "being spoken" while the beat's drawing animation finishes.
+      setLiveCaption((c) => (c && c.id === id ? { id, text: say, word: nWords } : c));
     }
-    return speakBrowser(beat.say, lang, signal);
   }, []);
 
   /** Consumer: plays beats in order, drawing and speaking each one concurrently. */
@@ -244,7 +398,11 @@ export default function Tutor() {
       const studentEls = elements.filter((e) => !b.isTutorElement(e));
       const changed = studentEls.filter((e) => (lastSeen.current.get(e.id) ?? -1) < e.version);
       for (const e of studentEls) lastSeen.current.set(e.id, e.version);
-      const canvas = b.summarizeScene(elements, new Set(changed.map((e) => e.id)));
+      // Slide/paging: start this turn on a fresh page below previous turns, unless
+      // the student just drew (then stay on their page). The summary is reported in
+      // the same page-local frame the player will place this turn's content in.
+      b.player.advancePage(changed.length > 0);
+      const canvas = b.summarizeScene(elements, new Set(changed.map((e) => e.id)), b.player.pageShift);
 
       const userMsg: ChatMessage = { id: uid("u"), role: "user", text, hidden: opts?.hidden };
       const assistantId = uid("a");
@@ -309,7 +467,11 @@ export default function Tutor() {
         // Same policy as stopTurn: a reply that produced no text (e.g. the model
         // errored out) disappears instead of leaving an empty bubble.
         setMessages((m) => m.flatMap((x) => (x.id === assistantId ? (x.text ? [{ ...x, pending: false }] : []) : [x])));
+        setLiveCaption(null);
         setStatus("idle");
+        // The turn ran to the end, so nothing was frozen — drop any stale freeze.
+        resumePlayback();
+        setSpeechPaused(false);
       }
     },
     [playQueue, stopTurn],
@@ -419,8 +581,32 @@ export default function Tutor() {
     else void startListening();
   }, [startListening, stopListening]);
 
-  // Space = push-to-talk (normal mode) / resume (voice mode, paused). Esc = interrupt.
-  const { pause: voicePause, resume: voiceResume } = voice;
+  const { pause: voicePause, resume: voiceResume, listen: voiceListen } = voice;
+
+  // The avatar's stop/resume switch — distinct from "awaiting an answer".
+  // Speaking → freeze the voice in place (resume carries on from the same word).
+  // Listening → stop listening (the loop's own "paused" phase). Paused → undo it.
+  // Awaiting an answer or idle → nothing to pause, so this is a no-op (listening
+  // begins only on Enter).
+  const toggleAvatarPause = useCallback(() => {
+    const phase = voicePhaseRef.current;
+    const listening = phase === "listening" || phase === "capturing";
+    const speaking = statusRef.current === "teaching" || statusRef.current === "thinking" || phase === "greeting";
+    if (speechPausedRef.current) {
+      resumePlayback();
+      setSpeechPaused(false);
+    } else if (phase === "paused") {
+      voiceResume();
+    } else if (listening) {
+      voicePause();
+    } else if (speaking) {
+      // Freeze; if audio hasn't started yet it'll be born frozen.
+      pausePlayback();
+      setSpeechPaused(true);
+    }
+  }, [voicePause, voiceResume]);
+
+  // Space = push-to-talk (normal mode) / pause-resume the avatar (voice mode). Esc = interrupt.
   useEffect(() => {
     const isTyping = (t: EventTarget | null) =>
       t instanceof HTMLElement && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable);
@@ -432,11 +618,20 @@ export default function Tutor() {
         if (voiceModeRef.current && (p === "greeting" || p === "listening" || p === "capturing")) voicePause();
         return;
       }
+      // Enter (voice mode, mic not yet open): Guru is waiting for an answer — start listening.
+      if (e.key === "Enter" && !isTyping(e.target)) {
+        if (voiceModeRef.current && !chatPanelOpenRef.current && voicePhaseRef.current === "awaiting") {
+          e.preventDefault();
+          voiceListen();
+        }
+        return;
+      }
       if (e.code === "Space" && !e.repeat && !isTyping(e.target)) {
         e.preventDefault();
         if (voiceModeRef.current) {
-          // The loop owns the mic; Space only wakes it from the paused state.
-          if (voicePhaseRef.current === "paused") voiceResume();
+          // Same as clicking the avatar: pause/resume Guru. The loop owns the mic,
+          // so Space never does push-to-talk here. (Not while the chat face is up.)
+          if (!chatPanelOpenRef.current) toggleAvatarPause();
           return;
         }
         void startListening();
@@ -455,7 +650,7 @@ export default function Tutor() {
       window.removeEventListener("keydown", down, true);
       window.removeEventListener("keyup", up, true);
     };
-  }, [startListening, stopListening, stopTurn, voicePause, voiceResume]);
+  }, [startListening, stopListening, stopTurn, voicePause, voiceListen, toggleAvatarPause]);
 
   // Deep link: /?q=your+question asks it automatically once the board and config are ready.
   const autoAsked = useRef(false);
@@ -480,30 +675,22 @@ export default function Tutor() {
   const showChat = !voiceMode || chatPanelOpen;
 
   // Voice-stage derived state. Caption priority: the student's live words while
-  // they speak → what Guru is saying (greeting/re-prompt) → latest reply text.
-  let lastAssistant = "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "assistant" && messages[i].text) {
-      lastAssistant = messages[i].text;
-      break;
-    }
-  }
+  // they speak → the greeting/re-prompt → the sentence being spoken right now.
   const guruListening = voice.phase === "listening" || voice.phase === "capturing";
   const guruSpeaking = status === "teaching" || voice.phase === "greeting";
   const studentSpeaking = guruListening && Boolean(interim.trim());
-  const caption = studentSpeaking ? interim : (voice.voiceCaption ?? lastAssistant);
-  const voiceChip =
-    voice.phase === "greeting"
-      ? "Indica is speaking…"
-      : guruListening
-        ? "Listening…"
-        : voice.phase === "paused"
-          ? "Paused — tap Indica or press Space"
-          : status === "thinking"
-            ? "Indica is thinking…"
-            : status === "teaching"
-              ? "Indica is teaching… · Esc to skip"
-              : "One moment…";
+  // Paused either way: voice frozen mid-sentence, or listening stopped by the loop.
+  // This is the stop/resume feature only — it is deliberately NOT set while
+  // awaiting an answer, so that state never looks paused.
+  const avatarPaused = speechPaused || voice.phase === "paused";
+  // Guru asked something and is waiting for the student to press Enter to answer.
+  const awaitingAnswer = voice.phase === "awaiting";
+  // Is there something a pause would act on right now? (Only then is the avatar a
+  // pause control — while awaiting/idle there's nothing to stop.)
+  const pausable = guruSpeaking || guruListening || status === "thinking";
+  // The only states worth a pill in the caption strip; everything else either
+  // shows a caption (speaking) or the avatar's own affordance (paused → play).
+  const stripStatus = guruListening ? "Listening…" : status === "thinking" ? "Thinking…" : null;
 
   return (
     <main className="flex h-dvh w-full flex-col-reverse bg-neutral-100 md:flex-row">
@@ -585,7 +772,10 @@ export default function Tutor() {
       <section className="relative min-h-0 min-w-0 flex-1">
         {/* Premium teaching surface painted behind the (transparent) canvas. */}
         <div aria-hidden className="board-surface pointer-events-none absolute inset-0" />
-        <div className={"absolute inset-0" + (voiceMode ? " md:right-60" : "") + (status === "teaching" ? " guru-teaching" : "")}>
+        {/* On the voice stage the canvas viewport stops above the caption strip,
+            so Excalidraw's own framing (recenter / fit) can never place drawing
+            under the subtitles. The decorative surface still fills the gap. */}
+        <div className={"absolute inset-0" + (voiceMode && !chatPanelOpen ? " bottom-10" : "")}>
           <Whiteboard onReady={onReady} />
         </div>
         {busy && !voiceMode && (
@@ -593,109 +783,110 @@ export default function Tutor() {
             {STATUS_LABEL[status]} <span className="opacity-60">· Esc to interrupt</span>
           </div>
         )}
-        {board && status === "teaching" && (
-          <button
-            type="button"
-            onClick={() => board.player.recenter()}
-            title="Jump to where Indica is teaching"
-            className={
-              "absolute right-3 z-10 flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium shadow ring-1 ring-black/5 backdrop-blur transition hover:brightness-105 " +
-              (voiceMode ? "top-16 md:top-3 md:right-63 " : "top-3 ") +
-              (status === "teaching" ? "animate-pulse bg-amber-500 text-white" : "bg-white/90 text-neutral-700 hover:bg-white")
-            }
-          >
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <circle cx="12" cy="12" r="3.5" />
-              <path d="M12 2v3.5M12 18.5V22M2 12h3.5M18.5 12H22" />
-            </svg>
-            Jump to Indica
-          </button>
-        )}
-
         {voiceMode && (
           <>
-            {/* Guru's rail (md+): the board above ends at its left edge, so
-                whiteboard writing can never run behind the avatar or caption. */}
-            <div
-              aria-hidden
-              className="absolute inset-y-0 right-0 z-10 hidden w-60 border-l border-neutral-200/60 bg-[#fffdf7] md:block"
-            />
-
-            {/* Hamburger — reopens the chat on the left, shrinking the board */}
+            {/* Hamburger — the single voice-mode control. It toggles between the
+                stage (full board + presenter) and the chat face (chat panel +
+                board, presenter hidden, hands-free loop quietened). */}
             <button
               type="button"
-              onClick={() => setChatPanelOpen((v) => !v)}
-              title={chatPanelOpen ? "Hide chat" : "Show chat"}
-              aria-label={chatPanelOpen ? "Hide chat" : "Show chat"}
+              onClick={() => {
+                if (!chatPanelOpen) {
+                  voice.pause();
+                  setChatPanelOpen(true);
+                } else {
+                  setChatPanelOpen(false);
+                  if (voicePhaseRef.current === "paused") voice.resume();
+                }
+              }}
+              title={chatPanelOpen ? "Back to voice" : "Show chat"}
+              aria-label={chatPanelOpen ? "Back to voice" : "Show chat"}
               className="absolute left-3 top-3 z-20 grid h-10 w-10 place-items-center rounded-full bg-white/90 text-neutral-700 shadow ring-1 ring-black/5 backdrop-blur transition hover:bg-white"
             >
               <HamburgerIcon />
             </button>
 
-            {/* Exit voice mode */}
-            <button
-              type="button"
-              onClick={() => {
-                stopTurn();
-                setVoiceMode(false);
-              }}
-              className="absolute right-3 top-3 z-20 flex items-center gap-1.5 rounded-full bg-neutral-900/85 px-3 py-1.5 text-xs font-medium text-white shadow backdrop-blur transition hover:bg-neutral-900"
-            >
-              <CloseIcon /> Exit voice
-            </button>
-
-            {/* Talking Guru (bottom-right, like a presenter cam). Mouth is driven by
-                live audio; amber glow while speaking, rose pulse while listening.
-                No mic button — the hands-free loop owns the microphone. */}
-            <div className="pointer-events-none absolute right-4 top-28 z-20 flex flex-col items-center gap-2 md:right-0 md:top-14 md:w-60 md:px-3">
-              <div className="relative">
-                {guruListening && (
-                  <div
-                    aria-hidden
-                    className="pointer-events-none absolute -inset-1.5 animate-pulse rounded-full border-4 border-rose-400/70"
-                  />
-                )}
-                <div
-                  className={
-                    "relative h-32 w-32 overflow-hidden rounded-full bg-linear-to-b from-amber-50 to-amber-100 ring-2 transition-shadow duration-300 md:h-36 md:w-36 " +
-                    (guruSpeaking
-                      ? "ring-amber-400 shadow-[0_0_38px_8px_rgba(245,158,11,0.5)]"
-                      : guruListening
-                        ? "ring-rose-300 shadow-[0_0_30px_6px_rgba(244,63,94,0.4)]"
-                        : "ring-white/70 shadow-2xl")
-                  }
-                >
-                  <Avatar className="h-full w-full" />
-                  {voice.phase === "paused" && (
+            {!chatPanelOpen && (
+              <>
+                {/* Presenter PiP (bottom-right, like a video call). Mouth is driven
+                    by live audio; amber glow while speaking, rose pulse while
+                    listening. Clicking it (or Space) pauses/resumes Guru; hovering
+                    reveals the pause button in the centre. */}
+                <div className="pointer-events-none absolute bottom-5 right-4 z-20 flex flex-col items-end gap-2 md:bottom-6 md:right-6">
+                  <div className="relative">
+                    {guruListening && !avatarPaused && (
+                      <div
+                        aria-hidden
+                        className="pointer-events-none absolute -inset-1.5 animate-pulse rounded-full border-4 border-rose-400/70"
+                      />
+                    )}
                     <button
                       type="button"
-                      onClick={voice.resume}
-                      aria-label="Resume listening"
-                      title="Resume listening"
-                      className="pointer-events-auto absolute inset-0 z-10 grid place-items-center rounded-full bg-neutral-900/45 text-white transition hover:bg-neutral-900/55"
+                      onClick={toggleAvatarPause}
+                      aria-label={avatarPaused ? "Resume" : pausable ? "Pause" : "Indica"}
+                      title={avatarPaused ? "Resume (Space)" : pausable ? "Pause (Space)" : undefined}
+                      aria-pressed={avatarPaused}
+                      className={
+                        "group pointer-events-auto relative block h-32 w-32 overflow-hidden rounded-full bg-linear-to-b from-amber-50 to-amber-100 ring-2 transition-shadow duration-300 md:h-40 md:w-40 " +
+                        (avatarPaused || pausable ? "cursor-pointer " : "cursor-default ") +
+                        (avatarPaused
+                          ? "ring-white/80 shadow-2xl"
+                          : guruSpeaking
+                            ? "ring-amber-400 shadow-[0_0_38px_8px_rgba(245,158,11,0.5)]"
+                            : guruListening
+                              ? "ring-rose-300 shadow-[0_0_30px_6px_rgba(244,63,94,0.4)]"
+                              : "ring-white/70 shadow-2xl")
+                      }
                     >
-                      <PlayIcon />
+                      <Avatar className="h-full w-full" />
+                      {/* Stop/resume affordance only: a play button while paused,
+                          otherwise the pause button revealed on hover — but only
+                          when there's actually something to pause. While awaiting
+                          an answer the avatar shows nothing (it isn't paused). */}
+                      {(avatarPaused || pausable) && (
+                        <span
+                          aria-hidden
+                          className={
+                            "absolute inset-0 grid place-items-center rounded-full text-white transition-opacity duration-150 " +
+                            (avatarPaused
+                              ? "bg-neutral-900/45 opacity-100"
+                              : "bg-neutral-900/35 opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100")
+                          }
+                        >
+                          {avatarPaused ? <PlayIcon /> : <PauseIcon />}
+                        </span>
+                      )}
                     </button>
-                  )}
+                  </div>
                 </div>
-              </div>
-              <span
-                aria-live="polite"
-                className="rounded-full bg-neutral-900/70 px-2.5 py-0.5 text-[11px] font-medium text-white backdrop-blur"
-              >
-                {voiceChip}
-              </span>
-              {caption && (
-                <div
-                  className={
-                    "max-w-[min(70vw,20rem)] overflow-y-auto rounded-2xl bg-neutral-900/80 px-3.5 py-2 text-center text-sm leading-snug shadow-lg backdrop-blur md:max-h-[55dvh] md:max-w-full " +
-                    (studentSpeaking ? "italic text-rose-100" : "text-white")
-                  }
-                >
-                  {caption}
-                </div>
-              )}
-            </div>
+
+                {/* Lower-third subtitle: one line high always, theme-translucent,
+                    appears exactly when the voice starts and highlights the word
+                    being spoken (karaoke). Between speeches the same spot shows
+                    the state pill — Listening… / Thinking… — nothing else. */}
+                {(studentSpeaking || voice.voiceCaption || liveCaption || awaitingAnswer || stripStatus) && (
+                  <div className="pointer-events-none absolute inset-x-4 bottom-4 z-20 flex justify-center">
+                    <div
+                      aria-live="polite"
+                      className="w-fit max-w-[90vw] overflow-hidden whitespace-nowrap rounded-full border border-amber-200/30 bg-[#fffdf7]/45 px-3.5 py-1.5 text-center text-sm leading-none shadow-md shadow-amber-900/5 backdrop-blur-sm md:max-w-2xl md:text-[15px]"
+                    >
+                      {studentSpeaking ? (
+                        <span className="italic text-rose-600">{tailOf(interim)}</span>
+                      ) : voice.voiceCaption ? (
+                        <KaraokeLine text={voice.voiceCaption.text} word={voice.voiceCaption.word} />
+                      ) : liveCaption ? (
+                        <KaraokeLine text={liveCaption.text} word={liveCaption.word} />
+                      ) : awaitingAnswer ? (
+                        // A light, unobtrusive hint — the mic stays shut until Enter.
+                        <span className="font-normal text-neutral-400">{voicePrompts(language).answerHint}</span>
+                      ) : (
+                        <span className="font-medium text-amber-800">{stripStatus}</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
           </>
         )}
       </section>

@@ -63,14 +63,9 @@ body {
   display: none !important;
 }
 
-/* Zoom controls (− 100% +) only belong on screen while Guru is teaching; the
-   wrapper gets the `guru-teaching` class then. Hidden at rest so the home
-   screen stays clean. */
+/* No zoom controls (− 100% +): the board frames itself and the UI stays clean. */
 .excalidraw .zoom-actions {
   display: none !important;
-}
-.guru-teaching .excalidraw .zoom-actions {
-  display: flex !important;
 }
 
 /* Slim, quiet scrollbars (chat panel, captions). */

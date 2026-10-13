@@ -66,31 +66,75 @@ export function languageLabel(code: string): string {
 
 /**
  * What Guru says out loud in hands-free voice mode: the opening question when
- * there is no conversation yet, and the nudge after 5s of silence. Spoken only —
- * these never enter the chat transcript or the LLM history.
+ * there is no conversation yet, and the nudge after the student stays silent.
+ * `answerHint` is never spoken — it's the light caption shown while Guru waits
+ * for the student to press Enter before the mic opens. The spoken lines never
+ * enter the chat transcript or the LLM history.
  */
-export const VOICE_PROMPTS: Record<LanguageCode, { greeting: string; reprompt: string }> = {
+export const VOICE_PROMPTS: Record<LanguageCode, { greeting: string; reprompt: string; answerHint: string }> = {
   en: {
     greeting: "Hello! What should we learn today?",
-    reprompt: "I didn't hear anything. What would you like to learn?",
+    reprompt: "I didn't hear anything. Can you repeat?",
+    answerHint: "Press Enter, then speak your answer",
   },
   "en-IN": {
     greeting: "Hello! What should we learn today?",
-    reprompt: "I didn't hear anything. What would you like to learn?",
+    reprompt: "I didn't hear anything. Can you repeat?",
+    answerHint: "Press Enter, then speak your answer",
   },
-  "hi-IN": { greeting: "नमस्ते! आज हम क्या सीखें?", reprompt: "मुझे कुछ सुनाई नहीं दिया। आप क्या सीखना चाहेंगे?" },
-  "bn-IN": { greeting: "নমস্কার! আজ আমরা কী শিখব?", reprompt: "আমি কিছু শুনতে পাইনি। তুমি কী শিখতে চাও?" },
-  "ta-IN": { greeting: "வணக்கம்! இன்று நாம் என்ன கற்போம்?", reprompt: "எனக்கு எதுவும் கேட்கவில்லை. நீங்கள் என்ன கற்க விரும்புகிறீர்கள்?" },
-  "te-IN": { greeting: "నమస్తే! ఈరోజు మనం ఏమి నేర్చుకుందాం?", reprompt: "నాకు ఏమీ వినిపించలేదు. మీరు ఏమి నేర్చుకోవాలనుకుంటున్నారు?" },
-  "mr-IN": { greeting: "नमस्कार! आज आपण काय शिकूया?", reprompt: "मला काही ऐकू आले नाही. तुम्हाला काय शिकायचे आहे?" },
-  "gu-IN": { greeting: "નમસ્તે! આજે આપણે શું શીખીએ?", reprompt: "મને કંઈ સંભળાયું નહીં. તમે શું શીખવા માંગો છો?" },
-  "kn-IN": { greeting: "ನಮಸ್ಕಾರ! ಇಂದು ನಾವು ಏನು ಕಲಿಯೋಣ?", reprompt: "ನನಗೆ ಏನೂ ಕೇಳಿಸಲಿಲ್ಲ. ನೀವು ಏನು ಕಲಿಯಲು ಬಯಸುತ್ತೀರಿ?" },
-  "ml-IN": { greeting: "നമസ്കാരം! ഇന്ന് നമുക്ക് എന്ത് പഠിക്കാം?", reprompt: "എനിക്ക് ഒന്നും കേൾക്കാനായില്ല. നിങ്ങൾക്ക് എന്ത് പഠിക്കണം?" },
-  "pa-IN": { greeting: "ਸਤ ਸ੍ਰੀ ਅਕਾਲ! ਅੱਜ ਅਸੀਂ ਕੀ ਸਿੱਖੀਏ?", reprompt: "ਮੈਨੂੰ ਕੁਝ ਸੁਣਾਈ ਨਹੀਂ ਦਿੱਤਾ। ਤੁਸੀਂ ਕੀ ਸਿੱਖਣਾ ਚਾਹੁੰਦੇ ਹੋ?" },
-  "od-IN": { greeting: "ନମସ୍କାର! ଆଜି ଆମେ କଣ ଶିଖିବା?", reprompt: "ମୁଁ କିଛି ଶୁଣିପାରିଲି ନାହିଁ। ଆପଣ କଣ ଶିଖିବାକୁ ଚାହାଁନ୍ତି?" },
+  "hi-IN": {
+    greeting: "नमस्ते! आज हम क्या सीखें?",
+    reprompt: "मुझे कुछ सुनाई नहीं दिया। क्या आप दोहरा सकते हैं?",
+    answerHint: "उत्तर देने के लिए Enter दबाएँ, फिर बोलें",
+  },
+  "bn-IN": {
+    greeting: "নমস্কার! আজ আমরা কী শিখব?",
+    reprompt: "আমি কিছু শুনতে পাইনি। আবার বলবে?",
+    answerHint: "উত্তর দিতে Enter চাপো, তারপর বলো",
+  },
+  "ta-IN": {
+    greeting: "வணக்கம்! இன்று நாம் என்ன கற்போம்?",
+    reprompt: "எனக்கு எதுவும் கேட்கவில்லை. மீண்டும் சொல்ல முடியுமா?",
+    answerHint: "பதிலளிக்க Enter அழுத்தி, பிறகு பேசுங்கள்",
+  },
+  "te-IN": {
+    greeting: "నమస్తే! ఈరోజు మనం ఏమి నేర్చుకుందాం?",
+    reprompt: "నాకు ఏమీ వినిపించలేదు. మళ్ళీ చెప్పగలరా?",
+    answerHint: "సమాధానం చెప్పడానికి Enter నొక్కి, ఆపై మాట్లాడండి",
+  },
+  "mr-IN": {
+    greeting: "नमस्कार! आज आपण काय शिकूया?",
+    reprompt: "मला काही ऐकू आले नाही. पुन्हा सांगाल का?",
+    answerHint: "उत्तर देण्यासाठी Enter दाबा, नंतर बोला",
+  },
+  "gu-IN": {
+    greeting: "નમસ્તે! આજે આપણે શું શીખીએ?",
+    reprompt: "મને કંઈ સંભળાયું નહીં. ફરી કહી શકશો?",
+    answerHint: "જવાબ આપવા Enter દબાવો, પછી બોલો",
+  },
+  "kn-IN": {
+    greeting: "ನಮಸ್ಕಾರ! ಇಂದು ನಾವು ಏನು ಕಲಿಯೋಣ?",
+    reprompt: "ನನಗೆ ಏನೂ ಕೇಳಿಸಲಿಲ್ಲ. ಮತ್ತೊಮ್ಮೆ ಹೇಳಬಹುದೇ?",
+    answerHint: "ಉತ್ತರಿಸಲು Enter ಒತ್ತಿ, ನಂತರ ಮಾತನಾಡಿ",
+  },
+  "ml-IN": {
+    greeting: "നമസ്കാരം! ഇന്ന് നമുക്ക് എന്ത് പഠിക്കാം?",
+    reprompt: "എനിക്ക് ഒന്നും കേൾക്കാനായില്ല. ഒന്നുകൂടി പറയാമോ?",
+    answerHint: "ഉത്തരം പറയാൻ Enter അമർത്തുക, എന്നിട്ട് സംസാരിക്കൂ",
+  },
+  "pa-IN": {
+    greeting: "ਸਤ ਸ੍ਰੀ ਅਕਾਲ! ਅੱਜ ਅਸੀਂ ਕੀ ਸਿੱਖੀਏ?",
+    reprompt: "ਮੈਨੂੰ ਕੁਝ ਸੁਣਾਈ ਨਹੀਂ ਦਿੱਤਾ। ਕੀ ਤੁਸੀਂ ਦੁਹਰਾ ਸਕਦੇ ਹੋ?",
+    answerHint: "ਜਵਾਬ ਲਈ Enter ਦਬਾਓ, ਫਿਰ ਬੋਲੋ",
+  },
+  "od-IN": {
+    greeting: "ନମସ୍କାର! ଆଜି ଆମେ କଣ ଶିଖିବା?",
+    reprompt: "ମୁଁ କିଛି ଶୁଣିପାରିଲି ନାହିଁ। ଆଉ ଥରେ କହିପାରିବେ କି?",
+    answerHint: "ଉତ୍ତର ଦେବାକୁ Enter ଦବାନ୍ତୁ, ତାପରେ କୁହନ୍ତୁ",
+  },
 };
 
-export function voicePrompts(code: string): { greeting: string; reprompt: string } {
+export function voicePrompts(code: string): { greeting: string; reprompt: string; answerHint: string } {
   return VOICE_PROMPTS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
 }
 

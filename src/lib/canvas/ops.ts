@@ -33,10 +33,21 @@ export const FONT_PX: Record<SizeName, number> = { sm: 16, md: 24, lg: 36 };
 
 export const HIGHLIGHT_FILL = "#ffec99";
 
-export type TutorMeta = { tutor: true; turn: number; opId?: string };
+export type TutorMeta = {
+  tutor: true;
+  turn: number;
+  opId?: string;
+  temp?: boolean;
+  highlight?: boolean;
+  // Children of a high-level primitive (e.g. a numberline) share the parent's id
+  // in `group`, so the board summary can collapse them to one line and an erase
+  // of the parent removes the whole group.
+  group?: string;
+  groupLabel?: string;
+};
 
-function meta(turn: number, opId?: string | null): TutorMeta {
-  return { tutor: true, turn, opId: opId ?? undefined };
+function meta(turn: number, opId?: string | null, temp?: boolean | null): TutorMeta {
+  return { tutor: true, turn, opId: opId ?? undefined, temp: temp ? true : undefined };
 }
 
 /**
@@ -63,7 +74,7 @@ export function opToSkeleton(
         fontSize: FONT_PX[op.size ?? "md"],
         strokeColor: stroke,
         textAlign: "left",
-        customData: meta(turn, op.id),
+        customData: meta(turn, op.id, op.temp),
       };
     }
     case "rect":
@@ -75,14 +86,16 @@ export function opToSkeleton(
         id: elementId,
         x: op.x ?? 0,
         y: op.y ?? 0,
-        width: Math.max(op.w ?? 160, 40),
-        height: Math.max(op.h ?? 80, 30),
+        // An explicit size is respected (down to 4px, so primitives can draw small
+        // dots); only an OMITTED size falls back to a comfortable default.
+        width: op.w != null ? Math.max(op.w, 4) : 160,
+        height: op.h != null ? Math.max(op.h, 4) : 80,
         strokeColor: stroke,
         backgroundColor: FILL[color],
         fillStyle: "hachure",
         roughness: 1,
         roundness: type === "rectangle" ? { type: 3 } : null,
-        customData: meta(turn, op.id),
+        customData: meta(turn, op.id, op.temp),
         ...(op.text ? { label: { text: op.text, fontSize: 20 } } : {}),
       };
     }
@@ -105,10 +118,11 @@ export function opToSkeleton(
         ],
         strokeColor: stroke,
         strokeWidth: 2,
+        strokeStyle: op.dash ? "dashed" : "solid",
         roughness: 1,
         endArrowhead: op.op === "arrow" ? "arrow" : null,
         startArrowhead: null,
-        customData: meta(turn, op.id),
+        customData: meta(turn, op.id, op.temp),
         ...(op.text ? { label: { text: op.text, fontSize: 16 } } : {}),
       } as ExcalidrawElementSkeleton;
     }
@@ -126,11 +140,40 @@ export function opToSkeleton(
         roughness: 0,
         opacity: 45,
         roundness: { type: 3 },
-        customData: meta(turn, op.id),
+        // Tagged so collision avoidance never treats a translucent highlight as an
+        // obstacle — it is meant to overlay the very content it points at.
+        customData: { ...meta(turn, op.id, op.temp), highlight: true },
       };
     }
+    case "numberline":
+    case "axes":
+    case "bars":
+    case "fraction":
+    case "polygon":
+    case "angle":
+    case "vector":
+    case "table":
+    case "circuit":
+    case "optics":
+    case "molecule":
+    case "solid":
+    case "labeled":
+    case "punnett":
+    case "net":
+    case "reaction":
+    case "tree":
+    case "venn":
+    case "graph":
+    case "apparatus":
+    case "curvearrow":
+    case "wave":
+    case "pie":
+    case "incline":
+    case "timeline":
     case "erase":
     case "clear":
+      // High-level primitives are expanded into low-level ops by the player
+      // before they ever reach here; erase/clear create no elements.
       return null;
   }
 }

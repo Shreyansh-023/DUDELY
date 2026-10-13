@@ -21,13 +21,14 @@ import { useCallback, useEffect, useRef, useState, type RefObject } from "react"
 import { voicePrompts } from "@/lib/languages";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
 import { fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
+import { isPlaybackPaused } from "@/lib/voice/playback";
 import { MicVad } from "@/lib/voice/vad";
 import type { Status } from "./Tutor";
 
-export type VoicePhase = "off" | "greeting" | "listening" | "capturing" | "processing" | "paused";
+// "awaiting" = Guru has asked something and is waiting for the student to press
+// Enter before the mic opens (the student answers in their own time).
+export type VoicePhase = "off" | "greeting" | "listening" | "capturing" | "processing" | "awaiting" | "paused";
 
-/** After this many unanswered re-prompts Guru goes quiet until tapped. */
-const MAX_REPROMPTS = 1;
 /**
  * How many statement turns Guru may teach back-to-back before pausing to listen.
  * The prompt asks a checkpoint question roughly every third turn, so this cap is
@@ -57,12 +58,15 @@ type Deps = {
 
 export function useVoiceLoop(deps: Deps): {
   phase: VoicePhase;
-  voiceCaption: string | null;
+  /** The greeting/re-prompt being spoken and how far the voice has got (karaoke). */
+  voiceCaption: { text: string; word: number } | null;
   resume: () => void;
   pause: () => void;
+  /** Open the mic now — called when the student presses Enter in the "awaiting" phase. */
+  listen: () => void;
 } {
   const [phase, setPhaseState] = useState<VoicePhase>("off");
-  const [voiceCaption, setVoiceCaption] = useState<string | null>(null);
+  const [voiceCaption, setVoiceCaption] = useState<{ text: string; word: number } | null>(null);
 
   // Latest props/state for async continuations (same pattern as Tutor's refs).
   const depsRef = useRef(deps);
@@ -77,7 +81,6 @@ export function useVoiceLoop(deps: Deps): {
   const vadRef = useRef<MicVad | null>(null);
   const browserRecRef = useRef<{ stop: () => void; abort: () => void } | null>(null);
   const noInterimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const repromptCountRef = useRef(0);
   const autoContinueRef = useRef(0);
   const prevStatusRef = useRef<Status>("idle");
 
@@ -111,19 +114,41 @@ export function useVoiceLoop(deps: Deps): {
     async (text: string, gen: number) => {
       if (gen !== genRef.current) return;
       setPhase("greeting");
-      setVoiceCaption(text);
       const ac = new AbortController();
       greetAbortRef.current = ac;
       const lang = depsRef.current.languageRef.current;
+      // Same karaoke pacing as lesson beats: real boundary/progress events when
+      // the engine gives them, a ~150wpm pacer when it doesn't.
+      const nWords = text.split(/\s+/).length;
+      const advance = (word: number) =>
+        setVoiceCaption((c) =>
+          c && c.text === text ? { text, word: Math.max(c.word, Math.min(nWords - 1, word)) } : c,
+        );
+      let est = 0;
+      let pacer: ReturnType<typeof setInterval> | null = null;
       try {
         let blob: Blob | null = null;
         if (depsRef.current.configRef.current?.tts === "sarvam") {
           blob = await fetchSpeech(text, lang, ac.signal).catch(() => null); // 204 / failure → browser voice
         }
         if (gen !== genRef.current || ac.signal.aborted) return;
-        if (blob) await playBlob(blob, ac.signal);
-        else await speakBrowser(text, lang, ac.signal); // self-caps its wait, so this can't wedge the loop
+        // Caption goes up only once the TTS round trip is done and playback is
+        // about to start, so the subtitle and the voice arrive together.
+        setVoiceCaption({ text, word: 0 });
+        if (blob) {
+          // Real audio: elapsed fraction is the sole driver, so the highlight
+          // tracks the voice instead of being dragged ahead by the pacer.
+          await playBlob(blob, ac.signal, (f) => advance(Math.floor(f * nWords)));
+        } else {
+          pacer = setInterval(() => {
+            if (!isPlaybackPaused()) advance(++est); // freeze the karaoke with the voice
+          }, 380); // no boundary events on some engines
+          await speakBrowser(text, lang, ac.signal, (charIndex) =>
+            advance(text.slice(0, charIndex).split(/\s+/).filter(Boolean).length),
+          ); // self-caps its wait, so this can't wedge the loop
+        }
       } finally {
+        if (pacer) clearInterval(pacer);
         greetAbortRef.current = null;
         setVoiceCaption(null);
       }
@@ -134,36 +159,38 @@ export function useVoiceLoop(deps: Deps): {
   const submit = useCallback(
     (text: string, gen: number) => {
       if (gen !== genRef.current) return;
-      repromptCountRef.current = 0;
       autoContinueRef.current = 0; // the student spoke; start a fresh teaching run
-      setPhase("processing"); // the resume effect listens again once the turn ends
+      setPhase("processing"); // the resume effect decides what comes next once the turn ends
       depsRef.current.ask(text);
     },
     [setPhase],
   );
 
+  // The mic opened on Enter but caught nothing: say "I didn't hear, can you
+  // repeat?" and hand the floor back — the student presses Enter to try again.
   const handleNoSpeech = useCallback(
     async (gen: number) => {
       if (gen !== genRef.current) return;
-      repromptCountRef.current += 1;
-      if (repromptCountRef.current > MAX_REPROMPTS) {
-        setPhase("paused");
-        return;
-      }
       await speakPrompt(voicePrompts(depsRef.current.languageRef.current).reprompt, gen);
-      if (gen === genRef.current) void listenOnceRef.current(gen);
+      if (gen === genRef.current) void listenOnceRef.current(gen); // → "awaiting" (needs Enter)
     },
-    [setPhase, speakPrompt],
+    [speakPrompt],
   );
 
   const listenOnce = useCallback(
-    async (gen: number) => {
+    async (gen: number, immediate = false) => {
       if (gen !== genRef.current) return;
       const d = depsRef.current;
       if (d.status !== "idle") {
         // A turn is still playing (e.g. voice mode entered mid-lesson); the
         // resume effect will call us again when it finishes.
         setPhase("processing");
+        return;
+      }
+      if (!immediate) {
+        // Guru expects an answer but doesn't grab the mic — it waits for the
+        // student to press Enter (handled in Tutor, which calls listen()).
+        setPhase("awaiting");
         return;
       }
       setPhase("listening");
@@ -269,7 +296,6 @@ export function useVoiceLoop(deps: Deps): {
     greetAbortRef.current?.abort();
     greetAbortRef.current = null;
     cancelCapture();
-    repromptCountRef.current = 0;
     autoContinueRef.current = 0;
     setVoiceCaption(null);
     setPhase("off");
@@ -299,32 +325,41 @@ export function useVoiceLoop(deps: Deps): {
     if (phase === "processing" && deps.status === "idle" && prev !== "idle") {
       // Guru finished a turn. If it ended on a statement ("ready to continue"),
       // keep teaching the next step instead of waiting for the student. If it
-      // ended on a question (or was interrupted), hand the floor back and listen.
+      // ended on a question (or was interrupted), hand the floor back — but don't
+      // grab the mic: go to "awaiting" so the student answers after pressing Enter.
       if (autoContinueRef.current < MAX_AUTO_CONTINUE && depsRef.current.shouldContinue()) {
         autoContinueRef.current += 1;
         depsRef.current.continueLesson(); // stays in "processing"; we land back here when it ends
       } else {
         autoContinueRef.current = 0;
-        void listenOnceRef.current(++genRef.current);
+        void listenOnceRef.current(++genRef.current); // not immediate → "awaiting"
       }
     } else if (
-      (phase === "listening" || phase === "capturing") &&
+      (phase === "listening" || phase === "capturing" || phase === "awaiting") &&
       (deps.status === "thinking" || deps.status === "teaching")
     ) {
-      // The student typed a question in the chat panel while we were listening:
-      // drop the capture and fall in line behind that turn.
+      // A turn started (e.g. the student typed in the chat panel) while we were
+      // listening or waiting for Enter: drop any capture and fall in behind it.
       genRef.current += 1;
       cancelCapture();
       setPhase("processing");
     }
   }, [deps.status, deps.enabled, phase, cancelCapture, setPhase]);
 
+  // Resume from a user-initiated pause: go straight back to listening.
   const resume = useCallback(() => {
     if (!depsRef.current.enabled) return;
-    repromptCountRef.current = 0;
     autoContinueRef.current = 0;
     depsRef.current.setError(null);
-    void listenOnceRef.current(++genRef.current);
+    void listenOnceRef.current(++genRef.current, true);
+  }, []);
+
+  // The student pressed Enter in the "awaiting" phase — open the mic now.
+  const listen = useCallback(() => {
+    if (!depsRef.current.enabled) return;
+    autoContinueRef.current = 0;
+    depsRef.current.setError(null);
+    void listenOnceRef.current(++genRef.current, true);
   }, []);
 
   const pause = useCallback(() => {
@@ -337,5 +372,5 @@ export function useVoiceLoop(deps: Deps): {
     setPhase("paused");
   }, [cancelCapture, setPhase]);
 
-  return { phase, voiceCaption, resume, pause };
+  return { phase, voiceCaption, resume, pause, listen };
 }
