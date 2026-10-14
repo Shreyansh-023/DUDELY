@@ -1,8 +1,9 @@
 import { streamText, type ModelMessage } from "ai";
-import type { Grade, SubjectId } from "@/lib/curriculum";
+import { textbookKey, type Grade, type SubjectId } from "@/lib/curriculum";
 import { detectProvider, getModel } from "@/lib/llm";
 import { mockLesson } from "@/lib/mock-lesson";
 import { buildSystemPrompt, buildUserTurn } from "@/lib/prompt";
+import { retrieveTextbookContext, type Passage } from "@/lib/rag";
 import { BeatSchema, TutorRequestSchema, type HistoryMessage, type TutorEvent } from "@/lib/schema";
 
 export const maxDuration = 60;
@@ -28,14 +29,6 @@ export async function POST(req: Request) {
   const grade = (parsed.data.grade ?? null) as Grade | null;
   const subject = (parsed.data.subject ?? null) as SubjectId | null;
 
-  // The chosen class + subject name one NCERT textbook. The RAG backend (built
-  // separately) uses this to restrict vector search to that book's embeddings.
-  // When that service is ready, derive the key with textbookKey(grade, subject),
-  // retrieve the top passages for the latest question, and pass them into
-  // buildSystemPrompt as a `context` argument.
-  // TODO(rag): const book = textbookKey(grade, subject);
-  //            const passages = book ? await retrieveTextbookContext(book, messages.at(-1)?.text) : [];
-
   if (detectProvider() === "mock") return mockResponse(messages, language);
 
   let model: ReturnType<typeof getModel>;
@@ -45,7 +38,22 @@ export async function POST(req: Request) {
     return Response.json({ error: (err as Error).message }, { status: 500 });
   }
 
-  const system = buildSystemPrompt({ language, profile, grade, subject });
+  // The chosen class + subject name one NCERT textbook; passages from it ground the
+  // turn (rag/ builds the index, lib/rag searches it with Nemotron embeddings + BM25).
+  // No book chosen, no index for it, or retrieval failing all mean the turn simply
+  // runs without passages — grounding is additive, never a hard dependency.
+  const book = textbookKey(grade, subject);
+  let edition = "";
+  let passages: Passage[] = [];
+  if (book) {
+    try {
+      ({ edition, passages } = await retrieveTextbookContext(book, messages));
+    } catch (err) {
+      console.warn(`[tutor] textbook retrieval failed for ${book}: ${errorMessage(err)}`);
+    }
+  }
+
+  const system = buildSystemPrompt({ language, profile, grade, subject, textbook: passages });
   const last = messages.length - 1;
   const modelMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
@@ -56,7 +64,13 @@ export async function POST(req: Request) {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (ev: TutorEvent) => controller.enqueue(encoder.encode(JSON.stringify(ev) + "\n"));
-      send({ type: "meta", model: model.label });
+      send({
+        type: "meta",
+        model: model.label,
+        ...(passages.length > 0
+          ? { sources: passages.map((p) => `${book} ${edition}: ${p.label} (pdf p.${p.pages.join("-")})`) }
+          : {}),
+      });
       try {
         // Models occasionally emit an empty or malformed beat stream. As long as
         // nothing has been sent to the client yet (zero beats), one silent retry

@@ -1,5 +1,6 @@
 import { textbookLabel, type Grade, type SubjectId } from "./curriculum";
 import { languageLabel } from "./languages";
+import type { Passage } from "./rag";
 
 /**
  * The tutor "mastery" system prompt. This is where the Dudely feel comes from:
@@ -10,6 +11,8 @@ export function buildSystemPrompt(opts: {
   profile: string;
   grade?: Grade | null;
   subject?: SubjectId | null;
+  /** Passages retrieved from the student's NCERT textbook for this turn (may be empty). */
+  textbook?: Passage[];
 }): string {
   const lang = `${languageLabel(opts.language)} (${opts.language})`;
   const profile = opts.profile.trim() || "Not provided. Infer the level from how the student talks and adapt.";
@@ -17,6 +20,18 @@ export function buildSystemPrompt(opts: {
   const curriculum = book
     ? `The student is studying ${book}. Pitch every explanation at NCERT Class ${opts.grade} level and keep examples and terminology aligned with that textbook. If the student asks about something outside this class/subject, help briefly but gently steer back to ${book}.`
     : "The student has not picked a class and subject yet. Teach at a level you infer from how they talk, and you may invite them to pick their class and subject so you can follow their NCERT textbook.";
+
+  // Passages retrieved from the student's own textbook for this question. They ground
+  // the lesson in the exact syllabus wording so definitions, notation and the depth
+  // match what the student will see in their book and exam.
+  const textbook =
+    opts.textbook && opts.textbook.length > 0
+      ? `\n\n# From the student's textbook (${book ?? "NCERT"})
+These passages were retrieved from the student's own NCERT textbook for THIS question. Ground your explanation in them: use the SAME definitions, notation, terms and method the book uses, and stay at this depth — do not go beyond the syllabus. They are reference for YOU; never read them aloud verbatim or dump them on the board, and never mention "the passage". If they do not fit the question, rely on your own knowledge instead.
+${opts.textbook
+  .map((p, i) => `[${i + 1}] ${p.label}\n${p.text}`)
+  .join("\n\n")}`
+      : "";
 
   // "English only" (en) is a HARD constraint: build a prompt that contains no
   // Hinglish rule and no Hinglish example, so nothing tempts the model to drift.
@@ -134,7 +149,7 @@ High-level DIAGRAM ops (STRONGLY PREFERRED — the renderer lays these out with 
 ${exampleSection}
 
 # Curriculum
-${curriculum}
+${curriculum}${textbook}
 
 # Student profile
 ${profile}`;

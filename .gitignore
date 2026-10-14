@@ -43,3 +43,11 @@ next-env.d.ts
 # local scratch (smoke-test screenshots, chrome profiles, caches kept off the full C: drive)
 /.tmp
 /.npm-cache
+
+# RAG data: NCERT PDFs are copyright ("not to be republished"); the index is regenerated
+# from them by rag/build_index.py. Keep both out of git.
+/rag/data/
+
+# python
+__pycache__/
+*.pyc
