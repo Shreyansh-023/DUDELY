@@ -32,10 +32,13 @@ type Meta = { book: string; edition: string; embedModel: string; dim: number; co
 /** A referenceable unit of the book (Example/Theorem/Exercise), from rag/build_index.py. */
 type Unit = { text: string; pdfPage: number; printedPage: number };
 type ExerciseUnit = Unit & { questions: Record<string, { text: string }> };
+type Section = { ref: string; title: string; intro: string; pdfPage: number; printedPage: number };
 type Structure = {
   examples: Record<string, Record<string, Unit>>; // chapter -> number -> unit
   theorems: Record<string, Unit>; // "1.2" -> unit
   exercises: Record<string, ExerciseUnit>; // "1.1" -> unit
+  sections: Record<string, Section[]>; // chapter -> ordered sections
+  outlines: Record<string, string>; // chapter -> "8.1 Introduction · 8.2 …"
 };
 type Index = { meta: Meta; chunks: Chunk[]; vectors: Float32Array; bm25: Bm25; structure: Structure | null };
 
@@ -232,21 +235,41 @@ type Refs = {
   examples: { chapter: string | null; num: string }[];
   theorems: string[]; // "1.2"
   exercises: { ref: string; question: string | null }[]; // "1.1"
+  sections: string[]; // "8.2"
   pages: number[]; // printed page numbers
 };
 
 function parseStructuralRefs(query: string): Refs {
   const q = query.toLowerCase();
-  const refs: Refs = { examples: [], theorems: [], exercises: [], pages: [] };
-  // "chapter N" scopes examples (which are numbered per chapter). Theorems/exercises
-  // carry their chapter in the "N.N" ref, so they need no separate chapter.
+  const refs: Refs = { examples: [], theorems: [], exercises: [], sections: [], pages: [] };
+  // "chapter N" scopes examples (which are numbered per chapter). Theorems/exercises/
+  // sections carry their chapter in the "N.N" ref, so they need no separate chapter.
   const chapter = q.match(/chapter\s+(\d+)/)?.[1] ?? null;
   for (const m of q.matchAll(/example\s+(?:no\.?\s*|number\s*)?(\d+)/g)) refs.examples.push({ chapter, num: m[1] });
   for (const m of q.matchAll(/theorem\s+(\d+\.\d+)/g)) refs.theorems.push(m[1]);
   const question = q.match(/(?:question|ques|prob(?:lem)?|q)\.?\s*(?:no\.?\s*|number\s*)?(\d+)/)?.[1] ?? null;
   for (const m of q.matchAll(/exercise\s+(\d+\.\d+)/g)) refs.exercises.push({ ref: m[1], question });
+  for (const m of q.matchAll(/section\s+(\d+\.\d+)/g)) refs.sections.push(m[1]);
   for (const m of q.matchAll(/page\s+(?:no\.?\s*|number\s*|#\s*)?(\d+)/g)) refs.pages.push(Number(m[1]));
   return refs;
+}
+
+// Opening a topic ("teach me X", "start trigonometry", "explain quadratic equations") is a
+// pedagogical need, not a similarity match: the book's intro/analogy and the chapter's
+// teaching sequence must be surfaced on purpose. These words flag that intent.
+const OPENER = /\b(teach|start|started|learn|learning|begin|introduce|introduction|intro|basics?|overview|explain|understand)\b/i;
+
+/** The chapter most of these passages belong to (parsed from their labels), or null. */
+function dominantChapter(passages: Passage[]): string | null {
+  const counts = new Map<string, number>();
+  for (const p of passages) {
+    const m = p.label.match(/Chapter (\d+)/) || p.label.match(/(?:Theorem|Exercise|Section) (\d+)\./);
+    if (m) counts.set(m[1], (counts.get(m[1]) ?? 0) + 1);
+  }
+  let best: string | null = null;
+  let max = 0;
+  for (const [ch, n] of counts) if (n > max) ((max = n), (best = ch));
+  return best;
 }
 
 /** Resolve named units to exact passages. [] when nothing in the query names a unit we hold. */
@@ -273,6 +296,11 @@ function resolveStructural(index: Index, query: string): Passage[] {
       const qText = question ? u.questions?.[question]?.text : undefined;
       if (qText) out.push({ label: `Exercise ${ref} · Q${question}`, pages: [u.pdfPage, u.pdfPage], kind: "exercise", text: qText });
       else unit(`Exercise ${ref}`, u, "exercise");
+    }
+    for (const ref of refs.sections) {
+      const ch = ref.split(".")[0];
+      const s = structure.sections?.[ch]?.find((x) => x.ref === ref);
+      if (s) out.push({ label: `Section ${ref} ${s.title}`, pages: [s.pdfPage, s.pdfPage], kind: "section", text: s.intro });
     }
   }
   for (const page of refs.pages) {
@@ -308,11 +336,35 @@ export async function retrieveTextbookContext(
     const index = await loadIndex(book, edition);
     if (!index) continue;
     // Deterministic first: if the student named a unit by position ("example 2 of
-    // chapter 1", "theorem 1.2", "exercise 1.1 q3", "page 45"), return exactly it and
-    // skip the embedding call. Otherwise fall back to hybrid semantic search.
+    // chapter 1", "theorem 1.2", "exercise 1.1 q3", "section 8.2", "page 45"), return
+    // exactly it and skip the embedding call. Otherwise fall back to hybrid semantic.
     const structural = resolveStructural(index, query);
-    if (structural.length > 0) return { edition, passages: structural };
-    return { edition, passages: await search(index, query, TOP_K) };
+    const base = structural.length > 0 ? structural : await search(index, query, TOP_K);
+    return { edition, passages: addChapterFraming(index, query, base, structural.length > 0) };
   }
   return { edition: "", passages: [] };
+}
+
+/**
+ * Prepend teaching context from the chapter the passages belong to: the section outline
+ * (so the tutor knows the sequence / where this concept sits) always, and — when the
+ * student is OPENING a topic rather than naming a specific unit — the Introduction
+ * section (the book's motivating analogy / hook for how to start the topic).
+ */
+function addChapterFraming(index: Index, query: string, base: Passage[], structural: boolean): Passage[] {
+  const ch = dominantChapter(base);
+  const outline = ch ? index.structure?.outlines?.[ch] : undefined;
+  if (!outline) return base;
+
+  // The outline spans the whole chapter; point it at the chapter's first section page.
+  const firstPage = index.structure?.sections?.[ch!]?.[0]?.pdfPage ?? 1;
+  const framing: Passage[] = [{ label: `Chapter ${ch} · Outline`, pages: [firstPage, firstPage], kind: "outline", text: outline }];
+  // An opener that is NOT a specific-unit lookup also gets the chapter's intro/analogy.
+  if (!structural && OPENER.test(query)) {
+    const sections = index.structure?.sections?.[ch!] ?? [];
+    const intro = sections.find((s) => /introduction/i.test(s.title)) ?? sections[0];
+    if (intro) framing.push({ label: `Chapter ${ch} · ${intro.title}`, pages: [intro.pdfPage, intro.pdfPage], kind: "section", text: intro.intro });
+  }
+  const limit = TOP_K + framing.length;
+  return [...framing, ...base].slice(0, limit);
 }

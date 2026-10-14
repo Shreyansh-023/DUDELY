@@ -149,6 +149,40 @@ def cap(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n].rstrip() + " …"
 
 
+# Section headings "8.1 Introduction", "8.2 Trigonometric Ratios" at the start of a line.
+# These give the chapter's teaching sequence; a section's opening prose is the book's hook
+# / analogy for the topic (e.g. the Qutub Minar example that opens Trigonometry).
+_SECTION = re.compile(r"(?m)^\s*(\d+)\.(\d+)\s+([A-Z][^\n]{1,58})")
+MAX_INTRO_CHARS = 1000
+
+
+def add_sections(struct: dict, ch: int | None, full: str, page_at) -> None:
+    if ch is None:
+        return
+    majors = [m.start() for m in _MAJOR.finditer(full)]  # examples/theorems/exercises
+    seen: dict[int, dict] = {}
+    for m in _SECTION.finditer(full):
+        if int(m.group(1)) != ch:
+            continue
+        minor = int(m.group(2))
+        if minor in seen:
+            continue  # first occurrence is the heading; later ones are cross-references
+        title = re.sub(r"\s+", " ", m.group(3)).strip().rstrip(".")
+        seen[minor] = {"ref": f"{ch}.{minor}", "title": title, "start": m.start(),
+                       "pdfPage": page_at(m.start())[0], "printedPage": page_at(m.start())[1]}
+    sections = [seen[k] for k in sorted(seen)]
+    bounds = sorted([s["start"] for s in sections] + majors + [len(full)])
+    out = []
+    for s in sections:
+        end = next((b for b in bounds if b > s["start"]), len(full))
+        out.append({"ref": s["ref"], "title": s["title"],
+                    "intro": cap(full[s["start"]:end], MAX_INTRO_CHARS),
+                    "pdfPage": s["pdfPage"], "printedPage": s["printedPage"]})
+    if out:
+        struct["sections"][str(ch)] = out
+        struct["outlines"][str(ch)] = " · ".join(f'{s["ref"]} {s["title"]}' for s in out)
+
+
 def add_structure(struct: dict, ch: int | None, full: str, page_at) -> None:
     """Find Example/Theorem/Exercise units in one chapter's full text and record them."""
     marks = list(_MAJOR.finditer(full))
@@ -187,7 +221,7 @@ def extract(book: str, edition: str) -> tuple[list[dict], dict]:
     if not pdfs:
         sys.exit(f"no PDFs in {src}")
     chunks: list[dict] = []
-    struct = {"examples": {}, "theorems": {}, "exercises": {}}
+    struct = {"examples": {}, "theorems": {}, "exercises": {}, "sections": {}, "outlines": {}}
     cid = 0
     for pdf in pdfs:
         if pdf.stat().st_size < 10000:  # skip truncated / 404-error files
@@ -229,6 +263,7 @@ def extract(book: str, edition: str) -> tuple[list[dict], dict]:
             return spans[-1][2], spans[-1][3]
 
         add_structure(struct, ch, full, page_at)
+        add_sections(struct, ch, full, page_at)
         print(f"  {pdf.name}: {label} — {doc.page_count} pages (printed offset {offset:+d})")
     return chunks, struct
 
@@ -289,10 +324,11 @@ def main() -> None:
             encoding="utf-8",
         )
         n_ex = sum(len(v) for v in struct["examples"].values())
+        n_sec = sum(len(v) for v in struct["sections"].values())
         mins = (time.perf_counter() - started) / 60
         print(f"  wrote {len(chunks)} chunks x {dim}d + structure "
-              f"({n_ex} examples, {len(struct['theorems'])} theorems, {len(struct['exercises'])} exercises) "
-              f"to {out_dir} in {mins:.1f} min")
+              f"({n_ex} examples, {len(struct['theorems'])} theorems, {len(struct['exercises'])} exercises, "
+              f"{n_sec} sections) to {out_dir} in {mins:.1f} min")
 
 
 if __name__ == "__main__":

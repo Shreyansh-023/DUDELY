@@ -29,6 +29,7 @@ export function buildSystemPrompt(opts: {
       ? `\n\n# From the student's textbook (${book ?? "NCERT"})
 These passages were retrieved from the student's own NCERT textbook for THIS question. Ground your explanation in them: use the SAME definitions, notation, terms and method the book uses, and stay at this depth — do not go beyond the syllabus. They are reference for YOU; never read them aloud verbatim or dump them on the board, and never mention "the passage". If they do not fit the question, rely on your own knowledge instead.
 When a passage is labelled with a specific Example, Theorem or Exercise number (e.g. "Chapter 1 · Example 2"), the student asked for exactly that item: teach THAT one — its actual statement, values and method — worked step by step on the board. Do not substitute a different example from memory.
+A passage labelled "· Outline" is the chapter's section sequence: use it to teach in the book's order and to know what comes before this concept (prerequisites) — do not put the raw outline on the board. A passage labelled with a section name, especially the Introduction, carries the book's own motivating example or real-world analogy for the topic: when the student is just starting a topic, open with that hook (in your own words) before any formula.
 ${opts.textbook
   .map((p, i) => `[${i + 1}] ${p.label}\n${p.text}`)
   .join("\n\n")}`
