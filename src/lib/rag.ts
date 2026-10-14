@@ -26,9 +26,18 @@ export type Passage = {
   text: string;
 };
 
-type Chunk = Passage & { id: number; stem: string; chapter: number | null };
+type Chunk = Passage & { id: number; stem: string; chapter: number | null; printedPage?: number };
 type Meta = { book: string; edition: string; embedModel: string; dim: number; count: number };
-type Index = { meta: Meta; chunks: Chunk[]; vectors: Float32Array; bm25: Bm25 };
+
+/** A referenceable unit of the book (Example/Theorem/Exercise), from rag/build_index.py. */
+type Unit = { text: string; pdfPage: number; printedPage: number };
+type ExerciseUnit = Unit & { questions: Record<string, { text: string }> };
+type Structure = {
+  examples: Record<string, Record<string, Unit>>; // chapter -> number -> unit
+  theorems: Record<string, Unit>; // "1.2" -> unit
+  exercises: Record<string, ExerciseUnit>; // "1.1" -> unit
+};
+type Index = { meta: Meta; chunks: Chunk[]; vectors: Float32Array; bm25: Bm25; structure: Structure | null };
 
 const INDEX_DIR = process.env.RAG_INDEX_DIR || path.join(process.cwd(), "rag", "data", "index");
 const TOP_K = Number(process.env.RAG_TOP_K || 3);
@@ -83,7 +92,17 @@ async function readIndex(book: string, edition: string): Promise<Index | null> {
       console.warn(`[rag] index ${book}/${edition} is inconsistent; rebuild it`);
       return null;
     }
-    return { meta, chunks, vectors, bm25: new Bm25(chunks.map((c) => tokenize(`${c.label} ${c.text}`))) };
+    // structure.json is optional: an older index without it still works (semantic only).
+    const structure = await readFile(path.join(dir, "structure.json"), "utf8")
+      .then((raw) => JSON.parse(raw) as Structure)
+      .catch(() => null);
+    return {
+      meta,
+      chunks,
+      vectors,
+      bm25: new Bm25(chunks.map((c) => tokenize(`${c.label} ${c.text}`))),
+      structure,
+    };
   } catch {
     return null; // not built for this book/edition
   }
@@ -201,6 +220,69 @@ async function search(index: Index, query: string, k: number): Promise<Passage[]
     });
 }
 
+// ------------------------------------------------------------------ structural lookup
+
+// A student references a unit by POSITION ("example 2 of chapter 1", "theorem 1.2",
+// "exercise 1.1 question 3", "page 45"). Semantic search cannot find a position — an
+// ordinal carries no meaning — so these are resolved by exact lookup in structure.json,
+// which also skips the embedding API call entirely (faster and cheaper than search).
+const MAX_STRUCTURAL_PASSAGES = 4;
+
+type Refs = {
+  examples: { chapter: string | null; num: string }[];
+  theorems: string[]; // "1.2"
+  exercises: { ref: string; question: string | null }[]; // "1.1"
+  pages: number[]; // printed page numbers
+};
+
+function parseStructuralRefs(query: string): Refs {
+  const q = query.toLowerCase();
+  const refs: Refs = { examples: [], theorems: [], exercises: [], pages: [] };
+  // "chapter N" scopes examples (which are numbered per chapter). Theorems/exercises
+  // carry their chapter in the "N.N" ref, so they need no separate chapter.
+  const chapter = q.match(/chapter\s+(\d+)/)?.[1] ?? null;
+  for (const m of q.matchAll(/example\s+(?:no\.?\s*|number\s*)?(\d+)/g)) refs.examples.push({ chapter, num: m[1] });
+  for (const m of q.matchAll(/theorem\s+(\d+\.\d+)/g)) refs.theorems.push(m[1]);
+  const question = q.match(/(?:question|ques|prob(?:lem)?|q)\.?\s*(?:no\.?\s*|number\s*)?(\d+)/)?.[1] ?? null;
+  for (const m of q.matchAll(/exercise\s+(\d+\.\d+)/g)) refs.exercises.push({ ref: m[1], question });
+  for (const m of q.matchAll(/page\s+(?:no\.?\s*|number\s*|#\s*)?(\d+)/g)) refs.pages.push(Number(m[1]));
+  return refs;
+}
+
+/** Resolve named units to exact passages. [] when nothing in the query names a unit we hold. */
+function resolveStructural(index: Index, query: string): Passage[] {
+  const { structure, chunks } = index;
+  const refs = parseStructuralRefs(query);
+  const out: Passage[] = [];
+  const unit = (label: string, u: Unit, kind: string) =>
+    out.push({ label, pages: [u.pdfPage, u.pdfPage], kind, text: u.text });
+
+  if (structure) {
+    for (const { chapter, num } of refs.examples) {
+      if (!chapter) continue; // examples restart per chapter; without one we cannot disambiguate
+      const u = structure.examples?.[chapter]?.[num];
+      if (u) unit(`Chapter ${chapter} · Example ${num}`, u, "example");
+    }
+    for (const ref of refs.theorems) {
+      const u = structure.theorems?.[ref];
+      if (u) unit(`Theorem ${ref}`, u, "theorem");
+    }
+    for (const { ref, question } of refs.exercises) {
+      const u = structure.exercises?.[ref];
+      if (!u) continue;
+      const qText = question ? u.questions?.[question]?.text : undefined;
+      if (qText) out.push({ label: `Exercise ${ref} · Q${question}`, pages: [u.pdfPage, u.pdfPage], kind: "exercise", text: qText });
+      else unit(`Exercise ${ref}`, u, "exercise");
+    }
+  }
+  for (const page of refs.pages) {
+    for (const c of chunks.filter((c) => c.printedPage === page).slice(0, 2)) {
+      out.push({ label: `Printed page ${page} (${c.label})`, pages: c.pages, kind: "page", text: c.text });
+    }
+  }
+  return out.slice(0, MAX_STRUCTURAL_PASSAGES);
+}
+
 // ------------------------------------------------------------------ public API
 
 const DEVANAGARI = /[ऀ-ॿ]/g;
@@ -224,7 +306,13 @@ export async function retrieveTextbookContext(
   const hindi = letters > 0 && (query.match(DEVANAGARI)?.length ?? 0) / letters >= 0.3;
   for (const edition of hindi ? ["hindi", "english"] : ["english", "hindi"]) {
     const index = await loadIndex(book, edition);
-    if (index) return { edition, passages: await search(index, query, TOP_K) };
+    if (!index) continue;
+    // Deterministic first: if the student named a unit by position ("example 2 of
+    // chapter 1", "theorem 1.2", "exercise 1.1 q3", "page 45"), return exactly it and
+    // skip the embedding call. Otherwise fall back to hybrid semantic search.
+    const structural = resolveStructural(index, query);
+    if (structural.length > 0) return { edition, passages: structural };
+    return { edition, passages: await search(index, query, TOP_K) };
   }
   return { edition: "", passages: [] };
 }

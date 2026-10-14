@@ -4,9 +4,14 @@ No local model and no Ollama: pages are extracted as plain text with PyMuPDF and
 chunks are embedded by the hosted Nemotron-3-Embed-1B NIM (input_type="passage").
 The matching query-side embedding lives in src/lib/rag.ts (input_type="query").
 
+Besides the vector index, it emits structure.json: every Example / Theorem / Exercise
+(with its questions) keyed by chapter + ordinal, so a student's positional reference
+("example 2 of chapter 1", "theorem 1.2", "exercise 1.1 q3", "page 45") resolves by exact
+lookup in src/lib/rag.ts instead of semantic search, which cannot find a position.
+
 Layout (see rag/common.py):
     rag/data/sources/<book>/<edition>/*.pdf          input PDFs
-    rag/data/index/<book>/<edition>/                 meta.json + chunks.json + vectors.f32 (output)
+    rag/data/index/<book>/<edition>/                 meta.json + chunks.json + vectors.f32 + structure.json (output)
 
     python rag/build_index.py --book ncert-class-10-maths --edition english
     python rag/build_index.py --book ncert-class-10-maths --edition english hindi
@@ -24,6 +29,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import httpx
@@ -94,13 +100,94 @@ def chunk_paras(paras: list[str]) -> list[str]:
     return out
 
 
-def extract_chunks(book: str, edition: str) -> list[dict]:
+# ---------------------------------------------------------------- printed pages
+
+# The running header carries the book's printed page number: even pages "6 MATHEMATICS",
+# odd pages "REAL NUMBERS 7" / "QUADRATIC EQUATIONS 45". We read a few, then map every
+# pdf page to a printed page by a constant per-PDF offset (printed = pdf_index + offset).
+_HDR_EVEN = re.compile(r"\b(\d{1,3})\s+MATHEMATICS\b")
+_HDR_ODD = re.compile(r"\b[A-Z][A-Z]+(?:\s[A-Z]+)*\s+(\d{1,3})\b")
+
+
+def printed_number(page_text: str) -> int | None:
+    head = page_text[:120]
+    m = _HDR_EVEN.search(head)
+    if m:
+        return int(m.group(1))
+    m = _HDR_ODD.search(head)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def printed_offset(doc: "pymupdf.Document") -> int:
+    """printed_page - (pdf_page_index + 1), taken as the mode over detectable pages."""
+    offsets = []
+    for i in range(doc.page_count):
+        p = printed_number(clean(doc[i].get_text()))
+        if p is not None:
+            offsets.append(p - (i + 1))
+    return Counter(offsets).most_common(1)[0][0] if offsets else 0
+
+
+# ---------------------------------------------------------------- structure
+
+# Example / Theorem / Exercise headings. These are the units a student references by
+# position ("example 2", "theorem 1.2", "exercise 1.1 q3") — semantic search can't find
+# a position, so we index them for deterministic lookup (see src/lib/rag.ts).
+_MAJOR = re.compile(r"(Example\s+\d+\s*:|Theorem\s+\d+\.\d+\s*:|EXERCISE\s+\d+\.\d+)")
+_EX_NUM = re.compile(r"Example\s+(\d+)")
+_TH_REF = re.compile(r"Theorem\s+(\d+\.\d+)")
+_EXR_REF = re.compile(r"EXERCISE\s+(\d+\.\d+)")
+_QNUM = re.compile(r"(?m)^\s*(\d{1,2})\.\s")
+MAX_UNIT_CHARS = 1800
+MAX_Q_CHARS = 700
+
+
+def cap(s: str, n: int) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[:n].rstrip() + " …"
+
+
+def add_structure(struct: dict, ch: int | None, full: str, page_at) -> None:
+    """Find Example/Theorem/Exercise units in one chapter's full text and record them."""
+    marks = list(_MAJOR.finditer(full))
+    for i, m in enumerate(marks):
+        start = m.start()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(full)
+        seg = full[start:end]
+        pdf_page, printed = page_at(start)
+        head = m.group(0)
+        if head.startswith("Example") and ch is not None:
+            num = _EX_NUM.match(head).group(1)
+            slot = struct["examples"].setdefault(str(ch), {})
+            if num not in slot or len(seg) > len(slot[num]["text"]):
+                slot[num] = {"text": cap(seg, MAX_UNIT_CHARS), "pdfPage": pdf_page, "printedPage": printed}
+        elif head.startswith("Theorem"):
+            ref = _TH_REF.match(head).group(1)
+            if ref not in struct["theorems"] or len(seg) > len(struct["theorems"][ref]["text"]):
+                struct["theorems"][ref] = {"text": cap(seg, MAX_UNIT_CHARS), "pdfPage": pdf_page, "printedPage": printed}
+        else:  # EXERCISE
+            ref = _EXR_REF.match(head).group(1)
+            questions: dict[str, dict] = {}
+            qmarks = list(_QNUM.finditer(seg))
+            for j, q in enumerate(qmarks):
+                qs = q.start()
+                qe = qmarks[j + 1].start() if j + 1 < len(qmarks) else len(seg)
+                questions[q.group(1)] = {"text": cap(seg[qs:qe], MAX_Q_CHARS)}
+            struct["exercises"][ref] = {
+                "text": cap(seg, MAX_UNIT_CHARS), "pdfPage": pdf_page, "printedPage": printed, "questions": questions,
+            }
+
+
+def extract(book: str, edition: str) -> tuple[list[dict], dict]:
     titles = TITLES.get(book, {})
     src = SOURCES / book / edition
     pdfs = sorted(src.glob("*.pdf"))
     if not pdfs:
         sys.exit(f"no PDFs in {src}")
     chunks: list[dict] = []
+    struct = {"examples": {}, "theorems": {}, "exercises": {}}
     cid = 0
     for pdf in pdfs:
         if pdf.stat().st_size < 10000:  # skip truncated / 404-error files
@@ -112,8 +199,17 @@ def extract_chunks(book: str, edition: str) -> list[dict]:
         label = f"Chapter {ch}: {title}" if title else (f"Chapter {ch}" if ch else pdf.stem)
         kind = "answers" if pdf.stem.endswith("an") else "chapter"
         doc = pymupdf.open(pdf)
+        offset = printed_offset(doc)
+
+        # Full chapter text with a char-offset -> (pdf page, printed page) map for structure.
+        full = ""
+        spans: list[tuple[int, int, int, int]] = []  # (start, end, pdf_page, printed_page)
         for pno in range(doc.page_count):
             txt = clean(doc[pno].get_text())
+            printed = pno + 1 + offset
+            s = len(full)
+            full += txt + "\n"
+            spans.append((s, len(full), pno + 1, printed))
             if len(txt) < 40:
                 continue
             for c in chunk_paras(txt.split("\n\n")):
@@ -122,11 +218,19 @@ def extract_chunks(book: str, edition: str) -> list[dict]:
                     continue
                 chunks.append(
                     {"id": cid, "stem": pdf.stem, "chapter": ch, "label": label,
-                     "pages": [pno + 1, pno + 1], "kind": kind, "text": c}
+                     "pages": [pno + 1, pno + 1], "printedPage": printed, "kind": kind, "text": c}
                 )
                 cid += 1
-        print(f"  {pdf.name}: {label} — {doc.page_count} pages")
-    return chunks
+
+        def page_at(pos: int) -> tuple[int, int]:
+            for s, e, pdf_page, printed in spans:
+                if s <= pos < e:
+                    return pdf_page, printed
+            return spans[-1][2], spans[-1][3]
+
+        add_structure(struct, ch, full, page_at)
+        print(f"  {pdf.name}: {label} — {doc.page_count} pages (printed offset {offset:+d})")
+    return chunks, struct
 
 
 def embed_passages(http: httpx.Client, key: str, texts: list[str]) -> list[list[float]]:
@@ -163,7 +267,7 @@ def main() -> None:
     http = httpx.Client(timeout=120)
     for edition in args.edition:
         print(f"\n{book_title(args.book)} [{edition}]")
-        chunks = extract_chunks(args.book, edition)
+        chunks, struct = extract(args.book, edition)
         if not chunks:
             print("  no chunks; skipping")
             continue
@@ -178,13 +282,17 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
         (out_dir / "vectors.f32").write_bytes(flat.tobytes())
+        (out_dir / "structure.json").write_text(json.dumps(struct, ensure_ascii=False), encoding="utf-8")
         (out_dir / "meta.json").write_text(
             json.dumps({"book": args.book, "edition": edition, "embedModel": EMBED_MODEL,
                         "dim": dim, "count": len(chunks)}),
             encoding="utf-8",
         )
+        n_ex = sum(len(v) for v in struct["examples"].values())
         mins = (time.perf_counter() - started) / 60
-        print(f"  wrote {len(chunks)} chunks x {dim}d to {out_dir} in {mins:.1f} min")
+        print(f"  wrote {len(chunks)} chunks x {dim}d + structure "
+              f"({n_ex} examples, {len(struct['theorems'])} theorems, {len(struct['exercises'])} exercises) "
+              f"to {out_dir} in {mins:.1f} min")
 
 
 if __name__ == "__main__":
