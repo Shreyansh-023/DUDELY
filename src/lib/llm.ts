@@ -27,6 +27,17 @@ const DEFAULT_MODELS: Record<Provider, string> = {
 /** NVIDIA's OpenAI-compatible inference endpoint (integrate.api.nvidia.com). */
 const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
 
+/**
+ * Per-role models for the staged lesson flow (see schema `TutorMode`):
+ *   - PLANNER/TEACHER: Nemotron Ultra 550B on NVIDIA. It designs the lesson once
+ *     (slow is fine) and teaches each step. Override with LESSON_MODEL.
+ *   - DOUBT: Groq gpt-oss-120b — fastest + most consistent in our benchmarks — so
+ *     a student's interruption is answered quickly. Override with DOUBT_MODEL.
+ * Each falls back to the default provider/model when its preferred key is missing.
+ */
+const LESSON_MODEL = process.env.LESSON_MODEL || "nvidia/nemotron-3-ultra-550b-a55b";
+const DOUBT_MODEL = process.env.DOUBT_MODEL || "openai/gpt-oss-120b";
+
 export function detectProvider(): Provider | null {
   const forced = process.env.LLM_PROVIDER?.toLowerCase();
   if (
@@ -86,6 +97,36 @@ export function getModel(): { model: LanguageModel; label: string } {
     case "anthropic":
       return { model: createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY })(id), label };
   }
+}
+
+/**
+ * The planner/teacher model: Nemotron Ultra on NVIDIA. Falls back to the default
+ * model when there is no NVIDIA key, so the staged flow still runs on whatever is
+ * configured. `mode` only labels the returned model for the meta event.
+ */
+export function getLessonModel(): { model: LanguageModel; label: string } {
+  if (process.env.NVIDIA_API_KEY) {
+    return {
+      model: createOpenAI({
+        baseURL: NVIDIA_BASE_URL,
+        apiKey: process.env.NVIDIA_API_KEY,
+        name: "nvidia",
+      }).chat(LESSON_MODEL),
+      label: `nvidia/${LESSON_MODEL}`.replace("nvidia/nvidia/", "nvidia/"),
+    };
+  }
+  return getModel();
+}
+
+/**
+ * The doubt model: Groq gpt-oss-120b (fast). Falls back to NVIDIA, then to the
+ * default, so an interruption is always answerable even without a Groq key.
+ */
+export function getDoubtModel(): { model: LanguageModel; label: string } {
+  if (process.env.GROQ_API_KEY) {
+    return { model: createGroq({ apiKey: process.env.GROQ_API_KEY })(DOUBT_MODEL), label: `groq/${DOUBT_MODEL}` };
+  }
+  return getModel();
 }
 
 /** Which speech services are configured. Read by the browser via /api/config. */

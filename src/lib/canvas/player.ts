@@ -49,12 +49,50 @@ export class BoardPlayer {
   private pageShiftY = 0;
   private static PAGE_TOP = 80;
   private static PAGE_GAP = 110;
+  /**
+   * Doubt "side canvas": while answering a doubt the player shifts that turn's
+   * content to the RIGHT of everything else (pageShiftX) instead of below it, so
+   * the quick side-note never disturbs the main lesson flow. Its elements are
+   * tracked so `clearSide` can wipe just the doubt when the student moves on.
+   */
+  private pageShiftX = 0;
+  private sideMode = false;
+  private sideIds = new Set<string>();
+  private static SIDE_GAP = 140;
 
   constructor(private api: ExcalidrawImperativeAPI) {}
 
   /** How far the current turn's page-local coordinates are shifted down the canvas. */
   get pageShift(): number {
     return this.pageShiftY;
+  }
+
+  /**
+   * Begin a doubt answer: place this turn's content on a side canvas to the RIGHT
+   * of everything drawn so far, and let transient pointing arrows linger longer (a
+   * doubt is read more slowly than a teaching aside). Keeps the vertical position
+   * so the side-note sits beside the current lesson page, not below it.
+   */
+  beginSide() {
+    const els = this.all().filter((e) => !e.isDeleted && e.width >= 0 && e.height >= 0);
+    const right = els.length ? Math.max(...els.map((e) => e.x + e.width)) : 1000;
+    this.pageShiftX = Math.max(0, right + BoardPlayer.SIDE_GAP - BoardPlayer.PAGE_TOP);
+    this.sideMode = true;
+    this.ephemeralLingerMs = BoardPlayer.SIDE_LINGER_MS;
+  }
+
+  /** Wipe just the doubt's side canvas and return to the main lesson flow. */
+  clearSide() {
+    if (this.sideIds.size) this.deleteIds(new Set(this.sideIds));
+    this.sideIds.clear();
+    this.pageShiftX = 0;
+    this.sideMode = false;
+    this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
+  }
+
+  /** True while a doubt is being answered on the side canvas. */
+  get inSideMode(): boolean {
+    return this.sideMode;
   }
 
   /**
@@ -118,6 +156,8 @@ export class BoardPlayer {
       try {
         const els = await this.applyOp(op, turn, signal);
         created.push(...els);
+        // Remember side-canvas elements so a later clearSide() can wipe just the doubt.
+        if (this.sideMode) for (const e of els) this.sideIds.add(e.id);
       } catch (err) {
         console.warn("[board] failed op", op, err);
       }
@@ -144,6 +184,10 @@ export class BoardPlayer {
       this.idMap.clear();
       this.turnShift = { turn: 0, dx: 0, dy: 0 };
       this.pageShiftY = 0; // board wiped: the next content starts a fresh first page
+      this.pageShiftX = 0;
+      this.sideMode = false;
+      this.sideIds.clear();
+      this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
       return [];
     }
     if (op.op === "erase") {
@@ -169,7 +213,7 @@ export class BoardPlayer {
     if (ephemeral !== Boolean(op.temp)) op = { ...op, temp: ephemeral };
 
     const elementId = this.resolveId(op.id);
-    const skeleton = opToSkeleton(shiftOp(op, carried.dx, carried.dy + this.pageShiftY), turn, elementId);
+    const skeleton = opToSkeleton(shiftOp(op, carried.dx + this.pageShiftX, carried.dy + this.pageShiftY), turn, elementId);
     if (!skeleton) return [];
 
     const converted = convertToExcalidrawElements([skeleton], { regenerateIds: false });
@@ -239,13 +283,13 @@ export class BoardPlayer {
     // We do NOT feed the group's own placement back into turnShift.
     const probe = {
       id: "__group__",
-      x: bbox.x + carried.dx,
+      x: bbox.x + carried.dx + this.pageShiftX,
       y: bbox.y + carried.dy + this.pageShiftY,
       width: bbox.w,
       height: bbox.h,
     } as unknown as ExcalidrawElement;
     const { dx, dy } = this.collisionPush(probe);
-    const tx = carried.dx + dx;
+    const tx = carried.dx + dx + this.pageShiftX;
     const ty = carried.dy + dy + this.pageShiftY;
     const placed = tx || ty ? children.map((c) => shiftOp(c, tx, ty)) : children;
 
@@ -491,8 +535,15 @@ export class BoardPlayer {
     this.commit([...this.all().filter((e) => e.id !== el.id), el, ...bound]);
   }
 
-  /** How long a transient annotation stays fully visible before it starts to fade. */
-  private static EPHEMERAL_LINGER_MS = 2600;
+  /**
+   * How long a transient annotation stays fully visible before it fades. The base
+   * value is a touch generous so "look here" arrows are readable; doubt answers on
+   * the side canvas use the longer SIDE value, since a confused student re-reads
+   * the pointer more slowly. `ephemeralLingerMs` is the live value (set per mode).
+   */
+  private static EPHEMERAL_LINGER_MS = 4000;
+  private static SIDE_LINGER_MS = 9000;
+  private ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
 
   /** After a linger, fade the given elements out and delete them. Detached from the turn. */
   private scheduleEphemeralFade(ids: string[]) {
@@ -500,7 +551,7 @@ export class BoardPlayer {
     const timer = setTimeout(() => {
       this.ephemeralTimers.delete(timer);
       void this.fadeOutAndDelete(new Set(ids));
-    }, BoardPlayer.EPHEMERAL_LINGER_MS);
+    }, this.ephemeralLingerMs);
     this.ephemeralTimers.add(timer);
   }
 
@@ -565,6 +616,10 @@ export class BoardPlayer {
     this.idMap.clear();
     this.turnShift = { turn: 0, dx: 0, dy: 0 };
     this.pageShiftY = 0;
+    this.pageShiftX = 0;
+    this.sideMode = false;
+    this.sideIds.clear();
+    this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
   }
 }
 

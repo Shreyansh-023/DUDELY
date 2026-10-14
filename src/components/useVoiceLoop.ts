@@ -64,6 +64,8 @@ export function useVoiceLoop(deps: Deps): {
   pause: () => void;
   /** Open the mic now — called when the student presses Enter in the "awaiting" phase. */
   listen: () => void;
+  /** Interrupt Guru and start listening immediately — the Doubt button. */
+  bargeIn: () => void;
 } {
   const [phase, setPhaseState] = useState<VoicePhase>("off");
   const [voiceCaption, setVoiceCaption] = useState<{ text: string; word: number } | null>(null);
@@ -178,12 +180,13 @@ export function useVoiceLoop(deps: Deps): {
   );
 
   const listenOnce = useCallback(
-    async (gen: number, immediate = false) => {
+    async (gen: number, immediate = false, force = false) => {
       if (gen !== genRef.current) return;
       const d = depsRef.current;
-      if (d.status !== "idle") {
+      if (!force && d.status !== "idle") {
         // A turn is still playing (e.g. voice mode entered mid-lesson); the
-        // resume effect will call us again when it finishes.
+        // resume effect will call us again when it finishes. `force` (barge-in)
+        // skips this because the caller just stopped the turn on purpose.
         setPhase("processing");
         return;
       }
@@ -362,6 +365,19 @@ export function useVoiceLoop(deps: Deps): {
     void listenOnceRef.current(++genRef.current, true);
   }, []);
 
+  // The student tapped the Doubt button mid-lesson: whoever stopped Guru's turn,
+  // open the mic immediately to capture the doubt (force past the "Guru is speaking"
+  // gate, since the interruption is intentional).
+  const bargeIn = useCallback(() => {
+    if (!depsRef.current.enabled) return;
+    greetAbortRef.current?.abort();
+    greetAbortRef.current = null;
+    cancelCapture();
+    autoContinueRef.current = 0;
+    depsRef.current.setError(null);
+    void listenOnceRef.current(++genRef.current, true, true);
+  }, [cancelCapture]);
+
   const pause = useCallback(() => {
     genRef.current += 1; // orphan any in-flight continuation (greeting chain included)
     greetAbortRef.current?.abort();
@@ -372,5 +388,5 @@ export function useVoiceLoop(deps: Deps): {
     setPhase("paused");
   }, [cancelCapture, setPhase]);
 
-  return { phase, voiceCaption, resume, pause, listen };
+  return { phase, voiceCaption, resume, pause, listen, bargeIn };
 }

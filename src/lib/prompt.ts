@@ -1,6 +1,7 @@
 import { textbookLabel, type Grade, type SubjectId } from "./curriculum";
 import { languageLabel } from "./languages";
 import type { Passage } from "./rag";
+import type { LessonPlan } from "./schema";
 
 /**
  * The tutor "mastery" system prompt. This is where the Dudely feel comes from:
@@ -162,4 +163,159 @@ ${profile}`;
 export function buildUserTurn(opts: { text: string; canvas: string }): string {
   const canvas = opts.canvas.trim() || "(board is empty)\nSuggested top-left for new content: (80, 80)";
   return `${opts.text.trim()}\n\n---\nCANVAS\n${canvas}`;
+}
+
+// ---------------------------------------------------------------------------
+// Staged lesson flow (TutorMode). The planner designs the whole lesson once;
+// the teacher teaches it one step at a time; the doubt model answers questions
+// on a side canvas without disturbing the main lesson. See lib/schema.ts.
+// ---------------------------------------------------------------------------
+
+const FAMILIARITY_NOTE: Record<"new" | "some" | "confident", string> = {
+  new: "The student says this topic is NEW to them. Start from intuition and a concrete real-life hook, assume no prior exposure, and include more small foundational steps before any formula.",
+  some: "The student has SEEN this topic before but is shaky. Briefly refresh the idea, then spend most steps on the parts students usually get wrong.",
+  confident: "The student is CONFIDENT with this topic. Keep foundations very short, go deeper faster, and weight steps toward harder cases, subtleties and practice.",
+};
+
+/**
+ * Planner prompt (Nemotron Ultra). It designs the lesson ONCE, in detail: what to
+ * teach, in what order, and what the board should show — but it does NOT teach yet.
+ * Output is a single JSON object matching LessonPlanSchema so the client can store
+ * it and later ask the teacher to teach one step at a time.
+ */
+export function buildPlanPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  familiarity?: "new" | "some" | "confident" | null;
+  textbook?: Passage[];
+}): string {
+  const base = buildSystemPrompt(opts); // reuse curriculum + textbook + language + profile context
+  const fam = opts.familiarity ? FAMILIARITY_NOTE[opts.familiarity] : "The student's familiarity is unknown; pitch for a first, careful pass through the topic.";
+  return `You are "Indica", a world-class tutor, acting right now as a LESSON DESIGNER. The student has named a topic. Before any teaching happens, design the full lesson in detail. Take your time and think it through — this runs once.
+
+${fam}
+
+# Your job
+Produce a step-by-step plan for teaching this ONE topic on a live whiteboard. Each step is ONE small idea that will become a short spoken explanation with a drawing (mastery first: never more than one idea per step). Order the steps as a real teacher would: open with intuition or a real-life hook, build up concept by concept, show one worked visual, and end with a quick check or a textbook-style practice step. Typically 4 to 8 steps.
+
+For each step give:
+- "title": a few words naming the step.
+- "teach": one or two sentences on what to explain in this step.
+- "draw": what the board should show for this step (a hint — a diagram type, a formula, a labelled figure — not literal coordinates).
+
+Ground the plan in the student's NCERT textbook context provided below (use its definitions, notation and sequence). Match the class level.
+
+# Output (STRICT)
+Output ONE JSON object and nothing else — no prose, no markdown fences, no commentary:
+{"topic":"<topic>","level":"<one phrase describing the pitch you chose>","steps":[{"title":"...","teach":"...","draw":"..."}, ...]}
+
+# Context for your design (do NOT output this; use it to design well)
+${base}`;
+}
+
+/**
+ * Explain prompt (Nemotron Ultra). The student asked to work a SPECIFIC textbook
+ * item — an example, exercise question or theorem (the RAG layer resolves the exact
+ * one and supplies it as a passage). Reuses the full board-rules prompt and asks the
+ * model to teach THAT item, step by step, on the MAIN board like normal teaching —
+ * NOT on a side canvas and NOT as a quick aside.
+ */
+export function buildExplainSystemPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  textbook?: Passage[];
+  plan?: LessonPlan | null;
+}): string {
+  const base = buildSystemPrompt(opts);
+  const planBlock = opts.plan && opts.plan.steps.length
+    ? `\n# The lesson in progress (context — the item may or may not be part of it)\nTopic: ${opts.plan.topic}\n${planOutline(opts.plan)}\n`
+    : "";
+  return `${base}
+${planBlock}
+# THIS TURN — work a SPECIFIC textbook item the student named (Example / Exercise / Theorem)
+The student asked you to explain or solve a particular item from their textbook. The passages above include the exact one (it is labelled, e.g. "Chapter 4 · Example 2" or "Exercise 4.1 · Q3" or "Theorem 1.2").
+- Teach THAT exact item — its real statement, values and method — worked step by step on the MAIN board, as a full teaching turn (this is NOT a side note; draw normally, start at the top-left of a fresh page).
+- Use the item's actual numbers and the book's method; do not substitute a different example from memory.
+- 3-7 beats. End on a clean statement once the item is fully worked. Do not quiz the student.`;
+}
+
+/** The lesson plan rendered as a compact outline the teacher/doubt models read for context. */
+function planOutline(plan: LessonPlan): string {
+  if (!plan.steps.length) return "(no plan available)";
+  return plan.steps
+    .map((s, i) => `${i + 1}. ${s.title}${s.teach ? ` — ${s.teach}` : ""}${s.draw ? ` [board: ${s.draw}]` : ""}`)
+    .join("\n");
+}
+
+/**
+ * Teacher prompt (Nemotron Ultra). Reuses the full board-rules system prompt and
+ * adds the plan + which step to teach, so the model teaches exactly that step as
+ * beats and nothing more.
+ */
+export function buildTeachSystemPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  textbook?: Passage[];
+  plan: LessonPlan;
+  step: number;
+}): string {
+  const base = buildSystemPrompt(opts);
+  const { plan, step } = opts;
+  const current = plan.steps[step];
+  const isLast = step >= plan.steps.length - 1;
+  const stepBlock = current
+    ? `You are now teaching STEP ${step + 1} of ${plan.steps.length}: "${current.title}".
+What to explain: ${current.teach || current.title}
+What the board should show: ${current.draw || "draw whatever best visualises this step"}`
+    : `Teach the next sensible step for this topic.`;
+
+  return `${base}
+
+# LESSON PLAN (you designed this earlier — follow it; do not restart the topic)
+Topic: ${plan.topic || "(as discussed)"}${plan.level ? `\nPitch: ${plan.level}` : ""}
+${planOutline(plan)}
+
+# THIS TURN
+${stepBlock}
+- Teach ONLY this step, as 2-6 beats, then stop. Do NOT jump ahead to later steps or re-teach earlier ones.
+- Assume earlier steps are already on previous pages; start this step's drawing at the top-left of a fresh page as the board rules describe.
+- IMPORTANT (overrides the ASK pedagogy above): in this guided lesson do NOT end with a checkpoint question and do NOT quiz the student between steps. Always end this step on a clear, complete STATEMENT. The student will interrupt on their own if they have a doubt, and the lesson advances to the next step automatically.
+${isLast ? '- This is the LAST step. After teaching it, close the topic and offer a textbook-style practice example (this closing offer is the one place a question is allowed).' : '- End on a clean statement that rounds off this step so the lesson can flow into the next one.'}`;
+}
+
+/**
+ * Doubt prompt (Groq). The student interrupted with a question mid-lesson. Reuses
+ * the board-rules prompt, then constrains the answer to a compact SIDE note: it is
+ * drawn on a separate side canvas (the client handles placement), so the model must
+ * NOT redraw the lesson and should prefer temporary pointing arrows to the existing
+ * figures over drawing new permanent structure.
+ */
+export function buildDoubtSystemPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  textbook?: Passage[];
+  plan?: LessonPlan | null;
+}): string {
+  const base = buildSystemPrompt(opts);
+  const planBlock = opts.plan && opts.plan.steps.length
+    ? `\n# The lesson in progress (for context — do NOT re-teach it)\nTopic: ${opts.plan.topic}\n${planOutline(opts.plan)}\n`
+    : "";
+
+  return `${base}
+${planBlock}
+# THIS TURN — the student has a DOUBT (answer it, do not advance the lesson)
+# (Conceptual doubt only. A request to work a specific textbook Example/Exercise/Theorem is handled elsewhere, on the main board.)
+The student interrupted the lesson with a question or confusion. Clear up EXACTLY that doubt, briefly, then stop and check if it helped. This is a quick side-note, not a new lesson.
+- Keep it SHORT: 1-4 beats. Answer only what they asked.
+- This answer is drawn on a SEPARATE side canvas, away from the lesson, so NEVER redraw or restate the whole lesson. Do not use the "clear" op.
+- PREFER pointing over redrawing: if the existing figures already show what they need, use temporary pointing gestures — an \`arrow\` or \`highlight\` with "temp":true — to point at the relevant part while you explain, instead of drawing new permanent shapes. Draw new permanent structure only when there is genuinely something new to show.
+- End with a short check that the doubt is cleared (e.g. ${opts.language === "en" ? '"Does that clear it up?"' : '"Samajh aaya ya aur detail mein dekhein?"'}), its \`say\` ending with "?", and put that question on the side canvas as a short orange text op. Then stop.`;
 }

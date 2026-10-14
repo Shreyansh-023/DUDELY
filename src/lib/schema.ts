@@ -307,6 +307,38 @@ export const HistoryMessageSchema = z.object({
 });
 export type HistoryMessage = z.infer<typeof HistoryMessageSchema>;
 
+/**
+ * A single step of a lesson plan, designed up front by the planner model
+ * (Nemotron Ultra). The teaching model later turns one step into spoken beats +
+ * board drawings. `draw` is a hint about what the board should show for the step.
+ */
+export const LessonStepSchema = z.object({
+  title: z.string().describe("Short title of this step, e.g. 'Opening analogy' or 'Derive the quadratic formula'."),
+  teach: z.string().default("").describe("What to explain in this step, in a sentence or two."),
+  draw: z.string().default("").describe("What the board should show for this step (a hint, not literal ops)."),
+});
+export type LessonStep = z.infer<typeof LessonStepSchema>;
+
+/** The whole lesson plan Ultra produces once, then the client threads back each teaching turn. */
+export const LessonPlanSchema = z.object({
+  topic: z.string().default("").describe("The topic being taught."),
+  level: z.string().default("").describe("Pitch/pace chosen from the student's stated familiarity."),
+  steps: z.array(LessonStepSchema).default([]),
+});
+export type LessonPlan = z.infer<typeof LessonPlanSchema>;
+
+/**
+ * What the current turn is for. The client drives a small state machine:
+ *   plan    -> design the lesson (Ultra), no beats, returns a `plan` event
+ *   teach   -> teach one plan step as beats (Ultra), guided by `plan` + `step`
+ *   doubt   -> answer a conceptual question as beats (Groq), drawn on a side canvas
+ *   explain -> work a specific textbook item (example/exercise/theorem) the student
+ *              named, as beats (Ultra), drawn on the MAIN canvas like normal teaching
+ *   ask     -> legacy single-turn behaviour (no plan); the original tutor loop
+ */
+export const TUTOR_MODES = ["plan", "teach", "doubt", "explain", "ask"] as const;
+export type TutorMode = (typeof TUTOR_MODES)[number];
+
 export const TutorRequestSchema = z.object({
   messages: z.array(HistoryMessageSchema).min(1),
   /** Compact textual description of what is on the board right now. */
@@ -319,12 +351,21 @@ export const TutorRequestSchema = z.object({
   subject: z.enum(["maths", "science"]).nullish(),
   /** Free text about the student: "Class 10, CBSE, weak in algebra". */
   profile: z.string().default(""),
+  /** Which stage of the lesson this turn is; defaults to the legacy single-turn flow. */
+  mode: z.enum(TUTOR_MODES).default("ask"),
+  /** The lesson plan designed earlier (teach/doubt turns thread it back so the model stays on plan). */
+  plan: LessonPlanSchema.nullish(),
+  /** Which plan step to teach (teach mode), 0-based. */
+  step: z.number().int().min(0).nullish(),
+  /** The student's self-reported familiarity with the topic, fed into planning. */
+  familiarity: z.enum(["new", "some", "confident"]).nullish(),
 });
 export type TutorRequest = z.infer<typeof TutorRequestSchema>;
 
 /** NDJSON events streamed from /api/tutor to the browser. */
 export type TutorEvent =
   | { type: "meta"; model: string; sources?: string[] }
+  | { type: "plan"; plan: LessonPlan }
   | { type: "beat"; beat: Beat }
   | { type: "done" }
   | { type: "error"; message: string };
