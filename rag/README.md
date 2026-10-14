@@ -125,10 +125,13 @@ Then, in `src/lib/rag.ts`, the query-side parser (`parseStructuralRefs`) already
 **activity**), add: a key in `structure.json` (build side), a `Structure` field + a branch in
 `resolveStructural`, and an `activity\s+…` rule in `parseStructuralRefs` (rag.ts).
 
-> Query keywords are **English** today (`example`, `section`, `chapter`, `teach`, …). A student
-> typing them in Hindi/Devanagari falls back to semantic search (which is cross-lingual and
-> still works). Add Hindi/Hinglish aliases to the parser regexes when you want deterministic
-> lookup in Hindi too.
+> Query keywords recognise **English, Hinglish and Hindi (Devanagari)** — `example / udaharan /
+> उदाहरण`, `chapter / adhyay / अध्याय`, `theorem / प्रमेय`, `exercise / प्रश्नावली`, `section`,
+> `page / पृष्ठ`, plus opener words (`teach / sikhao / सिखाओ`, …); Devanagari digits (`उदाहरण २`)
+> are normalised. Because a reference is numeric and the numbering is identical across editions,
+> a Hindi/Hinglish request resolves into the **English** index with no Hindi book needed (the
+> tutor then teaches that unit in the student's language). See `parseStructuralRefs` / `OPENER`
+> in `src/lib/rag.ts`; add more aliases or another language there.
 
 ---
 

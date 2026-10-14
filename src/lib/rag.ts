@@ -239,25 +239,48 @@ type Refs = {
   pages: number[]; // printed page numbers
 };
 
+// Structural keywords in English, Hinglish (romanized) and Hindi (Devanagari). A reference
+// is NUMERIC and the numbering is identical across editions, so a Hindi/Hinglish request
+// ("अध्याय 1 का उदाहरण 2", "chapter 1 ka example 2") resolves straight into the (English)
+// structure index; the tutor then teaches that unit in the student's language.
+const SEP = "[\\s:#.\\-]*"; // optional separators between a keyword and its number
+// Negative lookbehind: not preceded by a letter (Latin or Devanagari) so short aliases
+// ("q", "chap") never fire inside a word ("each 1", "quadratic 2").
+const kw = (...alts: string[]) => `(?<![a-z\\u0900-\\u097f])(?:${alts.join("|")})`;
+const K_CHAPTER = kw("chapters?", "chap", "adhyaay", "adhyay", "अध्याय", "चैप्टर");
+const K_EXAMPLE = kw("examples?", "udaharan\\w*", "udhaaran\\w*", "उदाहरण");
+const K_THEOREM = kw("theorems?", "prameya?", "प्रमेय");
+const K_EXERCISE = kw("exercises?", "prashnaavali", "prashnavali", "abhyaas", "abhyas", "प्रश्नावली", "अभ्यास");
+const K_SECTION = kw("sections?", "anubhag", "अनुभाग", "खंड", "भाग");
+const K_PAGE = kw("page", "pej", "prishtha?", "पृष्ठ", "पेज");
+const K_QUESTION = kw("questions?", "ques", "prashn", "sawaal", "sawal", "problem", "q", "प्रश्न", "सवाल");
+const NUM = "(?:no\\.?\\s*|number\\s*|sankhya\\s*|संख्या\\s*)?"; // optional "no."/"number"/"संख्या"
+
+// Devanagari digits ०-९ -> 0-9, so "उदाहरण २" is read like "example 2".
+function normalizeDigits(s: string): string {
+  return s.replace(/[०-९]/g, (d) => String(d.charCodeAt(0) - 0x0966));
+}
+
 function parseStructuralRefs(query: string): Refs {
-  const q = query.toLowerCase();
+  const q = normalizeDigits(query.toLowerCase());
   const refs: Refs = { examples: [], theorems: [], exercises: [], sections: [], pages: [] };
-  // "chapter N" scopes examples (which are numbered per chapter). Theorems/exercises/
-  // sections carry their chapter in the "N.N" ref, so they need no separate chapter.
-  const chapter = q.match(/chapter\s+(\d+)/)?.[1] ?? null;
-  for (const m of q.matchAll(/example\s+(?:no\.?\s*|number\s*)?(\d+)/g)) refs.examples.push({ chapter, num: m[1] });
-  for (const m of q.matchAll(/theorem\s+(\d+\.\d+)/g)) refs.theorems.push(m[1]);
-  const question = q.match(/(?:question|ques|prob(?:lem)?|q)\.?\s*(?:no\.?\s*|number\s*)?(\d+)/)?.[1] ?? null;
-  for (const m of q.matchAll(/exercise\s+(\d+\.\d+)/g)) refs.exercises.push({ ref: m[1], question });
-  for (const m of q.matchAll(/section\s+(\d+\.\d+)/g)) refs.sections.push(m[1]);
-  for (const m of q.matchAll(/page\s+(?:no\.?\s*|number\s*|#\s*)?(\d+)/g)) refs.pages.push(Number(m[1]));
+  // "chapter N" scopes examples (numbered per chapter). Theorems/exercises/sections carry
+  // their chapter in the "N.N" ref, so they need no separate chapter.
+  const chapter = q.match(new RegExp(`${K_CHAPTER}${SEP}${NUM}(\\d+)`, "i"))?.[1] ?? null;
+  for (const m of q.matchAll(new RegExp(`${K_EXAMPLE}${SEP}${NUM}(\\d+)`, "gi"))) refs.examples.push({ chapter, num: m[1] });
+  for (const m of q.matchAll(new RegExp(`${K_THEOREM}${SEP}(\\d+\\.\\d+)`, "gi"))) refs.theorems.push(m[1]);
+  const question = q.match(new RegExp(`${K_QUESTION}${SEP}${NUM}(\\d+)`, "i"))?.[1] ?? null;
+  for (const m of q.matchAll(new RegExp(`${K_EXERCISE}${SEP}(\\d+\\.\\d+)`, "gi"))) refs.exercises.push({ ref: m[1], question });
+  for (const m of q.matchAll(new RegExp(`${K_SECTION}${SEP}(\\d+\\.\\d+)`, "gi"))) refs.sections.push(m[1]);
+  for (const m of q.matchAll(new RegExp(`${K_PAGE}${SEP}${NUM}(\\d+)`, "gi"))) refs.pages.push(Number(m[1]));
   return refs;
 }
 
-// Opening a topic ("teach me X", "start trigonometry", "explain quadratic equations") is a
-// pedagogical need, not a similarity match: the book's intro/analogy and the chapter's
-// teaching sequence must be surfaced on purpose. These words flag that intent.
-const OPENER = /\b(teach|start|started|learn|learning|begin|introduce|introduction|intro|basics?|overview|explain|understand)\b/i;
+// Opening a topic is a pedagogical need, not a similarity match: the book's intro/analogy
+// and the chapter's teaching sequence must be surfaced on purpose. These words — English,
+// Hinglish and Hindi — flag that intent ("teach me X", "mujhe X sikhao", "X समझाओ").
+const OPENER =
+  /(teach|start|learn|begin|introduc|intro|basics?|overview|explain|understand|samjha|sikha|padha|parichay|shuru|bata|seekh|समझा|सिखा|पढ़ा|पढा|परिचय|शुरू|बता|सीख)/i;
 
 /** The chapter most of these passages belong to (parsed from their labels), or null. */
 function dominantChapter(passages: Passage[]): string | null {
