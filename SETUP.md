@@ -136,14 +136,25 @@ Needs `NVIDIA_API_KEY` in `.env` / `.env.local` or the shell environment.
 
 Download NCERT chapter PDFs (copyright; do not commit them — `rag/data/` is gitignored).
 
+**Maths classes 1–9** (current NCF English editions) — automated:
+
+```bash
+# Windows PowerShell
+$env:PYTHONPATH="rag"; python rag/download_ncert_maths.py --grades 1 2 3 4 5 6 7 8 9
+
+# macOS / Linux
+PYTHONPATH="rag" python rag/download_ncert_maths.py --grades 1 2 3 4 5 6 7 8 9
+```
+
+Or place PDFs manually:
+
 ```
 rag/data/sources/<book>/<edition>/*.pdf
 ```
 
-Examples:
-
 | Book key | Example PDF stem |
 | --- | --- |
+| `ncert-class-1-maths` … `ncert-class-9-maths` | see `rag/download_ncert_maths.py` / `rag/README.md` |
 | `ncert-class-10-maths` | `jemh104.pdf` (chapter 4) |
 | `ncert-class-9-science` | `iesc101.pdf` (chapter 1) |
 
@@ -152,11 +163,14 @@ Book keys match `textbookKey(grade, subject)` in `src/lib/curriculum.ts` (e.g. C
 ### 5.3 Build the index
 
 ```bash
-# Windows PowerShell
+# Windows PowerShell — all maths 1–9
+$env:PYTHONPATH="rag"; python rag/build_index.py --grades 1 2 3 4 5 6 7 8 9 --edition english
+
+# Single book
 $env:PYTHONPATH="rag"; python rag/build_index.py --book ncert-class-10-maths --edition english
 
 # macOS / Linux
-PYTHONPATH="rag" python rag/build_index.py --book ncert-class-10-maths --edition english
+PYTHONPATH="rag" python rag/build_index.py --grades 1 2 3 4 5 6 7 8 9 --edition english
 ```
 
 Output lands in:

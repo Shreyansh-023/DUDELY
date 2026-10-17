@@ -15,7 +15,11 @@ here in `rag/`. `rag/data/` is git-ignored (NCERT PDFs are copyright; the index 
 pip install -r rag/requirements.txt                 # pymupdf + httpx (one-time)
 # NVIDIA_API_KEY must be in .env or the environment (used for embeddings)
 
-# put the chapter PDFs here:  rag/data/sources/ncert-class-9-science/english/*.pdf
+# Maths classes 1–9 (downloads current NCF English PDFs, then embeds):
+PYTHONPATH="rag" python rag/download_ncert_maths.py --grades 1 2 3 4 5 6 7 8 9
+PYTHONPATH="rag" python rag/build_index.py --grades 1 2 3 4 5 6 7 8 9 --edition english
+
+# Or put chapter PDFs manually, e.g. rag/data/sources/ncert-class-9-science/english/*.pdf
 PYTHONPATH="rag" python rag/build_index.py --book ncert-class-9-science --edition english
 ```
 
@@ -64,8 +68,19 @@ via the regex `(\d\d)\D*$` on the filename.
 
 | Book | Stem prefix | Example |
 | --- | --- | --- |
+| Class 1 Maths (Joyful Mathematics) | `aejm1` | `aejm101.pdf` = ch 1 |
+| Class 2 Maths (Joyful Mathematics) | `bejm1` | `bejm101.pdf` = ch 1 |
+| Class 3 Maths (Maths Mela) | `cemm1` | `cemm101.pdf` = ch 1 |
+| Class 4 Maths (Maths Mela) | `demm1` | `demm101.pdf` = ch 1 |
+| Class 5 Maths (Maths Mela) | `eemm1` | `eemm101.pdf` = ch 1 |
+| Class 6 Maths (Ganita Prakash) | `fegp1` | `fegp101.pdf` = ch 1 |
+| Class 7 Maths (Ganita Prakash) | `gegp1` | `gegp101.pdf` = ch 1 |
+| Class 8 Maths (Ganita Prakash Part I) | `hegp1` | `hegp101.pdf` = ch 1 |
+| Class 9 Maths (Ganita Manjari) | `iemh1` | `iemh101.pdf` = ch 1 |
 | Class 10 Maths (English) | `jemh1` | `jemh104.pdf` = ch 4 |
 | Class 9 Science (English) | `iesc1` | `iesc101.pdf` = ch 1 |
+
+`rag/download_ncert_maths.py` fetches classes 1–9 English Maths for you.
 
 Find the exact stems from the book's page on ncert.nic.in (or probe `curl -sI`). Put one PDF
 per chapter into:
