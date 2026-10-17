@@ -108,7 +108,10 @@ export function languageLabel(code: string): string {
  * for the student to press Enter before the mic opens. The spoken lines never
  * enter the chat transcript or the LLM history.
  */
-export const VOICE_PROMPTS: Record<LanguageCode, { greeting: string; reprompt: string; answerHint: string }> = {
+export const VOICE_PROMPTS: Record<
+  LanguageCode,
+  { greeting: string; reprompt: string; answerHint: string }
+> = {
   en: {
     greeting: "Hello! What should we learn today?",
     reprompt: "I didn't hear anything. Can you repeat?",
@@ -173,6 +176,76 @@ export const VOICE_PROMPTS: Record<LanguageCode, { greeting: string; reprompt: s
 
 export function voicePrompts(code: string): { greeting: string; reprompt: string; answerHint: string } {
   return VOICE_PROMPTS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
+/**
+ * The opening familiarity question Indica asks once when a student names a new
+ * topic, BEFORE the lesson is designed. It is a fixed template per language (no
+ * LLM call) so it is instant; the student's answer calibrates the lesson plan.
+ */
+export const FAMILIARITY_PROMPTS: Record<LanguageCode, string> = {
+  en: "Before we begin — have you studied this topic before, or is it completely new for you?",
+  "en-IN": "Shuru karne se pehle — kya tumne yeh topic pehle padha hai, ya yeh bilkul naya hai?",
+  "hi-IN": "शुरू करने से पहले — क्या तुमने यह विषय पहले पढ़ा है, या यह बिल्कुल नया है?",
+  "bn-IN": "শুরু করার আগে — তুমি কি এই বিষয়টি আগে পড়েছ, নাকি এটি একদম নতুন?",
+  "ta-IN": "தொடங்குவதற்கு முன் — இந்தத் தலைப்பை முன்பு படித்திருக்கிறாயா, அல்லது இது முற்றிலும் புதியதா?",
+  "te-IN": "ప్రారంభించే ముందు — ఈ అంశాన్ని నువ్వు ఇంతకుముందు చదివావా, లేదా ఇది పూర్తిగా కొత్తదా?",
+  "mr-IN": "सुरू करण्यापूर्वी — तू हा विषय आधी शिकला आहेस का, की तो अगदी नवीन आहे?",
+  "gu-IN": "શરૂ કરતા પહેલાં — શું તેં આ વિષય પહેલાં ભણ્યો છે, કે તે તદ્દન નવો છે?",
+  "kn-IN": "ಪ್ರಾರಂಭಿಸುವ ಮೊದಲು — ನೀನು ಈ ವಿಷಯವನ್ನು ಮೊದಲು ಓದಿದ್ದೀಯಾ, ಅಥವಾ ಇದು ಸಂಪೂರ್ಣ ಹೊಸದೇ?",
+  "ml-IN": "തുടങ്ങുന്നതിന് മുമ്പ് — ഈ വിഷയം നീ മുമ്പ് പഠിച്ചിട്ടുണ്ടോ, അതോ ഇത് തീർത്തും പുതിയതാണോ?",
+  "pa-IN": "ਸ਼ੁਰੂ ਕਰਨ ਤੋਂ ਪਹਿਲਾਂ — ਕੀ ਤੂੰ ਇਹ ਵਿਸ਼ਾ ਪਹਿਲਾਂ ਪੜ੍ਹਿਆ ਹੈ, ਜਾਂ ਇਹ ਬਿਲਕੁਲ ਨਵਾਂ ਹੈ?",
+  "od-IN": "ଆରମ୍ଭ କରିବା ପୂର୍ବରୁ — ତୁମେ ଏହି ବିଷୟ ପୂର୍ବରୁ ପଢ଼ିଛ କି, ନା ଏହା ସମ୍ପୂର୍ଣ୍ଣ ନୂଆ?",
+};
+
+export function familiarityQuestion(code: string): string {
+  return FAMILIARITY_PROMPTS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
+/**
+ * Read the student's answer to the familiarity question into a level that tunes
+ * the lesson plan. Heuristic across English, Hinglish and Hindi; defaults to
+ * "new" (start from basics) when the answer is unclear — the safer pitch.
+ */
+export function classifyFamiliarity(text: string): "new" | "some" | "confident" {
+  const t = text.toLowerCase();
+  if (/(never|nahi|nhi|नहीं|first time|pehli baar|पहली बार|no idea|bilkul naya|बिल्कुल नया|\bnew\b|naya|नया|don'?t know|nothing)/.test(t))
+    return "new";
+  if (/(confident|very well|acch?i tarah|अच्छी तरह|fully|poora|पूरा|master|expert|bahut|strong)/.test(t))
+    return "confident";
+  if (/(little|thoda|थोड़ा|some|kuch|कुछ|basic|heard|seen|dekha|सुना|बेसिक|bit)/.test(t)) return "some";
+  if (/(yes|haan|हाँ|ha\b|yeah|yep|pata|आता|aata)/.test(t)) return "some";
+  return "new";
+}
+
+/**
+ * Does the student want a SPECIFIC textbook item worked — an example, exercise or
+ * theorem? Those go to the planner/teacher model (Ultra) on the main board, not to
+ * the quick doubt model. Keywords mirror lib/rag.ts (English, Hinglish, Hindi), so
+ * "explain example 2", "solve exercise 4.1 Q3", "theorem 1.2 samjhao", "उदाहरण 3
+ * समझाओ" all match. A bare "give me an example" also matches, which is fine — Ultra
+ * then works a worked example on the main board.
+ */
+export function isExplainRequest(text: string): boolean {
+  return /(examples?|udaharan|udhaaran|उदाहरण|exercises?|prashn?aavali|prashnavali|abhyaas|abhyas|प्रश्नावली|अभ्यास|theorems?|prameya|प्रमेय)/i.test(
+    text,
+  );
+}
+
+/**
+ * During a doubt, decide whether the student's reply means "I'm satisfied, carry
+ * on" (resume the lesson) rather than a further question. Anything with a question
+ * mark, a question word, or a negation is treated as another doubt (returns false).
+ */
+export function isDoubtCleared(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return false;
+  if (/[?？]/.test(t)) return false;
+  if (/(no\b|nahi|nhi|नहीं|not |still|confus|samajh nahi|phir se|फिर से|but |lekin|kyun|kyu|why|how|kaise|kaisе|what|aur ek|एक और|doubt|wait|ruk)/.test(t))
+    return false;
+  return /(got it|understood|understand|clear|cleared|makes sense|ok\b|okay|yes|yeah|yep|done|next|continue|carry on|aage|आगे|move on|thanks|thank you|samajh|samjh|समझ|theek|thik|ठीक|haan|हाँ|accha|अच्छा|great|perfect)/.test(
+    t,
+  );
 }
 
 /**

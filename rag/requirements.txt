@@ -1,0 +1,5 @@
+# Offline index build for textbook RAG (see rag/build_index.py).
+# Embeddings use the hosted NVIDIA Nemotron NIM (needs NVIDIA_API_KEY) — nothing runs
+# locally, so there is no Ollama / torch dependency. Runtime retrieval is in src/lib/rag.ts.
+pymupdf>=1.24
+httpx>=0.27

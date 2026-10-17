@@ -33,6 +33,51 @@ export const FONT_PX: Record<SizeName, number> = { sm: 16, md: 24, lg: 36 };
 
 export const HIGHLIGHT_FILL = "#ffec99";
 
+// Excalidraw font-family ids (the numbers used by appState.currentItemFontFamily).
+// The board's default is the hand-drawn Excalifont (5); family 2 is the plain
+// Helvetica substitute (LiberationSans). We keep everything hand-drawn EXCEPT
+// text that contains a math glyph the hand-drawn fonts can't render (see below).
+const FONT_HANDDRAWN = 5;
+const FONT_MATH = 2;
+
+/**
+ * Characters that NONE of Excalidraw's hand-drawn fonts (Excalifont/Virgil/
+ * Comic Shanns/Nunito/Lilita) have a glyph for, so the browser substitutes a
+ * fallback and they come out as mojibake on the board — e.g. "√2" rendered as
+ * "Ã2", "x²" as garbage. Every character listed here DOES exist in the bundled
+ * Helvetica substitute (LiberationSans), so any string containing one is drawn
+ * in that font instead. Verified against the bundled woff2 cmaps.
+ *
+ * Symbols the hand-drawn font CAN draw are deliberately left out so ordinary
+ * text keeps its hand-drawn feel: × ÷ · − ± ° π θ Σ µ λ α β ½ ¼ ¾ – — …
+ * Covered here: √∛ superscripts(² ³ ¹ ⁰ ⁴⁵⁶⁷⁸⁹ ⁿ) subscripts(₀–₉) Δ Ω
+ * ≤ ≥ ≠ ≈ ≡ ∝ ∞ → ← ↔ ⇒ ∫ ∏ ∂ ∇ ∈∉ ∠ ∥ ∩∪ ⊂⊃ ∅ ∴ ∵ △ ′ ″.
+ */
+const MATH_GLYPHS_NEEDING_FALLBACK =
+  /[²³¹⁰-₟√-∜ΔΩ∂∇∏∈-∍∠∥∩∪⊂⊃∅∫-∮∴∵≈≠≡≤≥∝∞←-⇿′″△]/;
+
+/**
+ * Indic/Arabic scripts (Devanagari, Bengali, Tamil, Telugu, …, Arabic/Urdu).
+ * The math fallback font (LiberationSans) is Latin-only, so a string that mixes
+ * one of these scripts with a math glyph must STAY hand-drawn — switching fonts
+ * would drop the letters entirely, which is worse than one mis-rendered symbol.
+ * Pure "√2" / "x²" labels have no such letters and are still fixed.
+ */
+const COMPLEX_SCRIPT = /[؀-ۿऀ-෿]/;
+
+/**
+ * Font family for a piece of board text: the Helvetica fallback (family 2) when
+ * the string contains a math glyph the hand-drawn font lacks, otherwise the
+ * hand-drawn default (family 5). Excalidraw text is single-font per element, so
+ * a short label like "√2" renders wholly in Helvetica — clean, and far better
+ * than the "Ã2" mojibake the hand-drawn font produced.
+ */
+export function boardFontFamily(text: string | null | undefined): typeof FONT_HANDDRAWN | typeof FONT_MATH {
+  if (!text || !MATH_GLYPHS_NEEDING_FALLBACK.test(text)) return FONT_HANDDRAWN;
+  if (COMPLEX_SCRIPT.test(text)) return FONT_HANDDRAWN;
+  return FONT_MATH;
+}
+
 export type TutorMeta = {
   tutor: true;
   turn: number;
@@ -72,6 +117,7 @@ export function opToSkeleton(
         y: op.y ?? 0,
         text: op.text,
         fontSize: FONT_PX[op.size ?? "md"],
+        fontFamily: boardFontFamily(op.text),
         strokeColor: stroke,
         textAlign: "left",
         customData: meta(turn, op.id, op.temp),
@@ -96,7 +142,7 @@ export function opToSkeleton(
         roughness: 1,
         roundness: type === "rectangle" ? { type: 3 } : null,
         customData: meta(turn, op.id, op.temp),
-        ...(op.text ? { label: { text: op.text, fontSize: 20 } } : {}),
+        ...(op.text ? { label: { text: op.text, fontSize: 20, fontFamily: boardFontFamily(op.text) } } : {}),
       };
     }
     case "arrow":
@@ -123,7 +169,7 @@ export function opToSkeleton(
         endArrowhead: op.op === "arrow" ? "arrow" : null,
         startArrowhead: null,
         customData: meta(turn, op.id, op.temp),
-        ...(op.text ? { label: { text: op.text, fontSize: 16 } } : {}),
+        ...(op.text ? { label: { text: op.text, fontSize: 16, fontFamily: boardFontFamily(op.text) } } : {}),
       } as ExcalidrawElementSkeleton;
     }
     case "highlight": {

@@ -1,9 +1,24 @@
 import { streamText, type ModelMessage } from "ai";
-import type { Grade, SubjectId } from "@/lib/curriculum";
-import { detectProvider, getModel } from "@/lib/llm";
+import { textbookKey, type Grade, type SubjectId } from "@/lib/curriculum";
+import { detectProvider, getDoubtModel, getLessonModel, getModel } from "@/lib/llm";
 import { mockLesson } from "@/lib/mock-lesson";
-import { buildSystemPrompt, buildUserTurn } from "@/lib/prompt";
-import { BeatSchema, TutorRequestSchema, type HistoryMessage, type TutorEvent } from "@/lib/schema";
+import {
+  buildDoubtSystemPrompt,
+  buildExplainSystemPrompt,
+  buildPlanPrompt,
+  buildSystemPrompt,
+  buildTeachSystemPrompt,
+  buildUserTurn,
+} from "@/lib/prompt";
+import { retrieveTextbookContext, type Passage } from "@/lib/rag";
+import {
+  BeatSchema,
+  LessonPlanSchema,
+  TutorRequestSchema,
+  type HistoryMessage,
+  type LessonPlan,
+  type TutorEvent,
+} from "@/lib/schema";
 
 export const maxDuration = 60;
 
@@ -24,28 +39,58 @@ export async function POST(req: Request) {
   if (!parsed.success) {
     return Response.json({ error: "Bad request", issues: parsed.error.issues }, { status: 400 });
   }
-  const { messages, canvas, language, profile } = parsed.data;
+  const { messages, canvas, language, profile, mode, step, familiarity } = parsed.data;
   const grade = (parsed.data.grade ?? null) as Grade | null;
   const subject = (parsed.data.subject ?? null) as SubjectId | null;
+  const plan: LessonPlan | null = parsed.data.plan ?? null;
 
-  // The chosen class + subject name one NCERT textbook. The RAG backend (built
-  // separately) uses this to restrict vector search to that book's embeddings.
-  // When that service is ready, derive the key with textbookKey(grade, subject),
-  // retrieve the top passages for the latest question, and pass them into
-  // buildSystemPrompt as a `context` argument.
-  // TODO(rag): const book = textbookKey(grade, subject);
-  //            const passages = book ? await retrieveTextbookContext(book, messages.at(-1)?.text) : [];
+  // Mock only covers the legacy single-turn flow; the staged flow needs real models.
+  if (detectProvider() === "mock" && mode === "ask") return mockResponse(messages, language);
 
-  if (detectProvider() === "mock") return mockResponse(messages, language);
-
+  // Pick the model for this stage: Ultra plans, teaches and works named textbook
+  // items (explain); Groq answers conceptual doubts; the configured default handles
+  // the legacy "ask" flow.
   let model: ReturnType<typeof getModel>;
   try {
-    model = getModel();
+    model =
+      mode === "doubt"
+        ? getDoubtModel()
+        : mode === "plan" || mode === "teach" || mode === "explain"
+          ? getLessonModel()
+          : getModel();
   } catch (err) {
     return Response.json({ error: (err as Error).message }, { status: 500 });
   }
 
-  const system = buildSystemPrompt({ language, profile, grade, subject });
+  // The chosen class + subject name one NCERT textbook; passages from it ground the
+  // turn (rag/ builds the index, lib/rag searches it with Nemotron embeddings + BM25).
+  // No book chosen, no index for it, or retrieval failing all mean the turn simply
+  // runs without passages — grounding is additive, never a hard dependency.
+  const book = textbookKey(grade, subject);
+  let edition = "";
+  let passages: Passage[] = [];
+  if (book) {
+    try {
+      ({ edition, passages } = await retrieveTextbookContext(book, messages));
+    } catch (err) {
+      console.warn(`[tutor] textbook retrieval failed for ${book}: ${errorMessage(err)}`);
+    }
+  }
+
+  // System prompt per stage. Teaching and doubt reuse the shared board-rules prompt
+  // (plus their framing); planning uses its own designer prompt.
+  const promptCtx = { language, profile, grade, subject, textbook: passages };
+  const system =
+    mode === "plan"
+      ? buildPlanPrompt({ ...promptCtx, familiarity: familiarity ?? null })
+      : mode === "teach"
+        ? buildTeachSystemPrompt({ ...promptCtx, plan: plan ?? LessonPlanSchema.parse({}), step: step ?? 0 })
+        : mode === "doubt"
+          ? buildDoubtSystemPrompt({ ...promptCtx, plan })
+          : mode === "explain"
+            ? buildExplainSystemPrompt({ ...promptCtx, plan })
+            : buildSystemPrompt(promptCtx);
+
   const last = messages.length - 1;
   const modelMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
@@ -56,62 +101,18 @@ export async function POST(req: Request) {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (ev: TutorEvent) => controller.enqueue(encoder.encode(JSON.stringify(ev) + "\n"));
-      send({ type: "meta", model: model.label });
+      send({
+        type: "meta",
+        model: model.label,
+        ...(passages.length > 0
+          ? { sources: passages.map((p) => `${book} ${edition}: ${p.label} (pdf p.${p.pages.join("-")})`) }
+          : {}),
+      });
       try {
-        // Models occasionally emit an empty or malformed beat stream. As long as
-        // nothing has been sent to the client yet (zero beats), one silent retry
-        // is safe and fixes most of these turns.
-        for (let attempt = 0; attempt < 2; attempt++) {
-          let errMsg: string | null = null; // buffered so a dead first attempt can retry silently
-          let beatCount = 0;
-          let raw = "";
-          try {
-            const result = streamText({
-              model: model.model,
-              system,
-              messages: modelMessages,
-              temperature: 0.6,
-              maxOutputTokens: 3000,
-              abortSignal: req.signal,
-              onError: ({ error }) => {
-                errMsg ??= errorMessage(error);
-              },
-            });
-            // The model emits beats as NDJSON. We extract each complete top-level JSON
-            // object from the text stream (tolerant of arrays, commas, code fences and
-            // pretty-printing) and validate it ourselves, so no provider-side structured
-            // output is involved — that path has been unreliable across Gemini/Groq/NVIDIA.
-            const scanner = new BeatScanner((beat) => {
-              beatCount++;
-              send({ type: "beat", beat });
-            });
-            for await (const delta of result.textStream) {
-              if (req.signal.aborted) break;
-              raw += delta;
-              scanner.push(delta);
-            }
-          } catch (err) {
-            errMsg ??= errorMessage(err);
-          }
-
-          if (req.signal.aborted) break;
-          if (beatCount > 0) {
-            // The client saw beats, so a retry would duplicate them; report honestly.
-            if (errMsg) send({ type: "error", message: errMsg });
-            else send({ type: "done" });
-            break;
-          }
-          if (attempt === 0) {
-            console.warn(
-              `[tutor] no valid beats (${errMsg ?? "no provider error"}), retrying once. raw output follows:\n` +
-                raw.slice(0, 3000),
-            );
-            continue;
-          }
-          send({
-            type: "error",
-            message: errMsg ?? "The tutor did not produce a valid response. Please try again.",
-          });
+        if (mode === "plan") {
+          await streamPlan({ model: model.model, system, messages: modelMessages, signal: req.signal, send, fallbackTopic: messages[last]?.text ?? "" });
+        } else {
+          await streamBeats({ model: model.model, system, messages: modelMessages, signal: req.signal, send });
         }
       } finally {
         controller.close();
@@ -126,6 +127,159 @@ export async function POST(req: Request) {
       "x-accel-buffering": "no",
     },
   });
+}
+
+type StreamArgs = {
+  model: Parameters<typeof streamText>[0]["model"];
+  system: string;
+  messages: ModelMessage[];
+  signal: AbortSignal;
+  send: (ev: TutorEvent) => void;
+};
+
+/**
+ * Teach/doubt/ask: the model emits beats as NDJSON. We extract each complete
+ * top-level JSON object from the text stream (tolerant of arrays, commas, code
+ * fences and pretty-printing) and validate it ourselves — no provider-side
+ * structured output, which has been unreliable across Gemini/Groq/NVIDIA. One
+ * silent retry is safe as long as nothing has reached the client yet.
+ */
+async function streamBeats({ model, system, messages, signal, send }: StreamArgs) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let errMsg: string | null = null; // buffered so a dead first attempt can retry silently
+    let beatCount = 0;
+    let raw = "";
+    try {
+      const result = streamText({
+        model,
+        system,
+        messages,
+        temperature: 0.6,
+        maxOutputTokens: 3000,
+        abortSignal: signal,
+        onError: ({ error }) => {
+          errMsg ??= errorMessage(error);
+        },
+      });
+      const scanner = new BeatScanner((beat) => {
+        beatCount++;
+        send({ type: "beat", beat });
+      });
+      for await (const delta of result.textStream) {
+        if (signal.aborted) break;
+        raw += delta;
+        scanner.push(delta);
+      }
+    } catch (err) {
+      errMsg ??= errorMessage(err);
+    }
+
+    if (signal.aborted) return;
+    if (beatCount > 0) {
+      if (errMsg) send({ type: "error", message: errMsg });
+      else send({ type: "done" });
+      return;
+    }
+    if (attempt === 0) {
+      console.warn(
+        `[tutor] no valid beats (${errMsg ?? "no provider error"}), retrying once. raw output follows:\n` +
+          raw.slice(0, 3000),
+      );
+      continue;
+    }
+    send({ type: "error", message: errMsg ?? "The tutor did not produce a valid response. Please try again." });
+  }
+}
+
+/**
+ * Plan mode: collect the planner's full output, pull the lesson-plan JSON object
+ * out of it (Ultra is a reasoning model, so there may be prose around the JSON),
+ * validate it and emit one `plan` event. One silent retry on a bad/empty plan.
+ */
+async function streamPlan({
+  model,
+  system,
+  messages,
+  signal,
+  send,
+  fallbackTopic,
+}: StreamArgs & { fallbackTopic: string }) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let errMsg: string | null = null;
+    let raw = "";
+    try {
+      const result = streamText({
+        model,
+        system,
+        messages,
+        temperature: 0.4,
+        maxOutputTokens: 4000,
+        abortSignal: signal,
+        onError: ({ error }) => {
+          errMsg ??= errorMessage(error);
+        },
+      });
+      for await (const delta of result.textStream) {
+        if (signal.aborted) return;
+        raw += delta;
+      }
+    } catch (err) {
+      errMsg ??= errorMessage(err);
+    }
+    if (signal.aborted) return;
+
+    const plan = extractPlan(raw);
+    if (plan && plan.steps.length > 0) {
+      if (!plan.topic) plan.topic = fallbackTopic.slice(0, 120);
+      send({ type: "plan", plan });
+      send({ type: "done" });
+      return;
+    }
+    if (attempt === 0) {
+      console.warn(`[tutor] no valid plan (${errMsg ?? "no provider error"}), retrying once. raw:\n` + raw.slice(0, 2000));
+      continue;
+    }
+    send({ type: "error", message: errMsg ?? "Could not design the lesson. Please try again." });
+  }
+}
+
+/**
+ * Find the lesson-plan JSON in the planner's raw output. Scans for every complete
+ * top-level {...} object (brace depth, ignoring braces inside strings) and returns
+ * the last one that validates — robust to reasoning text and fences around it.
+ */
+function extractPlan(raw: string): LessonPlan | null {
+  let best: LessonPlan | null = null;
+  let depth = 0;
+  let start = -1;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (c === "}") {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        try {
+          const parsed = LessonPlanSchema.safeParse(JSON.parse(raw.slice(start, i + 1)));
+          if (parsed.success && parsed.data.steps.length > 0) best = parsed.data;
+        } catch {
+          /* not JSON; skip */
+        }
+        start = -1;
+      }
+    }
+  }
+  return best;
 }
 
 /** LLM_PROVIDER=mock: stream a canned lesson with realistic pacing, no API key needed. */
