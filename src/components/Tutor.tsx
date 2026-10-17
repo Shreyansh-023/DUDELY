@@ -15,13 +15,15 @@ import {
 import type { Beat, HistoryMessage, LessonPlan, TutorEvent } from "@/lib/schema";
 import { AsyncQueue, uid } from "@/lib/utils";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
+import { LiveTranscriber, liveSttUnavailable, prewarmLiveStt, relayUrl } from "@/lib/voice/live-stt";
 import { fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
 import { isPlaybackPaused, pausePlayback, resumePlayback } from "@/lib/voice/playback";
 import ClassSubjectPicker from "./ClassSubjectPicker";
-import Composer from "./Composer";
+import Composer, { joinDictation } from "./Composer";
 import { LogoTile, Wordmark } from "./Logo";
 import LanguageMenu from "./LanguageMenu";
 import Transcript from "./Transcript";
+import VoiceReview from "./VoiceReview";
 import { useVoiceLoop } from "./useVoiceLoop";
 import type { Board } from "./Whiteboard";
 
@@ -59,7 +61,23 @@ const isQuestionEnding = (t: string) => /[?？]\s*$/.test(t.trim());
 // Hidden user turn that asks the model to teach the next small step. Phrased as
 // plain language so the model (which mirrors the student's language) just carries on.
 const CONTINUE_NUDGE = "Continue to the next step.";
-type Config = { llm: string | null; stt: SttMode; tts: TtsMode };
+export type Config = {
+  llm: string | null;
+  stt: SttMode;
+  tts: TtsMode;
+  /** Which backend can stream words while the student is still speaking. */
+  liveStt: "sarvam" | "browser" | null;
+  sttRelayUrl: string | null;
+  sttRelayPort: number;
+};
+const FALLBACK_CONFIG: Config = {
+  llm: null,
+  stt: "browser",
+  tts: "browser",
+  liveStt: "browser",
+  sttRelayUrl: null,
+  sttRelayPort: 8787,
+};
 type QueuedBeat = { beat: Beat; audio: Promise<Blob | null> | null };
 
 const STATUS_LABEL: Record<Status, string> = {
@@ -129,11 +147,6 @@ function PauseIcon() {
 }
 
 // ---- subtitle helpers ------------------------------------------------------
-
-/** Clip to one subtitle line, keeping the END (live interim speech grows there). */
-function tailOf(s: string): string {
-  return s.length > 52 ? "…" + s.slice(-52).trimStart() : s;
-}
 
 /** Breaks a sentence into subtitle-sized word groups (≈42 chars per line). */
 function chunkCaption(text: string): string[][] {
@@ -226,6 +239,9 @@ export default function Tutor() {
   const [subject, setSubject] = useState<SubjectId | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [interim, setInterim] = useState("");
+  // What's sitting in the composer. Owned here (not by Composer) so dictation
+  // can stream into it and so sending can clear it from anywhere.
+  const [draft, setDraft] = useState("");
   const [voiceMode, setVoiceMode] = useState(false); // avatar-only stage, chat hidden
   // The sentence being spoken right now and how far the voice has got into it.
   // Set at playback start (never earlier), advanced word-by-word, cleared at turn
@@ -291,16 +307,48 @@ export default function Tutor() {
   const lastSeen = useRef(new Map<string, number>());
   const recorderRef = useRef<Recorder | null>(null);
   const browserRecRef = useRef<{ stop: () => void } | null>(null);
+  // Live streaming transcription for the current chat-mode dictation, and
+  // whether that dictation should send itself when it ends (Space) or settle
+  // into the composer for editing (mic button).
+  const liveRef = useRef<LiveTranscriber | null>(null);
+  const autoSendRef = useRef(false);
+
+  /**
+   * Open a streaming-STT tap on a recording mic so words show up while they're
+   * being said. Best-effort by design: no relay, no Web Audio, a refused socket —
+   * any of those just means the transcript arrives at the end as it did before.
+   */
+  const attachLive = useCallback(async (r: Recorder, onText: (t: string) => void) => {
+    const cfg = configRef.current;
+    const stream = r.mediaStream;
+    if (!cfg || cfg.liveStt !== "sarvam" || !stream || liveSttUnavailable()) return;
+    const url = relayUrl(cfg);
+    if (!url) return;
+    const live = new LiveTranscriber(url, languageRef.current, { onText });
+    try {
+      await live.start(stream);
+    } catch {
+      return; // fall back to the batch transcript at the end of the turn
+    }
+    // The turn ended while we were connecting — don't leave a socket open.
+    if (recorderRef.current !== r) {
+      live.abort();
+      return;
+    }
+    liveRef.current = live;
+  }, []);
 
   // Load server capabilities, then restore the student's saved settings.
   useEffect(() => {
     let cancelled = false;
     fetch("/api/config")
       .then((r) => r.json() as Promise<Config>)
-      .catch((): Config => ({ llm: null, stt: "browser", tts: "browser" }))
+      .catch((): Config => FALLBACK_CONFIG)
       .then((c) => {
         if (cancelled) return;
         setConfig(c);
+        // Get the resampler worklet compiled now, not while the student talks.
+        if (c.liveStt === "sarvam") prewarmLiveStt();
         setLanguage(readLocal("guru.language", DEFAULT_LANGUAGE));
         const savedGrade = Number(readLocal("guru.grade", ""));
         if (isGrade(savedGrade)) setGrade(savedGrade);
@@ -443,7 +491,7 @@ export default function Tutor() {
       const ac = new AbortController();
       turnRef.current = ac;
       const turn = ++turnCounter.current;
-      const cfg = configRef.current ?? { llm: null, stt: "browser" as const, tts: "browser" as const };
+      const cfg = configRef.current ?? FALLBACK_CONFIG;
       const lang = languageRef.current;
 
       // Board context: a text summary of what is on the board and what the
@@ -555,7 +603,7 @@ export default function Tutor() {
       const ac = new AbortController();
       turnRef.current = ac;
       const turn = ++turnCounter.current;
-      const cfg = configRef.current ?? { llm: null, stt: "browser" as const, tts: "browser" as const };
+      const cfg = configRef.current ?? FALLBACK_CONFIG;
       b.player.advancePage(false);
 
       const userMsg: ChatMessage = { id: uid("u"), role: "user", text: userText };
@@ -704,82 +752,138 @@ export default function Tutor() {
     voicePhaseRef.current = voice.phase;
   }, [voice.phase]);
 
-  // ---- microphone (push-to-talk, normal chat mode) -----------------------
-  const startListening = useCallback(async () => {
-    if (statusRef.current === "listening") return;
-    stopTurn(); // barge-in: interrupt Guru
-    setError(null);
-    setInterim("");
-    const cfg = configRef.current;
-    const useBrowser = !cfg || cfg.stt === "browser" || typeof MediaRecorder === "undefined";
-    setStatus("listening");
-    statusRef.current = "listening";
-    if (useBrowser) {
-      if (!browserSttAvailable()) {
+  // ---- microphone (dictation + push-to-talk, normal chat mode) ------------
+  //
+  // Two ways in, deliberately different endings:
+  //   mic button  → dictation. Words stream into the composer as you speak and
+  //                 stay there, editable, until you press send (ChatGPT's mic).
+  //   hold Space  → push-to-talk. Release sends immediately; that's the point
+  //                 of holding a key down, and it's the fast path for a quick
+  //                 question mid-lesson.
+  // Either way the text appears live, which is the part that was missing: the
+  // Sarvam path used to record in silence and only reveal the sentence after
+  // the upload finished.
+
+  /** Commit a finished dictation: into the box, or straight out as a question. */
+  const finishDictation = useCallback(
+    (text: string, autoSend: boolean) => {
+      setInterim("");
+      const t = text.trim();
+      if (!t) {
         setStatus("idle");
-        setError("This browser has no speech recognition. Use Chrome, or add SARVAM_API_KEY for server-side STT.");
         return;
       }
-      const rec = recognizeBrowser(languageRef.current, setInterim);
-      browserRecRef.current = rec;
-      rec.result
-        .then((text) => {
-          browserRecRef.current = null;
-          setInterim("");
-          if (text) void ask(text);
-          else setStatus("idle");
-        })
-        .catch((e: Error) => {
-          browserRecRef.current = null;
-          setError(e.message);
+      if (autoSend) void ask(t);
+      else {
+        setDraft((d) => joinDictation(d, t));
+        setStatus("idle");
+      }
+    },
+    [ask],
+  );
+
+  const startListening = useCallback(
+    async (autoSend = false) => {
+      if (statusRef.current === "listening") return;
+      stopTurn(); // barge-in: interrupt Guru
+      setError(null);
+      setInterim("");
+      autoSendRef.current = autoSend;
+      const cfg = configRef.current;
+      const useBrowser = !cfg || cfg.stt === "browser" || typeof MediaRecorder === "undefined";
+      setStatus("listening");
+      statusRef.current = "listening";
+      if (useBrowser) {
+        if (!browserSttAvailable()) {
           setStatus("idle");
-        });
-      return;
-    }
-    const r = new Recorder();
-    recorderRef.current = r;
-    try {
-      await r.start();
-    } catch {
-      recorderRef.current = null;
-      setStatus("idle");
-      setError("Microphone permission was denied.");
-    }
-  }, [ask, stopTurn]);
+          setError("This browser has no speech recognition. Use Chrome, or add SARVAM_API_KEY for server-side STT.");
+          return;
+        }
+        // The Web Speech API streams interim hypotheses for free; they go
+        // straight into the composer.
+        const rec = recognizeBrowser(languageRef.current, setInterim);
+        browserRecRef.current = rec;
+        rec.result
+          .then((text) => {
+            browserRecRef.current = null;
+            finishDictation(text, autoSendRef.current);
+          })
+          .catch((e: Error) => {
+            browserRecRef.current = null;
+            setInterim("");
+            setError(e.message);
+            setStatus("idle");
+          });
+        return;
+      }
+      const r = new Recorder();
+      recorderRef.current = r;
+      try {
+        await r.start();
+      } catch {
+        recorderRef.current = null;
+        setStatus("idle");
+        setError("Microphone permission was denied.");
+        return;
+      }
+      // Tap the same mic stream for live partials. The recording continues
+      // regardless, so if the relay is down we still get the batch transcript.
+      void attachLive(r, setInterim);
+    },
+    [attachLive, finishDictation, stopTurn],
+  );
 
   const stopListening = useCallback(async () => {
+    const autoSend = autoSendRef.current;
     if (browserRecRef.current) {
-      browserRecRef.current.stop();
+      browserRecRef.current.stop(); // resolves rec.result → finishDictation
       return;
     }
     const r = recorderRef.current;
     if (!r) return;
     recorderRef.current = null;
-    setStatus("transcribing");
-    const blob = await r.stop();
+    const live = liveRef.current;
+    liveRef.current = null;
+    // Close the stream and the recording together; the streamed transcript is
+    // usually already complete, in which case there's no upload at all.
+    const [streamed, blob] = await Promise.all([live ? live.finish() : Promise.resolve(""), r.stop()]);
+    if (streamed.trim()) {
+      finishDictation(streamed, autoSend);
+      return;
+    }
     if (blob.size < 1500) {
+      setInterim("");
       setStatus("idle");
       return;
     }
+    setStatus("transcribing");
     try {
       const text = await transcribeOnServer(blob, languageRef.current);
-      if (text.trim()) void ask(text);
+      if (text.trim()) finishDictation(text, autoSend);
       else {
+        setInterim("");
         setStatus("idle");
         setError("Didn't catch that. Try again a little closer to the mic.");
       }
     } catch (e) {
+      setInterim("");
       setStatus("idle");
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [ask]);
+  }, [finishDictation]);
 
   const toggleMic = useCallback(() => {
     if (statusRef.current === "listening") void stopListening();
-    else void startListening();
+    else void startListening(false); // button = dictate into the box
   }, [startListening, stopListening]);
 
-  const { pause: voicePause, resume: voiceResume, listen: voiceListen, bargeIn: voiceBargeIn } = voice;
+  const {
+    pause: voicePause,
+    resume: voiceResume,
+    listen: voiceListen,
+    bargeIn: voiceBargeIn,
+    sendReview: voiceSendReview,
+  } = voice;
 
   // The Doubt button (voice stage): interrupt Guru and open the mic for the doubt.
   // The captured utterance flows through ask(), which routes it to the doubt model
@@ -826,9 +930,16 @@ export default function Tutor() {
       }
       // Enter (voice mode, mic not yet open): Guru is waiting for an answer — start listening.
       if (e.key === "Enter" && !isTyping(e.target)) {
-        if (voiceModeRef.current && !chatPanelOpenRef.current && voicePhaseRef.current === "awaiting") {
-          e.preventDefault();
-          voiceListen();
+        if (voiceModeRef.current && !chatPanelOpenRef.current) {
+          // "awaiting" → open the mic. "review" → send what was heard (the box
+          // handles Enter itself while focused; this covers a stray click out).
+          if (voicePhaseRef.current === "awaiting") {
+            e.preventDefault();
+            voiceListen();
+          } else if (voicePhaseRef.current === "review") {
+            e.preventDefault();
+            voiceSendReview();
+          }
         }
         return;
       }
@@ -840,7 +951,7 @@ export default function Tutor() {
           if (!chatPanelOpenRef.current) toggleAvatarPause();
           return;
         }
-        void startListening();
+        void startListening(true); // hold-to-talk: release sends
       }
     };
     const up = (e: KeyboardEvent) => {
@@ -856,7 +967,7 @@ export default function Tutor() {
       window.removeEventListener("keydown", down, true);
       window.removeEventListener("keyup", up, true);
     };
-  }, [startListening, stopListening, stopTurn, voicePause, voiceListen, toggleAvatarPause]);
+  }, [startListening, stopListening, stopTurn, voicePause, voiceListen, voiceSendReview, toggleAvatarPause]);
 
   // Deep link: /?q=your+question asks it automatically once the board and config are ready.
   const autoAsked = useRef(false);
@@ -892,23 +1003,42 @@ export default function Tutor() {
         ? "Ask your doubt… (say “got it” to continue the lesson)"
         : askPlaceholder(language);
 
-  // Voice-stage derived state. Caption priority: the student's live words while
-  // they speak → the greeting/re-prompt → the sentence being spoken right now.
+  // Voice-stage derived state. The student's words get their own box (see
+  // showSpeechBox); the caption strip below it carries Indica's side — the
+  // greeting/re-prompt, then the sentence being spoken right now.
   const guruListening = voice.phase === "listening" || voice.phase === "capturing";
   const guruSpeaking = status === "teaching" || voice.phase === "greeting";
-  const studentSpeaking = guruListening && Boolean(interim.trim());
   // Paused either way: voice frozen mid-sentence, or listening stopped by the loop.
   // This is the stop/resume feature only — it is deliberately NOT set while
   // awaiting an answer, so that state never looks paused.
   const avatarPaused = speechPaused || voice.phase === "paused";
   // Guru asked something and is waiting for the student to press Enter to answer.
   const awaitingAnswer = voice.phase === "awaiting";
+  // The student has finished speaking and is checking the transcript before it
+  // goes anywhere. Nothing is sent until they press send.
+  const reviewing = voice.phase === "review";
   // Is there something a pause would act on right now? (Only then is the avatar a
   // pause control — while awaiting/idle there's nothing to stop.)
   const pausable = guruSpeaking || guruListening || status === "thinking";
+  // The student's words own the lower third from the mic opening until the text
+  // is sent: listening (empty, "Listening…") → filling → transcribing (last
+  // partial held) → review. The `interim` guard on the transcribing gap stops
+  // the box flashing up empty in the frame after a send.
+  const showSpeechBox =
+    reviewing ||
+    guruListening ||
+    (voice.phase === "processing" && status === "idle" && Boolean(interim.trim()));
   // The only states worth a pill in the caption strip; everything else either
   // shows a caption (speaking) or the avatar's own affordance (paused → play).
-  const stripStatus = guruListening ? "Listening…" : status === "thinking" ? "Thinking…" : null;
+  // "processing" with no turn running yet is the gap between the student
+  // finishing and the review card appearing — say so rather than going blank.
+  const stripStatus = guruListening
+    ? "Listening…"
+    : status === "thinking"
+      ? "Thinking…"
+      : voice.phase === "processing" && status === "idle"
+        ? "Transcribing…"
+        : null;
   // The Doubt button is offered while Guru is working (speaking/teaching/thinking)
   // and not already listening — those are the moments a student wants to break in.
   const canRaiseDoubt =
@@ -972,11 +1102,16 @@ export default function Tutor() {
         <Transcript messages={messages} status={status} />
         <Composer
           status={status}
+          draft={draft}
+          onDraftChange={setDraft}
           interim={interim}
           disabled={!board || !config}
           voiceMode={voiceMode}
           placeholder={composerPlaceholder}
-          onSend={(t) => void ask(t)}
+          onSend={(t) => {
+            setDraft("");
+            void ask(t);
+          }}
           // In voice mode the hands-free loop owns the mic; the button pauses/resumes it.
           onToggleMic={voiceMode ? (guruListening ? voice.pause : voice.resume) : toggleMic}
           onStop={stopTurn}
@@ -1100,15 +1235,33 @@ export default function Tutor() {
                     appears exactly when the voice starts and highlights the word
                     being spoken (karaoke). Between speeches the same spot shows
                     the state pill — Listening… / Thinking… — nothing else. */}
-                {(studentSpeaking || voice.voiceCaption || liveCaption || awaitingAnswer || stripStatus) && (
+                {/* The student's own words: one box from the first syllable to
+                    send. It fills live while the mic is open, then unlocks with
+                    retry + send. It takes the subtitle's place — Indica's own
+                    captions can't apply while the student has the floor — and
+                    sits clear of the presenter PiP on md+. */}
+                {/* Centred on the stage. On phones the presenter sits in the
+                    bottom-right corner at the same height, so the box rides
+                    above it instead of running underneath. */}
+                {showSpeechBox && (
+                  <div className="absolute inset-x-4 bottom-40 z-30 flex justify-center md:bottom-4">
+                    <VoiceReview
+                      value={reviewing ? voice.review : interim}
+                      onChange={voice.setReview}
+                      onSend={voice.sendReview}
+                      onRetry={voice.retryReview}
+                      live={!reviewing}
+                    />
+                  </div>
+                )}
+
+                {!showSpeechBox && (voice.voiceCaption || liveCaption || awaitingAnswer || stripStatus) && (
                   <div className="pointer-events-none absolute inset-x-4 bottom-4 z-20 flex justify-center">
                     <div
                       aria-live="polite"
                       className="w-fit max-w-[90vw] overflow-hidden whitespace-nowrap rounded-full border border-amber-200/30 bg-[#fffdf7]/45 px-3.5 py-1.5 text-center text-sm leading-none shadow-md shadow-amber-900/5 backdrop-blur-sm md:max-w-2xl md:text-[15px]"
                     >
-                      {studentSpeaking ? (
-                        <span className="italic text-rose-600">{tailOf(interim)}</span>
-                      ) : voice.voiceCaption ? (
+                      {voice.voiceCaption ? (
                         <KaraokeLine text={voice.voiceCaption.text} word={voice.voiceCaption.word} />
                       ) : liveCaption ? (
                         <KaraokeLine text={liveCaption.text} word={liveCaption.word} />

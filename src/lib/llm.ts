@@ -192,5 +192,21 @@ export function describeVoice() {
       ? "groq"
       : "browser";
   const tts: "sarvam" | "browser" = process.env.SARVAM_API_KEY ? "sarvam" : "browser";
-  return { stt, tts };
+  // Live ("words appear as you speak") transcription. The browser path gets it
+  // free from the Web Speech API; the Sarvam path needs the relay in
+  // scripts/stt-relay.mjs, since a Next route handler can't hold a socket open.
+  // We can't probe whether that process is actually up from here — the client
+  // tries the socket once and quietly falls back to batch STT if it isn't.
+  const liveStt: "sarvam" | "browser" | null =
+    stt === "sarvam" && process.env.STT_LIVE !== "off" ? "sarvam" : stt === "browser" ? "browser" : null;
+  return {
+    stt,
+    tts,
+    liveStt,
+    // Set STT_RELAY_URL when the relay runs somewhere other than this host
+    // (a separate container, say); otherwise the browser derives it from the
+    // page's own hostname so phones on the LAN reach it too.
+    sttRelayUrl: process.env.STT_RELAY_URL || null,
+    sttRelayPort: Number(process.env.STT_RELAY_PORT || 8787),
+  };
 }

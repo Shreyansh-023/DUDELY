@@ -6,8 +6,14 @@
  * Flow: enter voice mode → (no conversation yet? Guru speaks a greeting) →
  * listen → the student's single utterance is end-pointed automatically (VAD on
  * the Sarvam path, the browser recogniser's own endpointing otherwise) →
- * transcribe → ask() → Guru teaches → when the turn ends, listen again.
+ * transcribe → review (the student sees what was heard and can fix it) →
+ * ask() → Guru teaches → when the turn ends, listen again.
  * 5s of silence → Guru re-asks once; still silent → "paused" until tapped.
+ *
+ * The review step exists because recognition is never perfect, least of all on
+ * code-mixed Hinglish: sending straight through means a misheard word silently
+ * becomes the question Guru answers. Nothing reaches the model until the
+ * student presses send.
  *
  * The loop never opens the mic while Guru is speaking (strictly sequential),
  * and it never writes greetings/re-prompts into the chat history.
@@ -19,15 +25,26 @@
 
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { voicePrompts } from "@/lib/languages";
-import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
-import { fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
+import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer } from "@/lib/voice/stt";
+import { LiveTranscriber, liveSttUnavailable, relayUrl } from "@/lib/voice/live-stt";
+import { fetchSpeech, playBlob, speakBrowser } from "@/lib/voice/tts";
 import { isPlaybackPaused } from "@/lib/voice/playback";
 import { MicVad } from "@/lib/voice/vad";
-import type { Status } from "./Tutor";
+import type { Config, Status } from "./Tutor";
 
 // "awaiting" = Guru has asked something and is waiting for the student to press
 // Enter before the mic opens (the student answers in their own time).
-export type VoicePhase = "off" | "greeting" | "listening" | "capturing" | "processing" | "awaiting" | "paused";
+// "review"   = the student has finished speaking and is looking at what was
+//              heard, free to edit it, say it again, or send.
+export type VoicePhase =
+  | "off"
+  | "greeting"
+  | "listening"
+  | "capturing"
+  | "processing"
+  | "awaiting"
+  | "review"
+  | "paused";
 
 /**
  * How many statement turns Guru may teach back-to-back before pausing to listen.
@@ -37,8 +54,6 @@ export type VoicePhase = "off" | "greeting" | "listening" | "capturing" | "proce
 const MAX_AUTO_CONTINUE = 8;
 /** Browser STT: abort if not even an interim result arrives within this window. */
 const NO_INTERIM_TIMEOUT_MS = 5000;
-
-type Config = { llm: string | null; stt: SttMode; tts: TtsMode };
 
 type Deps = {
   enabled: boolean; // voiceMode
@@ -60,6 +75,14 @@ export function useVoiceLoop(deps: Deps): {
   phase: VoicePhase;
   /** The greeting/re-prompt being spoken and how far the voice has got (karaoke). */
   voiceCaption: { text: string; word: number } | null;
+  /** What was heard, awaiting the student's approval. Only set in "review". */
+  review: string;
+  /** The student edited the transcript before sending. */
+  setReview: (text: string) => void;
+  /** Send the reviewed text to Guru. */
+  sendReview: () => void;
+  /** Throw the transcript away and listen again. */
+  retryReview: () => void;
   resume: () => void;
   pause: () => void;
   /** Open the mic now — called when the student presses Enter in the "awaiting" phase. */
@@ -69,18 +92,23 @@ export function useVoiceLoop(deps: Deps): {
 } {
   const [phase, setPhaseState] = useState<VoicePhase>("off");
   const [voiceCaption, setVoiceCaption] = useState<{ text: string; word: number } | null>(null);
+  const [review, setReview] = useState("");
 
   // Latest props/state for async continuations (same pattern as Tutor's refs).
   const depsRef = useRef(deps);
   const phaseRef = useRef<VoicePhase>("off");
+  // Read by sendReview, which fires from a keypress while the box is being edited.
+  const reviewRef = useRef("");
   useEffect(() => {
     depsRef.current = deps;
+    reviewRef.current = review;
   });
 
   const genRef = useRef(0);
   const greetAbortRef = useRef<AbortController | null>(null);
   const recorderRef = useRef<Recorder | null>(null);
   const vadRef = useRef<MicVad | null>(null);
+  const liveRef = useRef<LiveTranscriber | null>(null);
   const browserRecRef = useRef<{ stop: () => void; abort: () => void } | null>(null);
   const noInterimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoContinueRef = useRef(0);
@@ -103,6 +131,8 @@ export function useVoiceLoop(deps: Deps): {
   const cancelCapture = useCallback(() => {
     vadRef.current?.cancel();
     vadRef.current = null;
+    liveRef.current?.abort();
+    liveRef.current = null;
     recorderRef.current?.cancel();
     recorderRef.current = null;
     browserRecRef.current?.abort();
@@ -158,15 +188,32 @@ export function useVoiceLoop(deps: Deps): {
     [setPhase],
   );
 
+  /**
+   * The utterance is transcribed. Hand it to the student to check rather than
+   * to the model — Tutor renders it in an editable box with retry/send.
+   */
   const submit = useCallback(
     (text: string, gen: number) => {
       if (gen !== genRef.current) return;
-      autoContinueRef.current = 0; // the student spoke; start a fresh teaching run
-      setPhase("processing"); // the resume effect decides what comes next once the turn ends
-      depsRef.current.ask(text);
+      // Swap the live caption for the reviewable text in one commit, so the box
+      // on screen never blanks between the two.
+      depsRef.current.setInterim("");
+      setReview(text);
+      setPhase("review");
     },
     [setPhase],
   );
+
+  /** The student approved the transcript (send button, or Enter). */
+  const sendReview = useCallback(() => {
+    const text = reviewRef.current.trim();
+    if (!text) return;
+    genRef.current += 1; // nothing from the finished capture may fire after this
+    setReview("");
+    autoContinueRef.current = 0; // the student spoke; start a fresh teaching run
+    setPhase("processing"); // the resume effect decides what comes next once the turn ends
+    depsRef.current.ask(text);
+  }, [setPhase]);
 
   // The mic opened on Enter but caught nothing: say "I didn't hear, can you
   // repeat?" and hand the floor back — the student presses Enter to try again.
@@ -222,10 +269,15 @@ export function useVoiceLoop(deps: Deps): {
         const text = await rec.result.catch(() => "");
         browserRecRef.current = null;
         clearNoInterimTimer();
-        depsRef.current.setInterim("");
-        if (gen !== genRef.current) return;
-        if (text.trim()) submit(text, gen);
-        else void handleNoSpeech(gen);
+        if (gen !== genRef.current) {
+          depsRef.current.setInterim("");
+          return;
+        }
+        if (text.trim()) submit(text, gen); // clears the interim itself
+        else {
+          depsRef.current.setInterim("");
+          void handleNoSpeech(gen);
+        }
         return;
       }
 
@@ -252,24 +304,53 @@ export function useVoiceLoop(deps: Deps): {
         },
       });
       vadRef.current = vad;
+      // Stream the same mic audio to the recogniser so the student's words show
+      // up on the caption strip while they're still talking, instead of only
+      // after the upload. Purely additive: the recording below is unaffected,
+      // and if the relay isn't there we never notice.
+      const live = await openLive(cfg, d.languageRef.current, r, (t) => {
+        if (gen !== genRef.current) return;
+        if (phaseRef.current === "listening" && t.trim()) setPhase("capturing");
+        depsRef.current.setInterim(t);
+      });
+      if (gen !== genRef.current) {
+        live?.abort();
+        vad.cancel();
+        r.cancel();
+        if (recorderRef.current === r) recorderRef.current = null;
+        return;
+      }
+      if (live) liveRef.current = live;
+
       const outcome = await vad.wait();
       if (vadRef.current === vad) vadRef.current = null;
+      if (liveRef.current === live) liveRef.current = null;
       if (gen !== genRef.current) {
+        live?.abort();
         r.cancel();
         if (recorderRef.current === r) recorderRef.current = null;
         return;
       }
       if (outcome === "no-speech" || outcome === "cancelled") {
+        live?.abort();
         r.cancel(); // nothing worth transcribing — release the mic without an STT call
         recorderRef.current = null;
+        depsRef.current.setInterim("");
         if (outcome === "no-speech") void handleNoSpeech(gen);
         return;
       }
       // "speech-ended" | "max-duration": the sentence is in the can.
       setPhase("processing");
-      const blob = await r.stop();
+      const [streamed, blob] = await Promise.all([live ? live.finish() : Promise.resolve(""), r.stop()]);
       recorderRef.current = null;
       if (gen !== genRef.current) return;
+      // The streamed transcript is the same model on the same audio, already
+      // finished — take it and skip the upload entirely.
+      if (streamed.trim()) {
+        submit(streamed, gen); // clears the interim itself
+        return;
+      }
+      depsRef.current.setInterim("");
       if (blob.size < 1500) {
         void handleNoSpeech(gen);
         return;
@@ -301,6 +382,7 @@ export function useVoiceLoop(deps: Deps): {
     cancelCapture();
     autoContinueRef.current = 0;
     setVoiceCaption(null);
+    setReview("");
     setPhase("off");
   }, [cancelCapture, setPhase]);
 
@@ -338,13 +420,16 @@ export function useVoiceLoop(deps: Deps): {
         void listenOnceRef.current(++genRef.current); // not immediate → "awaiting"
       }
     } else if (
-      (phase === "listening" || phase === "capturing" || phase === "awaiting") &&
+      (phase === "listening" || phase === "capturing" || phase === "awaiting" || phase === "review") &&
       (deps.status === "thinking" || deps.status === "teaching")
     ) {
       // A turn started (e.g. the student typed in the chat panel) while we were
-      // listening or waiting for Enter: drop any capture and fall in behind it.
+      // listening, waiting for Enter, or holding a transcript for review: drop
+      // it and fall in behind the turn. (sendReview's own ask() lands here too,
+      // but it has already moved us to "processing", so this branch is skipped.)
       genRef.current += 1;
       cancelCapture();
+      setReview("");
       setPhase("processing");
     }
   }, [deps.status, deps.enabled, phase, cancelCapture, setPhase]);
@@ -353,6 +438,16 @@ export function useVoiceLoop(deps: Deps): {
   const resume = useCallback(() => {
     if (!depsRef.current.enabled) return;
     autoContinueRef.current = 0;
+    setReview("");
+    depsRef.current.setError(null);
+    void listenOnceRef.current(++genRef.current, true);
+  }, []);
+
+  /** "Say it again": bin what was heard and reopen the mic straight away. */
+  const retryReview = useCallback(() => {
+    if (!depsRef.current.enabled) return;
+    autoContinueRef.current = 0;
+    setReview("");
     depsRef.current.setError(null);
     void listenOnceRef.current(++genRef.current, true);
   }, []);
@@ -361,6 +456,7 @@ export function useVoiceLoop(deps: Deps): {
   const listen = useCallback(() => {
     if (!depsRef.current.enabled) return;
     autoContinueRef.current = 0;
+    setReview("");
     depsRef.current.setError(null);
     void listenOnceRef.current(++genRef.current, true);
   }, []);
@@ -374,6 +470,7 @@ export function useVoiceLoop(deps: Deps): {
     greetAbortRef.current = null;
     cancelCapture();
     autoContinueRef.current = 0;
+    setReview("");
     depsRef.current.setError(null);
     void listenOnceRef.current(++genRef.current, true, true);
   }, [cancelCapture]);
@@ -385,8 +482,34 @@ export function useVoiceLoop(deps: Deps): {
     cancelCapture();
     autoContinueRef.current = 0;
     setVoiceCaption(null);
+    setReview("");
     setPhase("paused");
   }, [cancelCapture, setPhase]);
 
-  return { phase, voiceCaption, resume, pause, listen, bargeIn };
+  return { phase, voiceCaption, review, setReview, sendReview, retryReview, resume, pause, listen, bargeIn };
+}
+
+/**
+ * Best-effort streaming transcription over a mic that's already recording.
+ * Returns null — never throws — when live text isn't on offer: no Sarvam key,
+ * the relay process isn't running, or Web Audio is unavailable. The caller then
+ * behaves exactly as it did before streaming existed.
+ */
+async function openLive(
+  cfg: Config | null,
+  language: string,
+  r: Recorder,
+  onText: (t: string) => void,
+): Promise<LiveTranscriber | null> {
+  const stream = r.mediaStream;
+  if (!cfg || cfg.liveStt !== "sarvam" || !stream || liveSttUnavailable()) return null;
+  const url = relayUrl(cfg);
+  if (!url) return null;
+  const live = new LiveTranscriber(url, language, { onText });
+  try {
+    await live.start(stream);
+    return live;
+  } catch {
+    return null;
+  }
 }
