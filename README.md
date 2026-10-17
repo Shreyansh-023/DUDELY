@@ -17,6 +17,9 @@ cp .env.example .env.local     # add GOOGLE_GENERATIVE_AI_API_KEY (and SARVAM_AP
 npm run dev                    # http://localhost:3000
 ```
 
+`npm run dev` starts two processes: Next, and the live-transcription relay on port 8787
+(see below). `npm run dev:next` / `npm run dev:relay` run them separately.
+
 Without any Sarvam key the app still works end-to-end using the browser's Web Speech API
 (Chrome recommended). Without any LLM key the UI loads but asks you for a key.
 
@@ -66,6 +69,54 @@ student's. On each ask, the client builds a compact text list of the board (ids,
 plus a JPEG of the region the student just changed, and sends both. The model can then say
 "the triangle you drew on the right…" and annotate it with highlights/arrows.
 
+## Live transcription (words appear as you speak)
+
+Batch STT can only show you the sentence *after* you stop talking — you record, you upload,
+you wait. ChatGPT and friends instead hold a socket open, push raw PCM up every ~100ms and
+paint the recogniser's partial hypotheses as they arrive, revising them in place. Indica does
+the same:
+
+```
+ mic ─► AudioWorklet (resample → 16kHz mono PCM16, 100ms chunks)
+          │
+          ▼  WebSocket (binary frames)
+     scripts/stt-relay.mjs  ──►  wss://api.sarvam.ai/speech-to-text-realtime/ws
+          │                 ◄──  transcript.partial / transcript.final
+          ▼
+   composer textarea (chat) · caption strip (voice mode)
+```
+
+The relay is a separate process for two reasons: a Next.js route handler can't hold a
+WebSocket open (the connection dies with the response), and `SARVAM_API_KEY` must never
+reach the browser. `npm run dev` starts it for you; in production run `npm run dev:relay`
+alongside the server, or point `STT_RELAY_URL` at wherever you deploy it.
+
+**It is strictly additive.** The mic keeps recording to a blob the whole time, so if the
+relay is down, Web Audio is unavailable, or the socket is refused, the turn falls back to the
+old `POST /api/stt` path and nobody notices except that the words show up later. When the
+stream *does* produce a transcript it's used directly and the upload is skipped, so there's
+no double billing. The browser Web Speech fallback already streamed interim results; those
+now land in the composer too.
+
+Three mic behaviours, deliberately different:
+
+| Gesture | While speaking | On stop |
+| --- | --- | --- |
+| Mic button (chat) | text streams into the composer, read-only | stays in the box, editable — you press send |
+| Hold `Space` (chat) | same | sends immediately on release |
+| Voice mode | the box on the stage fills line by line | same box unlocks: edit, **retry** (↻) or **send** (↑ / Enter) |
+
+Voice mode never sends straight through. One box owns the lower third from the first syllable to
+the moment it is asked: it opens empty ("Listening…"), fills with the recogniser's partials while
+read-only, holds the last of them through the upload, then unlocks — focused, caret at the end —
+with retry and send beside it. It is centred on the stage and grows sideways to ~48rem before
+wrapping downwards, so a one-word answer and a three-line question both look deliberate.
+
+Keeping it one element is the point: no pop-in, no layout jump at the handover. Recognition is
+not perfect, least of all on code-mixed Hinglish, and a misheard word would otherwise become the
+question Indica answers. Retry bins the transcript and reopens the mic; nothing reaches the model
+until send.
+
 ## Project layout
 
 | Path | What |
@@ -77,6 +128,9 @@ plus a JPEG of the region the student just changed, and sends both. The model ca
 | `src/lib/canvas/player.ts` | Animates ops onto the live scene (typing, growing arrows, fades) |
 | `src/lib/canvas/summary.ts` | Board → text summary; student-region snapshot for vision |
 | `src/lib/voice/stt.ts`, `tts.ts` | Mic recording / Web Speech fallback; audio playback / speechSynthesis fallback |
+| `src/lib/voice/live-stt.ts` | Streaming STT client — mic → PCM → relay → partial transcripts |
+| `public/pcm-worklet.js` | AudioWorklet: mic audio → 16 kHz mono linear16, 100ms chunks |
+| `scripts/stt-relay.mjs` | WebSocket relay to Sarvam realtime STT (holds the key) |
 | `src/app/api/tutor` | Streams NDJSON beats from the LLM (`Output.array` + `elementStream`) |
 | `src/app/api/stt`, `tts` | Sarvam Saaras v4 / Groq Whisper; Sarvam Bulbul v4 Flash |
 | `src/components/Tutor.tsx` | Orchestrator: turn lifecycle, beat queue, barge-in, push-to-talk |

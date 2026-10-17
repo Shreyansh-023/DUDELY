@@ -1,9 +1,13 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 
 type Props = {
   status: "idle" | "listening" | "transcribing" | "thinking" | "teaching";
+  /** What's in the box, owned by Tutor so dictation can write into it. */
+  draft: string;
+  onDraftChange: (text: string) => void;
+  /** Live speech not yet committed — rendered after the draft, in grey. */
   interim: string;
   disabled: boolean;
   voiceMode: boolean;
@@ -14,8 +18,17 @@ type Props = {
   onEnterVoice: () => void;
 };
 
+/** Join a typed draft and dictated speech without doubling or dropping the space. */
+export function joinDictation(draft: string, speech: string): string {
+  if (!draft.trim()) return speech;
+  if (!speech) return draft;
+  return /\s$/.test(draft) ? draft + speech : `${draft} ${speech}`;
+}
+
 export default function Composer({
   status,
+  draft,
+  onDraftChange,
   interim,
   disabled,
   voiceMode,
@@ -25,71 +38,89 @@ export default function Composer({
   onStop,
   onEnterVoice,
 }: Props) {
-  const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
   const listening = status === "listening";
   const busy = status === "thinking" || status === "teaching";
-  const hasText = text.trim().length > 0;
+  const dictating = interim.length > 0;
+  // What the student actually sees: typed text with the live speech running on
+  // the end of it, the way ChatGPT's dictation fills its composer as you talk.
+  const shown = dictating ? joinDictation(draft, interim) : draft;
+  const hasText = shown.trim().length > 0;
 
   // Auto-grow the field like ChatGPT: one line at rest, up to a cap, then scroll.
-  const autosize = () => {
+  // Runs on every value change, so speech arriving from the mic grows the box too.
+  useEffect(() => {
     const el = taRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-  };
+    // Keep the newest words in view while dictation runs past the visible area.
+    if (dictating) el.scrollTop = el.scrollHeight;
+  }, [shown, dictating]);
 
   const submit = () => {
-    const t = text.trim();
+    const t = shown.trim();
     if (!t) return;
     onSend(t);
-    setText("");
-    requestAnimationFrame(autosize);
+    onDraftChange("");
   };
 
   return (
     <div className="p-3">
-      {listening && (
-        <div className="mb-2 flex items-center gap-2 rounded-lg bg-red-50 px-3 py-1.5 text-xs text-red-700">
-          <span className="relative flex h-2 w-2">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
-            <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
-          </span>
-          <span className="truncate">{interim || "Listening… tap the mic again when done (or release Space)"}</span>
-        </div>
-      )}
       {status === "transcribing" && (
         <div className="mb-2 rounded-lg bg-neutral-100 px-3 py-1.5 text-xs text-neutral-600">Transcribing…</div>
       )}
 
       {/* One rounded box, ChatGPT-style: the field and every control live inside it. */}
-      <div className="flex items-end gap-1 rounded-3xl border border-amber-100 bg-white px-2 py-1.5 shadow-md shadow-amber-900/5 transition focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-200">
-        <textarea
-          ref={taRef}
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value);
-            autosize();
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              submit();
-            }
-          }}
-          rows={1}
-          placeholder={placeholder}
-          disabled={disabled}
-          className="min-h-9 max-h-40 flex-1 resize-none self-center bg-transparent px-2.5 py-2 text-sm leading-6 outline-none placeholder:text-neutral-400 disabled:opacity-50"
-        />
+      <div
+        className={
+          "flex items-end gap-1 rounded-3xl border bg-white px-2 py-1.5 shadow-md shadow-amber-900/5 transition focus-within:ring-2 " +
+          (listening
+            ? "border-rose-300 ring-2 ring-rose-100 focus-within:border-rose-400 focus-within:ring-rose-200"
+            : "border-amber-100 focus-within:border-amber-400 focus-within:ring-amber-200")
+        }
+      >
+        {/* While the mic is open the field is a live transcript, so it's read-only:
+            the recogniser keeps revising its tail and a caret in the middle of
+            that would fight the student. It becomes editable the moment the
+            words are committed. */}
+        <div className="relative min-w-0 flex-1">
+          <textarea
+            ref={taRef}
+            value={shown}
+            readOnly={dictating}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (!dictating) submit(); // mid-dictation Enter would send half a sentence
+              }
+            }}
+            rows={1}
+            placeholder={listening ? "" : placeholder}
+            disabled={disabled}
+            className="min-h-9 max-h-40 w-full resize-none self-center bg-transparent px-2.5 py-2 text-sm leading-6 outline-none placeholder:text-neutral-400 disabled:opacity-50"
+          />
+          {/* Nothing said yet: a pulsing hint in place of the placeholder, so the
+              student can tell the mic is live and simply hasn't heard them. */}
+          {listening && !shown && (
+            <span className="pointer-events-none absolute left-2.5 top-2 flex items-center gap-1.5 py-0 text-sm leading-6 text-rose-500">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-rose-500" />
+              </span>
+              Listening…
+            </span>
+          )}
+        </div>
 
-        {/* Mic — a quiet in-box control (push-to-talk / pause-resume in voice mode). */}
+        {/* Mic — a quiet in-box control (dictation / pause-resume in voice mode). */}
         <button
           type="button"
           onClick={onToggleMic}
           disabled={disabled || status === "transcribing"}
           aria-label={listening ? "Stop listening" : "Start listening"}
-          title={listening ? "Stop" : "Speak (or hold Space)"}
+          title={listening ? "Stop" : "Speak (or hold Space to send on release)"}
           className={
             "grid h-9 w-9 shrink-0 place-items-center rounded-full transition active:scale-95 disabled:opacity-40 " +
             (listening
@@ -101,7 +132,7 @@ export default function Composer({
         </button>
 
         {/* Primary action, same slot throughout:
-            busy → Stop · text typed → send (up-arrow) · empty → voice mode (waveform). */}
+            busy → Stop · text present → send (up-arrow) · empty → voice mode (waveform). */}
         {busy ? (
           <button
             type="button"
@@ -116,9 +147,9 @@ export default function Composer({
           <button
             type="button"
             onClick={submit}
-            disabled={disabled}
+            disabled={disabled || dictating}
             aria-label="Send"
-            title="Send"
+            title={dictating ? "Still listening…" : "Send"}
             className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-amber-500 text-white shadow-sm shadow-amber-500/30 transition hover:scale-105 hover:bg-amber-600 active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
           >
             <ArrowUpIcon />

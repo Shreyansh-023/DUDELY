@@ -108,7 +108,10 @@ export function languageLabel(code: string): string {
  * for the student to press Enter before the mic opens. The spoken lines never
  * enter the chat transcript or the LLM history.
  */
-export const VOICE_PROMPTS: Record<LanguageCode, { greeting: string; reprompt: string; answerHint: string }> = {
+export const VOICE_PROMPTS: Record<
+  LanguageCode,
+  { greeting: string; reprompt: string; answerHint: string }
+> = {
   en: {
     greeting: "Hello! What should we learn today?",
     reprompt: "I didn't hear anything. Can you repeat?",
