@@ -32,15 +32,20 @@ import { isPlaybackPaused } from "@/lib/voice/playback";
 import { MicVad } from "@/lib/voice/vad";
 import type { Config, Status } from "./Tutor";
 
-// "awaiting" = Guru has asked something and is waiting for the student to press
-// Enter before the mic opens (the student answers in their own time).
-// "review"   = the student has finished speaking and is looking at what was
-//              heard, free to edit it, say it again, or send.
+// "awaiting"     = Guru has asked something and is waiting for the student to
+//                  press Enter before the mic opens (they answer in their own time).
+// "transcribing" = the utterance is closed and the words are being worked out.
+//                  Its own phase, not a flavour of "processing": the student is
+//                  shown it, so it must not be guessed at from a status + a
+//                  non-empty interim.
+// "review"       = the student has finished speaking and is looking at what was
+//                  heard, free to edit it, say it again, or send.
 export type VoicePhase =
   | "off"
   | "greeting"
   | "listening"
   | "capturing"
+  | "transcribing"
   | "processing"
   | "awaiting"
   | "review"
@@ -54,6 +59,12 @@ export type VoicePhase =
 const MAX_AUTO_CONTINUE = 8;
 /** Browser STT: abort if not even an interim result arrives within this window. */
 const NO_INTERIM_TIMEOUT_MS = 5000;
+/**
+ * How long "Transcribing…" stays up at minimum. The browser recogniser hands
+ * back its final text the instant it endpoints, so without a floor the state
+ * would flash past in a frame and read as a glitch rather than a step.
+ */
+const TRANSCRIBING_MIN_MS = 450;
 
 type Deps = {
   enabled: boolean; // voiceMode
@@ -89,6 +100,14 @@ export function useVoiceLoop(deps: Deps): {
   listen: () => void;
   /** Interrupt Guru and start listening immediately — the Doubt button. */
   bargeIn: () => void;
+  /** Close the utterance now and transcribe it — the stop button on the waveform. */
+  endUtterance: () => void;
+  /**
+   * Live mic loudness, 0..~0.3 RMS, for the waveform. A ref, not state: it
+   * changes 20x a second and nothing in the tree should re-render for it.
+   * Stays 0 on the browser-STT path, which never hands us the stream.
+   */
+  micLevelRef: RefObject<number>;
 } {
   const [phase, setPhaseState] = useState<VoicePhase>("off");
   const [voiceCaption, setVoiceCaption] = useState<{ text: string; word: number } | null>(null);
@@ -113,6 +132,8 @@ export function useVoiceLoop(deps: Deps): {
   const noInterimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoContinueRef = useRef(0);
   const prevStatusRef = useRef<Status>("idle");
+  const micLevelRef = useRef(0);
+  const transcribeAtRef = useRef(0);
 
   const setPhase = useCallback((p: VoicePhase) => {
     phaseRef.current = p;
@@ -138,6 +159,7 @@ export function useVoiceLoop(deps: Deps): {
     browserRecRef.current?.abort();
     browserRecRef.current = null;
     clearNoInterimTimer();
+    micLevelRef.current = 0;
     depsRef.current.setInterim("");
   }, [clearNoInterimTimer]);
 
@@ -195,14 +217,29 @@ export function useVoiceLoop(deps: Deps): {
   const submit = useCallback(
     (text: string, gen: number) => {
       if (gen !== genRef.current) return;
-      // Swap the live caption for the reviewable text in one commit, so the box
-      // on screen never blanks between the two.
-      depsRef.current.setInterim("");
-      setReview(text);
-      setPhase("review");
+      const show = () => {
+        if (gen !== genRef.current) return;
+        // Swap the live caption for the reviewable text in one commit, so the box
+        // on screen never blanks between the two.
+        depsRef.current.setInterim("");
+        micLevelRef.current = 0;
+        setReview(text);
+        setPhase("review");
+      };
+      // Let "Transcribing…" be read before the words land on top of it.
+      const left = TRANSCRIBING_MIN_MS - (performance.now() - transcribeAtRef.current);
+      if (phaseRef.current === "transcribing" && left > 0) setTimeout(show, left);
+      else show();
     },
     [setPhase],
   );
+
+  /** The utterance is closed; the words are being worked out. */
+  const beginTranscribing = useCallback(() => {
+    transcribeAtRef.current = performance.now();
+    micLevelRef.current = 0;
+    setPhase("transcribing");
+  }, [setPhase]);
 
   /** The student approved the transcript (send button, or Enter). */
   const sendReview = useCallback(() => {
@@ -273,8 +310,13 @@ export function useVoiceLoop(deps: Deps): {
           depsRef.current.setInterim("");
           return;
         }
-        if (text.trim()) submit(text, gen); // clears the interim itself
-        else {
+        if (text.trim()) {
+          // The browser recogniser returns its final text the moment it
+          // endpoints, so there is nothing to wait for — but the student still
+          // gets the beat, so the handover reads as a step and not a jump.
+          beginTranscribing();
+          submit(text, gen); // clears the interim itself
+        } else {
           depsRef.current.setInterim("");
           void handleNoSpeech(gen);
         }
@@ -301,6 +343,11 @@ export function useVoiceLoop(deps: Deps): {
       const vad = new MicVad(r.mediaStream, undefined, {
         onSpeechStart: () => {
           if (gen === genRef.current) setPhase("capturing");
+        },
+        // Drives the waveform. Written to a ref on purpose — this fires 20x a
+        // second and the board must not re-render for it.
+        onLevel: (rms) => {
+          if (gen === genRef.current) micLevelRef.current = rms;
         },
       });
       vadRef.current = vad;
@@ -340,7 +387,7 @@ export function useVoiceLoop(deps: Deps): {
         return;
       }
       // "speech-ended" | "max-duration": the sentence is in the can.
-      setPhase("processing");
+      beginTranscribing();
       const [streamed, blob] = await Promise.all([live ? live.finish() : Promise.resolve(""), r.stop()]);
       recorderRef.current = null;
       if (gen !== genRef.current) return;
@@ -366,7 +413,7 @@ export function useVoiceLoop(deps: Deps): {
         void handleNoSpeech(gen);
       }
     },
-    [clearNoInterimTimer, handleNoSpeech, setPhase, submit],
+    [beginTranscribing, clearNoInterimTimer, handleNoSpeech, setPhase, submit],
   );
   // handleNoSpeech → listenOnce → handleNoSpeech is mutually recursive; break the cycle with a ref.
   const listenOnceRef = useRef(listenOnce);
@@ -420,7 +467,11 @@ export function useVoiceLoop(deps: Deps): {
         void listenOnceRef.current(++genRef.current); // not immediate → "awaiting"
       }
     } else if (
-      (phase === "listening" || phase === "capturing" || phase === "awaiting" || phase === "review") &&
+      (phase === "listening" ||
+        phase === "capturing" ||
+        phase === "transcribing" ||
+        phase === "awaiting" ||
+        phase === "review") &&
       (deps.status === "thinking" || deps.status === "teaching")
     ) {
       // A turn started (e.g. the student typed in the chat panel) while we were
@@ -475,6 +526,20 @@ export function useVoiceLoop(deps: Deps): {
     void listenOnceRef.current(++genRef.current, true, true);
   }, [cancelCapture]);
 
+  /**
+   * "I've finished" — close the utterance now instead of waiting out the
+   * trailing silence, and transcribe what was said. A no-op unless the mic is
+   * actually open.
+   */
+  const endUtterance = useCallback(() => {
+    const phase = phaseRef.current;
+    if (phase !== "listening" && phase !== "capturing") return;
+    // Whichever path is live: the browser recogniser finalises on stop(), the
+    // VAD resolves its wait() as if the silence had run out.
+    browserRecRef.current?.stop();
+    vadRef.current?.end();
+  }, []);
+
   const pause = useCallback(() => {
     genRef.current += 1; // orphan any in-flight continuation (greeting chain included)
     greetAbortRef.current?.abort();
@@ -486,7 +551,20 @@ export function useVoiceLoop(deps: Deps): {
     setPhase("paused");
   }, [cancelCapture, setPhase]);
 
-  return { phase, voiceCaption, review, setReview, sendReview, retryReview, resume, pause, listen, bargeIn };
+  return {
+    phase,
+    voiceCaption,
+    review,
+    setReview,
+    sendReview,
+    retryReview,
+    resume,
+    pause,
+    listen,
+    bargeIn,
+    endUtterance,
+    micLevelRef,
+  };
 }
 
 /**

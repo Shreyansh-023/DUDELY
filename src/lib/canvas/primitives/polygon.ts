@@ -1,41 +1,52 @@
 import type { DrawOp } from "../../schema";
-import { boundsOf, measureText, TEXT_H, type Expanded } from "./util";
+import { boundsOf, textBox, type Expanded } from "./util";
+import {
+  leaderEnd,
+  placeOutlineLabels,
+  signedArea2,
+  unionRects,
+  type LabelRequest,
+  type Pt,
+  type Rect,
+} from "./place";
 
 /**
  * Lowers a high-level `polygon` op into a closed shape whose vertices the model
- * supplies, but whose LABELS the renderer places: each vertex label is pushed
- * OUTSIDE the shape (away from the centroid) so it never sits on an edge, side
- * labels go just outside each edge midpoint, and 90-degree corners get a small
- * right-angle square automatically. This is what keeps triangle/Pythagoras
- * diagrams clean — the model stops hand-placing labels on top of the figure.
+ * supplies, but whose LABELS the renderer places.
+ *
+ * The placement is deterministic geometry (see `place.ts`), and it is what
+ * makes "side a is labelled a" true rather than hopeful: every side label is
+ * pushed out along its OWN edge's outward normal, by its own half-width, so the
+ * box sits square to that edge, outside the figure, touching nothing — and if a
+ * crowded corner forces it further out, a thin leader line runs back to the
+ * edge midpoint so the pairing is still unmistakable. Vertex labels get the
+ * same treatment along the outward corner bisector, and 90-degree corners are
+ * marked automatically.
+ *
+ * Works for triangles (incl. Pythagoras), quadrilaterals and any n-gon, convex
+ * or concave, with the vertices given in either winding order.
  */
 
 const FONT = 16;
-
-type P = { x: number; y: number };
-const norm = (v: P): P => {
-  const d = Math.hypot(v.x, v.y) || 1;
-  return { x: v.x / d, y: v.y / d };
-};
+const HEADING_FONT = 24;
 
 export function expandPolygon(op: DrawOp): Expanded {
   const pid = (op.id || "poly").replace(/[^a-zA-Z0-9_-]/g, "_");
-  const pts = (op.points ?? []).filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+  const pts: Pt[] = (op.points ?? [])
+    .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y))
+    .map((p) => ({ x: p.x, y: p.y }));
+  const srcPoints = (op.points ?? []).filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
   const col = op.color ?? "black";
   if (pts.length < 2) {
     return { ops: [], bbox: { x: op.x ?? 0, y: op.y ?? 0, w: 1, h: 1 }, label: "polygon (empty)" };
   }
   const closed = op.closed ?? true;
   const n = pts.length;
-  const cx = pts.reduce((s, p) => s + p.x, 0) / n;
-  const cy = pts.reduce((s, p) => s + p.y, 0) / n;
   const ops: DrawOp[] = [];
+  const boxes: Rect[] = [];
 
   const heading = (op.text ?? "").trim();
-  if (heading) {
-    const b = boundsOf(pts);
-    ops.push({ op: "text", id: `${pid}.h`, x: b.x, y: b.y - 40, text: heading, size: "md", color: "purple" });
-  }
+  const bounds = boundsOf(pts);
 
   // Edges.
   const edgeCount = closed ? n : n - 1;
@@ -45,64 +56,110 @@ export function expandPolygon(op: DrawOp): Expanded {
     ops.push({ op: "line", id: `${pid}.e${i}`, x: a.x, y: a.y, x2: b.x, y2: b.y, color: col });
   }
 
-  // Side labels: just outside each edge midpoint (perpendicular, away from centroid).
-  const sides = op.sides ?? [];
-  for (let i = 0; i < edgeCount; i++) {
-    const t = (sides[i] ?? "").trim();
-    if (!t) continue;
-    const a = pts[i];
-    const b = pts[(i + 1) % n];
-    const mx = (a.x + b.x) / 2;
-    const my = (a.y + b.y) / 2;
-    const out = norm({ x: mx - cx, y: my - cy });
-    ops.push({
-      op: "text",
-      id: `${pid}.s${i}`,
-      x: mx + out.x * 18 - measureText(t, FONT) / 2,
-      y: my + out.y * 18 - TEXT_H / 2,
-      text: t,
-      size: "sm",
-      color: "blue",
-    });
-  }
-
-  // Vertex labels: pushed outward from the centroid so they clear the edges.
-  pts.forEach((p, i) => {
-    const t = (p.label ?? "").trim();
-    if (!t) return;
-    let dir = norm({ x: p.x - cx, y: p.y - cy });
-    if (!Number.isFinite(dir.x) || (dir.x === 0 && dir.y === 0)) dir = { x: 0, y: -1 };
-    ops.push({
-      op: "text",
-      id: `${pid}.v${i}`,
-      x: p.x + dir.x * 22 - measureText(t, FONT) / 2,
-      y: p.y + dir.y * 22 - TEXT_H / 2,
-      text: t,
-      size: "sm",
-      color: p.color ?? "black",
-    });
-  });
-
-  // Right-angle marks at ~90-degree corners (closed shapes, or interior vertices).
-  const corners = closed ? n : n; // check every vertex that has two neighbours
-  for (let i = 0; i < corners; i++) {
-    const prev = pts[(i - 1 + n) % n];
-    const next = pts[(i + 1) % n];
+  // Right-angle marks at 90-degree corners. Computed BEFORE the labels so the
+  // little square is an obstacle a vertex letter has to avoid, not something
+  // drawn on top of it afterwards. A reflex corner is skipped: |cos| cannot
+  // tell 90 from 270, and a square asserting "right angle" in the notch of a
+  // concave shape is simply false.
+  const area2 = closed && n >= 3 ? signedArea2(pts) : 0;
+  const reserved: Rect[] = [];
+  for (let i = 0; i < n; i++) {
     if (!closed && (i === 0 || i === n - 1)) continue; // endpoints have one edge
     const v = pts[i];
-    const ua = norm({ x: prev.x - v.x, y: prev.y - v.y });
-    const ub = norm({ x: next.x - v.x, y: next.y - v.y });
-    const cos = ua.x * ub.x + ua.y * ub.y;
-    if (Math.abs(cos) > 0.09) continue; // not a right angle
+    const ua = unit({ x: pts[(i - 1 + n) % n].x - v.x, y: pts[(i - 1 + n) % n].y - v.y });
+    const ub = unit({ x: pts[(i + 1) % n].x - v.x, y: pts[(i + 1) % n].y - v.y });
+    if (Math.abs(ua.x * ub.x + ua.y * ub.y) > 0.09) continue; // not a right angle
+    const cross = ua.x * ub.y - ua.y * ub.x;
+    if (area2 !== 0 && cross * area2 >= 0) continue; // reflex: 270, not 90
     const s = 12;
     const c1 = { x: v.x + ua.x * s, y: v.y + ua.y * s };
     const c2 = { x: v.x + ub.x * s, y: v.y + ub.y * s };
     const c3 = { x: v.x + (ua.x + ub.x) * s, y: v.y + (ua.y + ub.y) * s };
     ops.push({ op: "line", id: `${pid}.r${i}a`, x: c1.x, y: c1.y, x2: c3.x, y2: c3.y, color: col });
     ops.push({ op: "line", id: `${pid}.r${i}b`, x: c2.x, y: c2.y, x2: c3.x, y2: c3.y, color: col });
+    const mb = boundsOf([v, c1, c2, c3]);
+    reserved.push({ x: mb.x, y: mb.y, w: mb.w, h: mb.h });
   }
 
-  const b = boundsOf(pts);
-  const bbox = { x: b.x - 40, y: b.y - (heading ? 46 : 40), w: b.w + 80, h: b.h + (heading ? 86 : 80) };
+  // Every label is requested up front so they are placed against one another
+  // as well as against the strokes — a side label never lands on a vertex
+  // letter, and two side labels never land on each other.
+  const sides = op.sides ?? [];
+  const sideText: string[] = [];
+  const vertexText: string[] = [];
+  const requests: LabelRequest[] = [];
+
+  for (let i = 0; i < n; i++) {
+    const t = (srcPoints[i].label ?? "").trim();
+    vertexText[i] = t;
+    if (!t) continue;
+    const b = textBox(t, FONT);
+    requests.push({ kind: "vertex", index: i, w: b.w, h: b.h });
+  }
+  for (let i = 0; i < edgeCount; i++) {
+    const t = (sides[i] ?? "").trim();
+    sideText[i] = t;
+    if (!t) continue;
+    const b = textBox(t, FONT);
+    requests.push({ kind: "edge", index: i, w: b.w, h: b.h });
+  }
+
+  const placements = placeOutlineLabels(pts, closed, requests, { reserved });
+
+  for (const p of placements) {
+    const text = p.kind === "edge" ? sideText[p.index] : vertexText[p.index];
+    if (!text) continue;
+    const id = p.kind === "edge" ? `${pid}.s${p.index}` : `${pid}.v${p.index}`;
+    const color = p.kind === "edge" ? "blue" : srcPoints[p.index].color ?? "black";
+    // A label that had to be pushed clear of a crowded corner gets a hairline
+    // back to the midpoint of the side it names, so the pairing stays obvious.
+    if (p.leader) {
+      const end = leaderEnd(p.anchor, p);
+      ops.push({
+        op: "line",
+        id: `${id}L`,
+        x: p.anchor.x,
+        y: p.anchor.y,
+        x2: end.x,
+        y2: end.y,
+        color: "gray",
+        dash: true,
+      });
+    }
+    ops.push({ op: "text", id, x: p.x, y: p.y, text, size: "sm", color });
+    boxes.push({ x: p.x, y: p.y, w: p.w, h: p.h });
+  }
+
+  // The heading goes on LAST, above everything already placed. Reserving a
+  // fixed band at `bounds.y - 40` before placing is what used to shove every
+  // top-side label past the title and manufacture a leader straight through
+  // the words; a title has no geometric anchor, so it is the thing that should
+  // give way. It is unshifted to the front so the draw order is unchanged.
+  const shape: Rect = { x: bounds.x, y: bounds.y, w: bounds.w, h: bounds.h };
+  const placedExtent = unionRects([shape, ...reserved, ...boxes]) ?? shape;
+  if (heading) {
+    const hb = textBox(heading, HEADING_FONT);
+    const hy = placedExtent.y - hb.h - 12;
+    ops.unshift({
+      op: "text",
+      id: `${pid}.h`,
+      x: bounds.x,
+      y: hy,
+      text: heading,
+      size: "md",
+      color: "purple",
+    });
+    boxes.push({ x: bounds.x, y: hy, w: hb.w, h: hb.h });
+  }
+
+  // The figure's own extent plus every label we actually placed, so the page
+  // layout reserves room for labels that had to travel.
+  const all = unionRects([shape, ...reserved, ...boxes]) ?? shape;
+  const bbox = { x: all.x - 16, y: all.y - 16, w: all.w + 32, h: all.h + 32 };
   return { ops, bbox, label: `polygon (${n} pts)` };
+}
+
+function unit(v: Pt): Pt {
+  const d = Math.hypot(v.x, v.y) || 1;
+  return { x: v.x / d, y: v.y / d };
 }

@@ -23,6 +23,7 @@ import Composer, { joinDictation } from "./Composer";
 import { LogoTile, Wordmark } from "./Logo";
 import LanguageMenu from "./LanguageMenu";
 import Transcript from "./Transcript";
+import VoiceCapture from "./VoiceCapture";
 import VoiceReview from "./VoiceReview";
 import { useVoiceLoop } from "./useVoiceLoop";
 import type { Board } from "./Whiteboard";
@@ -116,15 +117,6 @@ function PlusIcon() {
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden>
       <line x1="12" y1="5" x2="12" y2="19" />
       <line x1="5" y1="12" x2="19" y2="12" />
-    </svg>
-  );
-}
-
-function QuestionIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
-      <line x1="12" y1="17" x2="12" y2="17" />
     </svg>
   );
 }
@@ -300,6 +292,10 @@ export default function Tutor() {
     familiarity: "new" | "some" | "confident" | null;
   }>({ phase: "none", plan: null, step: 0, topic: "", familiarity: null });
   const [lessonPhase, setLessonPhase] = useState<LessonPhase>("none");
+  // True from the first teaching turn until the topic is dropped. Distinct from
+  // phase "teaching", which is already set while the plan is being designed —
+  // there is nothing on the board to have a doubt about until a step runs.
+  const [lessonStarted, setLessonStarted] = useState(false);
   const setLesson = useCallback((p: LessonPhase) => {
     lessonRef.current.phase = p;
     setLessonPhase(p);
@@ -647,6 +643,7 @@ export default function Tutor() {
     if (L.phase !== "teaching" || !L.plan) return;
     if (L.step >= L.plan.steps.length) return; // lesson complete; wait for the student
     const step = L.step;
+    setLessonStarted(true); // Indica is about to write on the board
     await runTurn({
       text: step === 0 ? "Begin the lesson." : CONTINUE_NUDGE,
       hidden: true,
@@ -691,6 +688,7 @@ export default function Tutor() {
         } else {
           // Planning failed: fall back so the student isn't stuck on a blank board.
           setLesson("none");
+          setLessonStarted(false);
           setStatus("idle");
         }
         return;
@@ -990,6 +988,7 @@ export default function Tutor() {
     setError(null);
     lessonRef.current = { phase: "none", plan: null, step: 0, topic: "", familiarity: null };
     setLessonPhase("none");
+    setLessonStarted(false);
   };
 
   const busy = status === "thinking" || status === "teaching";
@@ -1020,29 +1019,28 @@ export default function Tutor() {
   // Is there something a pause would act on right now? (Only then is the avatar a
   // pause control — while awaiting/idle there's nothing to stop.)
   const pausable = guruSpeaking || guruListening || status === "thinking";
+  // The words are being worked out — its own phase, so the box can say so
+  // without guessing from a status plus a non-empty interim.
+  const transcribing = voice.phase === "transcribing";
   // The student's words own the lower third from the mic opening until the text
-  // is sent: listening (empty, "Listening…") → filling → transcribing (last
-  // partial held) → review. The `interim` guard on the transcribing gap stops
-  // the box flashing up empty in the frame after a send.
-  const showSpeechBox =
-    reviewing ||
-    guruListening ||
-    (voice.phase === "processing" && status === "idle" && Boolean(interim.trim()));
+  // is sent: waveform while they talk → "Transcribing…" → the transcript, ready
+  // to edit and send.
+  const showSpeechBox = reviewing || guruListening || transcribing;
   // The only states worth a pill in the caption strip; everything else either
   // shows a caption (speaking) or the avatar's own affordance (paused → play).
-  // "processing" with no turn running yet is the gap between the student
-  // finishing and the review card appearing — say so rather than going blank.
-  const stripStatus = guruListening
-    ? "Listening…"
-    : status === "thinking"
-      ? "Thinking…"
-      : voice.phase === "processing" && status === "idle"
-        ? "Transcribing…"
-        : null;
+  // Listening and transcribing are not here: the speech box itself is showing
+  // them, and saying it twice in the same corner just reads as a duplicate.
+  const stripStatus = status === "thinking" ? "Thinking…" : null;
   // The Doubt button is offered while Guru is working (speaking/teaching/thinking)
   // and not already listening — those are the moments a student wants to break in.
+  // Gated on the lesson actually being underway: before that there is no lesson
+  // to interrupt, and "doubt" has nothing to attach itself to.
   const canRaiseDoubt =
-    !guruListening && !avatarPaused && (guruSpeaking || status === "thinking" || voice.phase === "processing");
+    lessonStarted &&
+    !guruListening &&
+    !transcribing &&
+    !avatarPaused &&
+    (guruSpeaking || status === "thinking" || voice.phase === "processing");
 
   return (
     <main className="flex h-dvh w-full flex-col-reverse bg-neutral-100 md:flex-row">
@@ -1165,18 +1163,28 @@ export default function Tutor() {
 
             {!chatPanelOpen && (
               <>
-                {/* Doubt button (top-left, under the hamburger): interrupt Guru and
-                    start listening so the student can ask a doubt hands-free. */}
+                {/* Doubt button (bottom-left, mirroring the presenter PiP): interrupt
+                    Guru and start listening so the student can ask a doubt hands-free.
+                    Word only — a "?" next to it said the same thing twice. */}
                 {canRaiseDoubt && (
-                  <button
-                    type="button"
-                    onClick={raiseDoubt}
-                    title="Ask a doubt"
-                    aria-label="Ask a doubt"
-                    className="absolute left-3 top-16 z-20 flex items-center gap-1.5 rounded-full bg-white/90 px-3 py-2 text-sm font-medium text-rose-600 shadow ring-1 ring-black/5 backdrop-blur transition hover:bg-white active:scale-95"
-                  >
-                    <QuestionIcon /> Doubt
-                  </button>
+                  <div className="absolute bottom-5 left-4 z-20 md:bottom-6 md:left-6">
+                    {/* A halo that keeps breathing while the button is on offer:
+                        it appears mid-lesson, so it has to be findable without
+                        competing with Guru's writing. */}
+                    <span
+                      aria-hidden
+                      className="pointer-events-none absolute -inset-1.5 animate-pulse rounded-full bg-orange-500/35 blur-md [animation-duration:2.8s]"
+                    />
+                    <button
+                      type="button"
+                      onClick={raiseDoubt}
+                      title="Ask a doubt"
+                      aria-label="Ask a doubt"
+                      className="relative block rounded-full bg-linear-to-b from-[#fb923c] to-[#e03e22] px-5 py-2.5 text-sm font-semibold tracking-wide text-white shadow-lg shadow-orange-900/30 ring-1 ring-inset ring-white/30 transition duration-150 hover:-translate-y-px hover:shadow-xl hover:shadow-orange-900/35 hover:brightness-105 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 active:translate-y-0 active:scale-95"
+                    >
+                      Doubt
+                    </button>
+                  </div>
                 )}
 
                 {/* Presenter PiP (bottom-right, like a video call). Mouth is driven
@@ -1245,13 +1253,21 @@ export default function Tutor() {
                     above it instead of running underneath. */}
                 {showSpeechBox && (
                   <div className="absolute inset-x-4 bottom-40 z-30 flex justify-center md:bottom-4">
-                    <VoiceReview
-                      value={reviewing ? voice.review : interim}
-                      onChange={voice.setReview}
-                      onSend={voice.sendReview}
-                      onRetry={voice.retryReview}
-                      live={!reviewing}
-                    />
+                    {reviewing ? (
+                      <VoiceReview
+                        value={voice.review}
+                        onChange={voice.setReview}
+                        onSend={voice.sendReview}
+                        onRetry={voice.retryReview}
+                      />
+                    ) : (
+                      <VoiceCapture
+                        state={transcribing ? "transcribing" : "live"}
+                        levelRef={voice.micLevelRef}
+                        onCancel={voice.pause}
+                        onStop={voice.endUtterance}
+                      />
+                    )}
                   </div>
                 )}
 
@@ -1279,6 +1295,23 @@ export default function Tutor() {
           </>
         )}
       </section>
+
+      {/* Doubt mode: the answer goes on the side canvas, and the whole viewport
+          gets a glowing frame so it is obvious at a glance that the lesson is
+          paused on a doubt (say "got it" to resume). Decorative + click-through;
+          the markup is bare tags because globals.css styles it by element. */}
+      {lessonPhase === "doubt" && (
+        <div className="doubt-frame" aria-hidden>
+          <header>
+            <i />
+            <b>Doubt Mode</b>
+            <i />
+          </header>
+          <i className="edge-l" />
+          <i className="edge-r" />
+          <i className="edge-b" />
+        </div>
+      )}
     </main>
   );
 }

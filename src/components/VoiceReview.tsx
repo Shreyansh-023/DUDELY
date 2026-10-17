@@ -7,19 +7,12 @@ type Props = {
   onChange: (text: string) => void;
   onSend: () => void;
   onRetry: () => void;
-  /** Still listening/transcribing: the box fills itself and can't be edited yet. */
-  live: boolean;
 };
 
 /**
- * The student's own words on the voice stage — one element for the whole
- * utterance, from the first syllable to the moment it is sent.
- *
- * While the mic is open it fills line by line with the recogniser's partials
- * and is read-only (the tail is still being revised; a caret in the middle of
- * that would fight the student). When the utterance is closed it becomes an
- * ordinary editable box, takes focus, and its retry/send buttons light up.
- * Keeping it one element means no pop-in and no layout jump at the handover.
+ * What the recogniser heard, handed to the student to check. It takes over the
+ * same spot VoiceCapture's waveform had, in the same shell, so the handover
+ * reads as the box settling rather than one card swapping for another.
  *
  * Nothing is sent until the student presses send: recognition is never perfect,
  * least of all on code-mixed Hinglish, and a misheard word would otherwise
@@ -33,21 +26,20 @@ type Props = {
  * the textarea must keep identical type, alignment and padding or the two will
  * drift apart.
  */
-export default function VoiceReview({ value, onChange, onSend, onRetry, live }: Props) {
+export default function VoiceReview({ value, onChange, onSend, onRetry }: Props) {
   const taRef = useRef<HTMLTextAreaElement>(null);
 
-  // Take focus the moment editing opens (not before — focusing a read-only box
-  // mid-sentence would pop the mobile keyboard over the board). Caret at the
-  // end, so Enter sends and typing corrects without clicking in first.
+  // Take focus as the box opens, caret at the end, so Enter sends and typing
+  // corrects without having to click in first.
   useEffect(() => {
     const el = taRef.current;
-    if (live || !el) return;
+    if (!el) return;
     el.focus();
     const end = el.value.length;
     el.setSelectionRange(end, end);
-  }, [live]);
+  }, []);
 
-  const canSend = !live && value.trim().length > 0;
+  const canSend = value.trim().length > 0;
   // Shared by the textarea and its invisible sizing twin — any divergence here
   // shows up as the text drifting out of the box.
   //
@@ -56,22 +48,19 @@ export default function VoiceReview({ value, onChange, onSend, onRetry, live }: 
   // ("mmmm…", a URL, a pasted token) still reports its full unwrapped width as
   // the grid track's minimum, so the track overflows the card and the text
   // sails out past the right edge while the card itself stays clamped.
-  const TYPE = "px-4 py-2.5 text-center text-[15px] leading-6 wrap-anywhere md:text-base md:leading-7";
+  // py is picked so the text's vertical centre lands exactly on the retry/send
+  // buttons' centre (h-10 = 40px, so 20px from the top): 8px + half of the
+  // 24px line box = 20 at rest, and 6px + half of the 28px md line box = 20.
+  const TYPE = "px-4 py-2 md:py-1.5 text-center text-[15px] leading-6 wrap-anywhere md:text-base md:leading-7";
 
   return (
     <div
-      className={
-        "pointer-events-auto flex w-fit max-w-[min(94vw,48rem)] items-end gap-1.5 rounded-[1.75rem] border bg-[#fffdf7]/90 p-1.5 shadow-lg shadow-amber-900/10 backdrop-blur-md transition " +
-        (live
-          ? "border-rose-200/70"
-          : "border-amber-200/70 focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-200/70")
-      }
+      className="pointer-events-auto flex w-fit max-w-[min(94vw,48rem)] items-end gap-1.5 rounded-[1.75rem] border border-amber-200/70 bg-[#fffdf7]/90 p-1.5 shadow-lg shadow-amber-900/10 backdrop-blur-md transition focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-200/70"
     >
       <div className="relative grid min-w-48 flex-1">
         <textarea
           ref={taRef}
           value={value}
-          readOnly={live}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -81,7 +70,13 @@ export default function VoiceReview({ value, onChange, onSend, onRetry, live }: 
           }}
           rows={1}
           aria-label="What you said — edit before sending"
-          className={"col-start-1 row-start-1 max-h-48 resize-none overflow-y-auto bg-transparent text-neutral-800 outline-none " + TYPE}
+          // `block`: a textarea is inline-block by default, so it sits on its
+          // wrapper's text baseline and leaves descender space underneath — the
+          // grid cell reports a height taller than one real text line, and with
+          // the outer row `items-end` that drops the retry/send buttons below
+          // middle while the text stays above it. Mirrored on the span below,
+          // since the two must stay identical or they drift apart.
+          className={"col-start-1 row-start-1 block max-h-48 resize-none overflow-y-auto bg-transparent text-neutral-800 outline-none " + TYPE}
         />
         {/* Invisible twin: its wrapped height and natural width size the grid
             cell, and the textarea above stretches to fill it. The trailing
@@ -90,32 +85,17 @@ export default function VoiceReview({ value, onChange, onSend, onRetry, live }: 
             sized from this span's contribution, so capping only the textarea
             lets the row keep growing past it — the card stretches on while the
             textarea stops and scrolls, leaving a hole above the buttons. */}
-        <span aria-hidden className={"col-start-1 row-start-1 invisible max-h-48 overflow-hidden whitespace-pre-wrap " + TYPE}>
+        <span aria-hidden className={"col-start-1 row-start-1 block invisible max-h-48 overflow-hidden whitespace-pre-wrap " + TYPE}>
           {value + " "}
         </span>
-        {/* Mic open, nothing heard yet — so the student can tell it's live. */}
-        {live && !value && (
-          <span
-            className={
-              "pointer-events-none col-start-1 row-start-1 flex items-center justify-center gap-1.5 text-rose-500 " + TYPE
-            }
-          >
-            <span className="relative flex h-1.5 w-1.5">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75" />
-              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-rose-500" />
-            </span>
-            Listening…
-          </span>
-        )}
       </div>
 
       <button
         type="button"
         onClick={onRetry}
-        disabled={live}
         aria-label="Say it again"
         title="Say it again"
-        className="grid h-10 w-10 shrink-0 place-items-center rounded-full text-neutral-500 transition hover:bg-amber-100/70 hover:text-amber-700 active:scale-95 disabled:opacity-30 disabled:hover:bg-transparent"
+        className="grid h-10 w-10 shrink-0 place-items-center rounded-full text-neutral-500 transition hover:bg-amber-100/70 hover:text-amber-700 active:scale-95"
       >
         <RetryIcon />
       </button>

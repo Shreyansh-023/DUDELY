@@ -99,12 +99,19 @@ export default function Composer({
             rows={1}
             placeholder={listening ? "" : placeholder}
             disabled={disabled}
-            className="min-h-9 max-h-40 w-full resize-none self-center bg-transparent px-2.5 py-2 text-sm leading-6 outline-none placeholder:text-neutral-400 disabled:opacity-50"
+            // Two things keep this level with the buttons, and both are load-bearing.
+            // `block`: a textarea is inline-block by default, so it would sit on its
+            // wrapper's text baseline and leave ~7px of descender space underneath —
+            // the row would measure 43px, and `items-end` would drop the buttons to
+            // the bottom of that phantom gap while the text stayed up top.
+            // `py-1.5`: 6px + half the 24px line box = 18px = half the 36px controls,
+            // so the last line of text stays level at every height the box grows to.
+            className="block min-h-9 max-h-40 w-full resize-none bg-transparent px-2.5 py-1.5 text-sm leading-6 outline-none placeholder:text-neutral-400 disabled:opacity-50"
           />
           {/* Nothing said yet: a pulsing hint in place of the placeholder, so the
               student can tell the mic is live and simply hasn't heard them. */}
           {listening && !shown && (
-            <span className="pointer-events-none absolute left-2.5 top-2 flex items-center gap-1.5 py-0 text-sm leading-6 text-rose-500">
+            <span className="pointer-events-none absolute left-2.5 top-1.5 flex items-center gap-1.5 py-0 text-sm leading-6 text-rose-500">
               <span className="relative flex h-1.5 w-1.5">
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75" />
                 <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-rose-500" />

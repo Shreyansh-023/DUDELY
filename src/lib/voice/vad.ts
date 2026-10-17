@@ -114,6 +114,14 @@ export class MicVad {
     this.finish("cancelled");
   }
 
+  /**
+   * The student pressed stop: close the utterance now rather than waiting out
+   * the trailing silence, and transcribe what was recorded. Idempotent.
+   */
+  end(): void {
+    this.finish("speech-ended");
+  }
+
   private finish(outcome: VadOutcome): void {
     const settle = this.settle;
     if (!settle) return;
