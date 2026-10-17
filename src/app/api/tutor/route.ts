@@ -1,6 +1,13 @@
 import { streamText, type ModelMessage } from "ai";
 import { textbookKey, type Grade, type SubjectId } from "@/lib/curriculum";
-import { detectProvider, getDoubtModel, getLessonModel, getModel } from "@/lib/llm";
+import {
+  detectProvider,
+  getDoubtModel,
+  getLessonFallbacks,
+  getLessonModel,
+  getModel,
+  isOverloadedError,
+} from "@/lib/llm";
 import { mockLesson } from "@/lib/mock-lesson";
 import {
   buildDoubtSystemPrompt,
@@ -97,6 +104,12 @@ export async function POST(req: Request) {
     return { role: "user", content: i === last ? buildUserTurn({ text: m.text, canvas }) : m.text };
   });
 
+  // Plan/teach/explain: if NVIDIA is overloaded, try Groq / Google / default next.
+  const modelChain =
+    mode === "plan" || mode === "teach" || mode === "explain"
+      ? [model, ...getLessonFallbacks(model.label)]
+      : [model];
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -110,9 +123,22 @@ export async function POST(req: Request) {
       });
       try {
         if (mode === "plan") {
-          await streamPlan({ model: model.model, system, messages: modelMessages, signal: req.signal, send, fallbackTopic: messages[last]?.text ?? "" });
+          await streamPlan({
+            models: modelChain,
+            system,
+            messages: modelMessages,
+            signal: req.signal,
+            send,
+            fallbackTopic: messages[last]?.text ?? "",
+          });
         } else {
-          await streamBeats({ model: model.model, system, messages: modelMessages, signal: req.signal, send });
+          await streamBeats({
+            models: modelChain,
+            system,
+            messages: modelMessages,
+            signal: req.signal,
+            send,
+          });
         }
       } finally {
         controller.close();
@@ -129,8 +155,10 @@ export async function POST(req: Request) {
   });
 }
 
+type ModelPick = { model: Parameters<typeof streamText>[0]["model"]; label: string };
+
 type StreamArgs = {
-  model: Parameters<typeof streamText>[0]["model"];
+  models: ModelPick[];
   system: string;
   messages: ModelMessage[];
   signal: AbortSignal;
@@ -141,106 +169,133 @@ type StreamArgs = {
  * Teach/doubt/ask: the model emits beats as NDJSON. We extract each complete
  * top-level JSON object from the text stream (tolerant of arrays, commas, code
  * fences and pretty-printing) and validate it ourselves — no provider-side
- * structured output, which has been unreliable across Gemini/Groq/NVIDIA. One
- * silent retry is safe as long as nothing has reached the client yet.
+ * structured output, which has been unreliable across Gemini/Groq/NVIDIA.
+ * Retries once on empty output; on overload, walks the model fallback chain.
  */
-async function streamBeats({ model, system, messages, signal, send }: StreamArgs) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let errMsg: string | null = null; // buffered so a dead first attempt can retry silently
-    let beatCount = 0;
-    let raw = "";
-    try {
-      const result = streamText({
-        model,
-        system,
-        messages,
-        temperature: 0.6,
-        maxOutputTokens: 3000,
-        abortSignal: signal,
-        onError: ({ error }) => {
-          errMsg ??= errorMessage(error);
-        },
-      });
-      const scanner = new BeatScanner((beat) => {
-        beatCount++;
-        send({ type: "beat", beat });
-      });
-      for await (const delta of result.textStream) {
-        if (signal.aborted) break;
-        raw += delta;
-        scanner.push(delta);
+async function streamBeats({ models, system, messages, signal, send }: StreamArgs) {
+  let lastErr: string | null = null;
+  for (let mi = 0; mi < models.length; mi++) {
+    const { model, label } = models[mi];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let errMsg: string | null = null;
+      let beatCount = 0;
+      let raw = "";
+      try {
+        const result = streamText({
+          model,
+          system,
+          messages,
+          temperature: 0.6,
+          maxOutputTokens: 3000,
+          maxRetries: 1,
+          abortSignal: signal,
+          onError: ({ error }) => {
+            errMsg ??= errorMessage(error);
+          },
+        });
+        const scanner = new BeatScanner((beat) => {
+          beatCount++;
+          send({ type: "beat", beat });
+        });
+        for await (const delta of result.textStream) {
+          if (signal.aborted) break;
+          raw += delta;
+          scanner.push(delta);
+        }
+      } catch (err) {
+        errMsg ??= errorMessage(err);
       }
-    } catch (err) {
-      errMsg ??= errorMessage(err);
-    }
 
-    if (signal.aborted) return;
-    if (beatCount > 0) {
-      if (errMsg) send({ type: "error", message: errMsg });
-      else send({ type: "done" });
-      return;
+      if (signal.aborted) return;
+      if (beatCount > 0) {
+        if (errMsg) send({ type: "error", message: errMsg });
+        else send({ type: "done" });
+        return;
+      }
+      lastErr = errMsg;
+      if (attempt === 0 && !isOverloadedError(errMsg)) {
+        console.warn(
+          `[tutor] no valid beats on ${label} (${errMsg ?? "no provider error"}), retrying once. raw:\n` +
+            raw.slice(0, 3000),
+        );
+        continue;
+      }
+      break; // try next model (especially on overload)
     }
-    if (attempt === 0) {
-      console.warn(
-        `[tutor] no valid beats (${errMsg ?? "no provider error"}), retrying once. raw output follows:\n` +
-          raw.slice(0, 3000),
-      );
-      continue;
+    if (mi + 1 < models.length && isOverloadedError(lastErr)) {
+      console.warn(`[tutor] ${label} overloaded; falling back to ${models[mi + 1].label}`);
+      send({ type: "meta", model: models[mi + 1].label });
+    } else if (mi + 1 < models.length && lastErr) {
+      console.warn(`[tutor] ${label} failed (${lastErr}); trying ${models[mi + 1].label}`);
+      send({ type: "meta", model: models[mi + 1].label });
     }
-    send({ type: "error", message: errMsg ?? "The tutor did not produce a valid response. Please try again." });
   }
+  send({ type: "error", message: lastErr ?? "The tutor did not produce a valid response. Please try again." });
 }
 
 /**
  * Plan mode: collect the planner's full output, pull the lesson-plan JSON object
- * out of it (Ultra is a reasoning model, so there may be prose around the JSON),
- * validate it and emit one `plan` event. One silent retry on a bad/empty plan.
+ * out of it (reasoning models may wrap JSON in prose), validate it and emit one
+ * `plan` event. Retries once; on overload walks the fallback model chain.
  */
 async function streamPlan({
-  model,
+  models,
   system,
   messages,
   signal,
   send,
   fallbackTopic,
 }: StreamArgs & { fallbackTopic: string }) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let errMsg: string | null = null;
-    let raw = "";
-    try {
-      const result = streamText({
-        model,
-        system,
-        messages,
-        temperature: 0.4,
-        maxOutputTokens: 4000,
-        abortSignal: signal,
-        onError: ({ error }) => {
-          errMsg ??= errorMessage(error);
-        },
-      });
-      for await (const delta of result.textStream) {
-        if (signal.aborted) return;
-        raw += delta;
+  let lastErr: string | null = null;
+  for (let mi = 0; mi < models.length; mi++) {
+    const { model, label } = models[mi];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let errMsg: string | null = null;
+      let raw = "";
+      try {
+        const result = streamText({
+          model,
+          system,
+          messages,
+          temperature: 0.4,
+          maxOutputTokens: 4000,
+          maxRetries: 1,
+          abortSignal: signal,
+          onError: ({ error }) => {
+            errMsg ??= errorMessage(error);
+          },
+        });
+        for await (const delta of result.textStream) {
+          if (signal.aborted) return;
+          raw += delta;
+        }
+      } catch (err) {
+        errMsg ??= errorMessage(err);
       }
-    } catch (err) {
-      errMsg ??= errorMessage(err);
-    }
-    if (signal.aborted) return;
+      if (signal.aborted) return;
 
-    const plan = extractPlan(raw);
-    if (plan && plan.steps.length > 0) {
-      if (!plan.topic) plan.topic = fallbackTopic.slice(0, 120);
-      send({ type: "plan", plan });
-      send({ type: "done" });
-      return;
+      const plan = extractPlan(raw);
+      if (plan && plan.steps.length > 0) {
+        if (!plan.topic) plan.topic = fallbackTopic.slice(0, 120);
+        send({ type: "plan", plan });
+        send({ type: "done" });
+        return;
+      }
+      lastErr = errMsg;
+      if (attempt === 0 && !isOverloadedError(errMsg)) {
+        console.warn(`[tutor] no valid plan on ${label} (${errMsg ?? "no provider error"}), retrying once. raw:\n` + raw.slice(0, 2000));
+        continue;
+      }
+      break;
     }
-    if (attempt === 0) {
-      console.warn(`[tutor] no valid plan (${errMsg ?? "no provider error"}), retrying once. raw:\n` + raw.slice(0, 2000));
-      continue;
+    if (mi + 1 < models.length) {
+      console.warn(
+        `[tutor] plan via ${label} failed (${lastErr ?? "empty"}); trying ${models[mi + 1].label}`,
+      );
+      send({ type: "meta", model: models[mi + 1].label });
     }
-    send({ type: "error", message: errMsg ?? "Could not design the lesson. Please try again." });
   }
+  send({ type: "error", message: lastErr ?? "Could not design the lesson. Please try again." });
 }
 
 /**

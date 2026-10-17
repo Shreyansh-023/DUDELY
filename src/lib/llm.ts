@@ -29,13 +29,17 @@ const NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
 
 /**
  * Per-role models for the staged lesson flow (see schema `TutorMode`):
- *   - PLANNER/TEACHER: Nemotron Ultra 550B on NVIDIA. It designs the lesson once
- *     (slow is fine) and teaches each step. Override with LESSON_MODEL.
+ *   - PLANNER/TEACHER: NVIDIA lesson model. Prefer LESSON_MODEL, else the user's
+ *     LLM_MODEL when on NVIDIA, else Nemotron Super (Ultra is often capacity-
+ *     constrained / "Service temporarily overloaded").
  *   - DOUBT: Groq gpt-oss-120b — fastest + most consistent in our benchmarks — so
  *     a student's interruption is answered quickly. Override with DOUBT_MODEL.
  * Each falls back to the default provider/model when its preferred key is missing.
  */
-const LESSON_MODEL = process.env.LESSON_MODEL || "nvidia/nemotron-3-ultra-550b-a55b";
+const LESSON_MODEL =
+  process.env.LESSON_MODEL ||
+  process.env.LLM_MODEL ||
+  "nvidia/nemotron-3-super-120b-a12b";
 const DOUBT_MODEL = process.env.DOUBT_MODEL || "openai/gpt-oss-120b";
 
 export function detectProvider(): Provider | null {
@@ -100,19 +104,19 @@ export function getModel(): { model: LanguageModel; label: string } {
 }
 
 /**
- * The planner/teacher model: Nemotron Ultra on NVIDIA. Falls back to the default
- * model when there is no NVIDIA key, so the staged flow still runs on whatever is
- * configured. `mode` only labels the returned model for the meta event.
+ * The planner/teacher model on NVIDIA. Falls back to the default model when
+ * there is no NVIDIA key. `mode` only labels the returned model for the meta event.
  */
 export function getLessonModel(): { model: LanguageModel; label: string } {
   if (process.env.NVIDIA_API_KEY) {
+    const id = LESSON_MODEL.replace(/^nvidia\//, "");
     return {
       model: createOpenAI({
         baseURL: NVIDIA_BASE_URL,
         apiKey: process.env.NVIDIA_API_KEY,
         name: "nvidia",
-      }).chat(LESSON_MODEL),
-      label: `nvidia/${LESSON_MODEL}`.replace("nvidia/nvidia/", "nvidia/"),
+      }).chat(id),
+      label: `nvidia/${id}`,
     };
   }
   return getModel();
@@ -127,6 +131,57 @@ export function getDoubtModel(): { model: LanguageModel; label: string } {
     return { model: createGroq({ apiKey: process.env.GROQ_API_KEY })(DOUBT_MODEL), label: `groq/${DOUBT_MODEL}` };
   }
   return getModel();
+}
+
+/** True when the provider is at capacity / rate-limited — worth trying another model. */
+export function isOverloadedError(msg: string | null | undefined): boolean {
+  if (!msg) return false;
+  const m = msg.toLowerCase();
+  return (
+    m.includes("overloaded") ||
+    m.includes("capacity") ||
+    m.includes("too many requests") ||
+    m.includes("rate limit") ||
+    m.includes("529") ||
+    m.includes("503")
+  );
+}
+
+/**
+ * Alternate models to try when the primary lesson/plan model is overloaded.
+ * Prefers Groq (fast, you already use it for doubts), then Google, then the
+ * generic default — skipping anything already tried.
+ */
+export function getLessonFallbacks(primaryLabel: string): { model: LanguageModel; label: string }[] {
+  const out: { model: LanguageModel; label: string }[] = [];
+  const seen = new Set([primaryLabel]);
+  const push = (m: { model: LanguageModel; label: string }) => {
+    if (seen.has(m.label)) return;
+    seen.add(m.label);
+    out.push(m);
+  };
+  try {
+    if (process.env.GROQ_API_KEY) push(getDoubtModel());
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
+      const id = process.env.GOOGLE_LESSON_MODEL || "gemini-3.5-flash";
+      push({
+        model: createGoogle({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY })(id),
+        label: `google/${id}`,
+      });
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    push(getModel());
+  } catch {
+    /* ignore */
+  }
+  return out;
 }
 
 /** Which speech services are configured. Read by the browser via /api/config. */

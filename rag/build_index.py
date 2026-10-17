@@ -15,6 +15,7 @@ Layout (see rag/common.py):
 
     python rag/build_index.py --book ncert-class-10-maths --edition english
     python rag/build_index.py --book ncert-class-10-maths --edition english hindi
+    python rag/build_index.py --grades 1 2 3 4 5 6 7 8 9 --edition english
 
 Needs NVIDIA_API_KEY in the environment or in .env at the repo root.
 vectors.f32 is little-endian float32, row-major [count x dim], L2-normalized; the app
@@ -44,7 +45,68 @@ TARGET_CHARS = 1100
 HARD_CHARS = 1600
 
 # Chapter titles per book (for nice passage labels). Unknown books fall back to "Chapter N".
+# Classes 1–9 use current NCF English editions (Joyful / Maths Mela / Ganita Prakash / Ganita Manjari).
 TITLES = {
+    "ncert-class-1-maths": {
+        1: "Finding the Furry Cat!", 2: "What is Long? What is Round?", 3: "Mango Treat",
+        4: "Making 10", 5: "How Many?", 6: "Vegetable Farm", 7: "Lina's Family",
+        8: "Fun with Numbers", 9: "Utsav", 10: "How do I Spend my Day?",
+        11: "How Many Times?", 12: "How Much Can We Spend?", 13: "So Many Toys",
+    },
+    "ncert-class-2-maths": {
+        1: "A Day at the Beach", 2: "Shapes Around Us", 3: "Fun with Numbers",
+        4: "Shadow Story (Togalu)", 5: "Playing with Lines", 6: "Decorations for Festival",
+        7: "Rani's Gift", 8: "Grouping and Sharing", 9: "Which Season is it?",
+        10: "Fun at the Fair", 11: "Data Handling",
+    },
+    "ncert-class-3-maths": {
+        1: "What's in a Name?", 2: "Toy Joy", 3: "Double Century",
+        4: "Vacation with My Nani Maa", 5: "Fun with Shapes", 6: "House of Hundreds–I",
+        7: "Raksha Bandhan", 8: "Fair Share", 9: "House of Hundreds–II",
+        10: "Fun at Class Party!", 11: "Filling and Lifting", 12: "Give and Take",
+        13: "Time Goes On", 14: "The Surajkund Fair",
+    },
+    "ncert-class-4-maths": {
+        1: "Shapes Around Us", 2: "Hide and Seek", 3: "Pattern Around Us",
+        4: "Thousands Around Us", 5: "Sharing and Measuring", 6: "Measuring Length",
+        7: "The Cleanest Village", 8: "Weigh it, Pour it", 9: "Equal Groups",
+        10: "Elephants, Tigers, and Leopards", 11: "Fun with Symmetry",
+        12: "Ticking Clocks and Turning Calendar", 13: "The Transport Museum", 14: "Data Handling",
+    },
+    "ncert-class-5-maths": {
+        1: "We the Travellers—I", 2: "Fractions", 3: "Angles as Turns",
+        4: "We the Travellers—II", 5: "Far and Near", 6: "The Dairy Farm",
+        7: "Shapes and Patterns", 8: "Weight and Capacity", 9: "Coconut Farm",
+        10: "Symmetrical Designs", 11: "Grandmother's Quilt", 12: "Racing Seconds",
+        13: "Animal Jumps", 14: "Maps and Locations", 15: "Data Through Pictures",
+    },
+    "ncert-class-6-maths": {
+        1: "Patterns in Mathematics", 2: "Lines and Angles", 3: "Number Play",
+        4: "Data Handling and Presentation", 5: "Prime Time", 6: "Perimeter and Area",
+        7: "Fractions", 8: "Playing with Constructions", 9: "Symmetry",
+        10: "The Other Side of Zero",
+    },
+    "ncert-class-7-maths": {
+        1: "Large Numbers Around Us", 2: "Arithmetic Expressions",
+        3: "A Peek Beyond the Point", 4: "Expressions using Letter-Numbers",
+        5: "Parallel and Intersecting Lines", 6: "Number Play",
+        7: "A Tale of Three Intersecting Lines", 8: "Working with Fractions",
+    },
+    "ncert-class-8-maths": {
+        1: "A Square and A Cube", 2: "Power Play", 3: "A Story of Numbers",
+        4: "Quadrilaterals", 5: "Number Play", 6: "We Distribute, Yet Things Multiply",
+        7: "Proportional Reasoning-1",
+    },
+    "ncert-class-9-maths": {
+        1: "Orienting Yourself: The Use of Coordinates",
+        2: "Introduction to Linear Polynomials",
+        3: "The World of Numbers",
+        4: "Exploring Algebraic Identities",
+        5: "I'm Up and Down, and Round and Round",
+        6: "Measuring Space: Perimeter and Area",
+        7: "The Mathematics of Maybe: Introduction to Probability",
+        8: "Predicting What Comes Next: Exploring Sequences and Progressions",
+    },
     "ncert-class-10-maths": {
         1: "Real Numbers", 2: "Polynomials", 3: "Pair of Linear Equations in Two Variables",
         4: "Quadratic Equations", 5: "Arithmetic Progressions", 6: "Triangles",
@@ -310,44 +372,66 @@ def l2_normalize(v: list[float]) -> list[float]:
     return [x / n for x in v]
 
 
+def resolve_books(args: argparse.Namespace) -> list[str]:
+    books: list[str] = list(args.book or [])
+    if args.grades:
+        books.extend(f"ncert-class-{g}-maths" for g in args.grades)
+    # de-dupe, keep order
+    seen: set[str] = set()
+    out: list[str] = []
+    for b in books:
+        if b not in seen:
+            seen.add(b)
+            out.append(b)
+    if not out:
+        sys.exit("pass --book and/or --grades")
+    return out
+
+
+def build_one(http: httpx.Client, key: str, book: str, edition: str) -> None:
+    print(f"\n{book_title(book)} [{edition}]")
+    chunks, struct = extract(book, edition)
+    if not chunks:
+        print("  no chunks; skipping")
+        return
+    started = time.perf_counter()
+    vecs = embed_passages(http, key, [c["text"] for c in chunks])
+    dim = len(vecs[0])
+    flat = array.array("f")
+    for v in vecs:
+        flat.extend(l2_normalize(v))
+
+    out_dir = INDEX / book / edition
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "vectors.f32").write_bytes(flat.tobytes())
+    (out_dir / "structure.json").write_text(json.dumps(struct, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "meta.json").write_text(
+        json.dumps({"book": book, "edition": edition, "embedModel": EMBED_MODEL,
+                    "dim": dim, "count": len(chunks)}),
+        encoding="utf-8",
+    )
+    n_ex = sum(len(v) for v in struct["examples"].values())
+    n_sec = sum(len(v) for v in struct["sections"].values())
+    mins = (time.perf_counter() - started) / 60
+    print(f"  wrote {len(chunks)} chunks x {dim}d + structure "
+          f"({n_ex} examples, {len(struct['theorems'])} theorems, {len(struct['exercises'])} exercises, "
+          f"{n_sec} sections) to {out_dir} in {mins:.1f} min")
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--book", required=True, help='textbook key, e.g. "ncert-class-10-maths"')
+    p.add_argument("--book", action="append", default=[], help='textbook key, e.g. "ncert-class-10-maths" (repeatable)')
+    p.add_argument("--grades", nargs="+", type=int, help="shorthand: build ncert-class-N-maths for each N")
     p.add_argument("--edition", nargs="+", required=True, help="edition folder(s), e.g. english hindi")
     args = p.parse_args()
 
     key = api_key()
     http = httpx.Client(timeout=120)
-    for edition in args.edition:
-        print(f"\n{book_title(args.book)} [{edition}]")
-        chunks, struct = extract(args.book, edition)
-        if not chunks:
-            print("  no chunks; skipping")
-            continue
-        started = time.perf_counter()
-        vecs = embed_passages(http, key, [c["text"] for c in chunks])
-        dim = len(vecs[0])
-        flat = array.array("f")
-        for v in vecs:
-            flat.extend(l2_normalize(v))
-
-        out_dir = INDEX / args.book / edition
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
-        (out_dir / "vectors.f32").write_bytes(flat.tobytes())
-        (out_dir / "structure.json").write_text(json.dumps(struct, ensure_ascii=False), encoding="utf-8")
-        (out_dir / "meta.json").write_text(
-            json.dumps({"book": args.book, "edition": edition, "embedModel": EMBED_MODEL,
-                        "dim": dim, "count": len(chunks)}),
-            encoding="utf-8",
-        )
-        n_ex = sum(len(v) for v in struct["examples"].values())
-        n_sec = sum(len(v) for v in struct["sections"].values())
-        mins = (time.perf_counter() - started) / 60
-        print(f"  wrote {len(chunks)} chunks x {dim}d + structure "
-              f"({n_ex} examples, {len(struct['theorems'])} theorems, {len(struct['exercises'])} exercises, "
-              f"{n_sec} sections) to {out_dir} in {mins:.1f} min")
+    for book in resolve_books(args):
+        for edition in args.edition:
+            build_one(http, key, book, edition)
 
 
 if __name__ == "__main__":
