@@ -135,10 +135,11 @@ def printed_offset(doc: "pymupdf.Document") -> int:
 # Example / Theorem / Exercise headings. These are the units a student references by
 # position ("example 2", "theorem 1.2", "exercise 1.1 q3") — semantic search can't find
 # a position, so we index them for deterministic lookup (see src/lib/rag.ts).
-_MAJOR = re.compile(r"(Example\s+\d+\s*:|Theorem\s+\d+\.\d+\s*:|EXERCISE\s+\d+\.\d+)")
+# Appendix PDFs use EXERCISE A1.1 etc.; chapter PDFs use EXERCISE 1.1.
+_MAJOR = re.compile(r"(Example\s+\d+\s*:|Theorem\s+\d+\.\d+\s*:|EXERCISE\s+A?\d+\.\d+)")
 _EX_NUM = re.compile(r"Example\s+(\d+)")
 _TH_REF = re.compile(r"Theorem\s+(\d+\.\d+)")
-_EXR_REF = re.compile(r"EXERCISE\s+(\d+\.\d+)")
+_EXR_REF = re.compile(r"EXERCISE\s+(A?\d+\.\d+)")
 _QNUM = re.compile(r"(?m)^\s*(\d{1,2})\.\s")
 MAX_UNIT_CHARS = 1800
 MAX_Q_CHARS = 700
@@ -184,7 +185,12 @@ def add_sections(struct: dict, ch: int | None, full: str, page_at) -> None:
 
 
 def add_structure(struct: dict, ch: int | None, full: str, page_at) -> None:
-    """Find Example/Theorem/Exercise units in one chapter's full text and record them."""
+    """Find Example/Theorem/Exercise units in one chapter's full text and record them.
+
+    Appendix / answers PDFs (jemh1a1, jemh1an, …) have no chapter number in the
+    filename (`ch is None`). Examples still match _MAJOR there — do not fall through
+    to the Exercise branch just because ch is missing.
+    """
     marks = list(_MAJOR.finditer(full))
     for i, m in enumerate(marks):
         start = m.start()
@@ -192,17 +198,30 @@ def add_structure(struct: dict, ch: int | None, full: str, page_at) -> None:
         seg = full[start:end]
         pdf_page, printed = page_at(start)
         head = m.group(0)
-        if head.startswith("Example") and ch is not None:
-            num = _EX_NUM.match(head).group(1)
+        if head.startswith("Example"):
+            # Examples are keyed by chapter; skip structural index when chapter is unknown
+            # (appendix). Semantic chunks from the same PDF still cover that content.
+            if ch is None:
+                continue
+            num_m = _EX_NUM.match(head)
+            if not num_m:
+                continue
+            num = num_m.group(1)
             slot = struct["examples"].setdefault(str(ch), {})
             if num not in slot or len(seg) > len(slot[num]["text"]):
                 slot[num] = {"text": cap(seg, MAX_UNIT_CHARS), "pdfPage": pdf_page, "printedPage": printed}
         elif head.startswith("Theorem"):
-            ref = _TH_REF.match(head).group(1)
+            th_m = _TH_REF.match(head)
+            if not th_m:
+                continue
+            ref = th_m.group(1)
             if ref not in struct["theorems"] or len(seg) > len(struct["theorems"][ref]["text"]):
                 struct["theorems"][ref] = {"text": cap(seg, MAX_UNIT_CHARS), "pdfPage": pdf_page, "printedPage": printed}
-        else:  # EXERCISE
-            ref = _EXR_REF.match(head).group(1)
+        elif head.startswith("EXERCISE"):
+            ex_m = _EXR_REF.match(head)
+            if not ex_m:
+                continue
+            ref = ex_m.group(1)
             questions: dict[str, dict] = {}
             qmarks = list(_QNUM.finditer(seg))
             for j, q in enumerate(qmarks):
