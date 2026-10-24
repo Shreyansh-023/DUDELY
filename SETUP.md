@@ -73,7 +73,12 @@ SARVAM_API_KEY=...                # Saaras v4 STT + Bulbul TTS; without it → b
 # SARVAM_STT_MODEL=saaras:v4
 # SARVAM_TTS_MODEL=...
 # SARVAM_TTS_SPEAKER=...
-# SARVAM_TTS_PACE=1.0
+# TTS_PACE=0.9                    # 0.5..1.5, how fast Indica speaks; paces Sarvam AND
+#                                 # browser speech. Below 1 on purpose: a student needs
+#                                 # time to look at what was just drawn, and the slower
+#                                 # delivery is what lets the next lesson step finish
+#                                 # generating before the current one stops speaking.
+# SARVAM_TTS_PACE=0.9             # legacy name for the same thing; TTS_PACE wins
 # SARVAM_TTS_PITCH=0.0
 # SARVAM_TTS_LOUDNESS=1.0
 

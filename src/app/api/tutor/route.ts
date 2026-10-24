@@ -2,10 +2,8 @@ import { streamText, type ModelMessage } from "ai";
 import { textbookKey, type Grade, type SubjectId } from "@/lib/curriculum";
 import {
   detectProvider,
-  getDoubtModel,
-  getLessonFallbacks,
-  getLessonModel,
-  getModel,
+  fitDoubtContext,
+  getModelChain,
   isOverloadedError,
 } from "@/lib/llm";
 import { mockLesson } from "@/lib/mock-lesson";
@@ -21,9 +19,11 @@ import { retrieveTextbookContext, type Passage } from "@/lib/rag";
 import {
   BeatSchema,
   LessonPlanSchema,
+  LessonStepSchema,
   TutorRequestSchema,
   type HistoryMessage,
   type LessonPlan,
+  type LessonStep,
   type TutorEvent,
 } from "@/lib/schema";
 
@@ -54,20 +54,18 @@ export async function POST(req: Request) {
   // Mock only covers the legacy single-turn flow; the staged flow needs real models.
   if (detectProvider() === "mock" && mode === "ask") return mockResponse(messages, language);
 
-  // Pick the model for this stage: Ultra plans, teaches and works named textbook
-  // items (explain); Groq answers conceptual doubts; the configured default handles
-  // the legacy "ask" flow.
-  let model: ReturnType<typeof getModel>;
+  // Pick the model chain for this stage. getModelChain owns the per-mode
+  // policy — biggest Nemotron first for plan (thinking ON), Super 120 first for
+  // teach/explain/doubt (thinking OFF), with Lightning 30B and other NVIDIA
+  // models as fallbacks, then Groq/Google as off-provider rescue.
+  let modelChain: ReturnType<typeof getModelChain>;
   try {
-    model =
-      mode === "doubt"
-        ? getDoubtModel()
-        : mode === "plan" || mode === "teach" || mode === "explain"
-          ? getLessonModel()
-          : getModel();
+    modelChain = getModelChain(mode);
+    if (modelChain.length === 0) throw new Error("No models configured. Set NVIDIA_API_KEY (recommended) or GROQ_/GOOGLE_/OPENAI_/ANTHROPIC_API_KEY in .env.local");
   } catch (err) {
     return Response.json({ error: (err as Error).message }, { status: 500 });
   }
+  const primary = modelChain[0];
 
   // The chosen class + subject name one NCERT textbook; passages from it ground the
   // turn (rag/ builds the index, lib/rag searches it with Nemotron embeddings + BM25).
@@ -78,7 +76,7 @@ export async function POST(req: Request) {
   let passages: Passage[] = [];
   if (book) {
     try {
-      ({ edition, passages } = await retrieveTextbookContext(book, messages));
+      ({ edition, passages } = await retrieveTextbookContext(book, messages, { mode }));
     } catch (err) {
       console.warn(`[tutor] textbook retrieval failed for ${book}: ${errorMessage(err)}`);
     }
@@ -87,7 +85,7 @@ export async function POST(req: Request) {
   // System prompt per stage. Teaching and doubt reuse the shared board-rules prompt
   // (plus their framing); planning uses its own designer prompt.
   const promptCtx = { language, profile, grade, subject, textbook: passages };
-  const system =
+  const systemPrompt =
     mode === "plan"
       ? buildPlanPrompt({ ...promptCtx, familiarity: familiarity ?? null })
       : mode === "teach"
@@ -99,16 +97,35 @@ export async function POST(req: Request) {
             : buildSystemPrompt(promptCtx);
 
   const last = messages.length - 1;
-  const modelMessages: ModelMessage[] = messages.map((m, i) => {
+  // With thinking off, a model can forget the NDJSON contract — and how much to
+  // say — by the time it reaches the end of a long system prompt, so repeat both
+  // on the final turn, where they are the last thing it reads. Teaching needs the
+  // length reminder most: left to itself a no-thinking teacher will answer a
+  // whole lesson step in one short sentence.
+  const formatNudge =
+    mode === "doubt"
+      ? "\n\n---\nReply with NDJSON beats only: 1-4 lines, each a complete JSON object. No prose."
+      : mode === "teach" || mode === "explain"
+        ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 3-6 beats, and draw on the board — one short sentence is not a step."
+        : "";
+  const rawMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
-    return { role: "user", content: i === last ? buildUserTurn({ text: m.text, canvas }) : m.text };
+    return { role: "user", content: i === last ? buildUserTurn({ text: m.text, canvas }) + formatNudge : m.text };
   });
 
-  // Plan/teach/explain: if NVIDIA is overloaded, try Groq / Google / default next.
-  const modelChain =
-    mode === "plan" || mode === "teach" || mode === "explain"
-      ? [model, ...getLessonFallbacks(model.label)]
-      : [model];
+  // Doubt mode talks to a 1M-token window, and a doubt turn is normally a few
+  // thousand tokens — but guard the request anyway so a long lesson history or an
+  // unusually large retrieval can never push it over the model's limit.
+  let system = systemPrompt;
+  let modelMessages = rawMessages;
+  if (mode === "doubt") {
+    const fitted = fitDoubtContext(system, modelMessages);
+    if (fitted.trimmed > 0) {
+      console.warn(`[tutor] doubt context over budget; dropped ${fitted.trimmed} oldest message(s)`);
+    }
+    system = fitted.system;
+    modelMessages = fitted.messages;
+  }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -116,7 +133,7 @@ export async function POST(req: Request) {
       const send = (ev: TutorEvent) => controller.enqueue(encoder.encode(JSON.stringify(ev) + "\n"));
       send({
         type: "meta",
-        model: model.label,
+        model: primary.label,
         ...(passages.length > 0
           ? { sources: passages.map((p) => `${book} ${edition}: ${p.label} (pdf p.${p.pages.join("-")})`) }
           : {}),
@@ -138,6 +155,12 @@ export async function POST(req: Request) {
             messages: modelMessages,
             signal: req.signal,
             send,
+            // The doubt model is a small MoE; low temperature keeps it on the
+            // strict NDJSON beat format instead of drifting into prose.
+            temperature: mode === "doubt" ? 0.2 : 0.6,
+            // A doubt is a spoken side-note, so prose with no drawing is still a
+            // usable answer — speak it rather than failing the student's question.
+            salvageProse: mode === "doubt",
           });
         }
       } finally {
@@ -163,16 +186,46 @@ type StreamArgs = {
   messages: ModelMessage[];
   signal: AbortSignal;
   send: (ev: TutorEvent) => void;
+  temperature?: number;
+  salvageProse?: boolean;
 };
+
+/**
+ * How long to wait for a model's FIRST beat before giving up on it and trying
+ * the next one in the chain. Beats stream, so this is deliberately a
+ * time-to-first-beat limit and not a total one: a model that is slow but
+ * actually producing is left alone.
+ *
+ * It exists because of what a wedged provider does to a lesson. Every beat of a
+ * taught step is spoken, so a request that never answers is silence the student
+ * sits in — the lesson simply stops, with nothing on screen to say why. A
+ * provider having a bad minute (an Internal Server Error, then a socket that
+ * never replies) has been seen doing exactly that.
+ *
+ * 15s is roughly four times normal — a step with thinking off answers in three
+ * to five — which tolerates an occasional slow cold start while still leaving
+ * the next model in the chain time to answer inside the 25-40s of speech the
+ * current step is buying us.
+ */
+const FIRST_BEAT_TIMEOUT_MS = 15_000;
 
 /**
  * Teach/doubt/ask: the model emits beats as NDJSON. We extract each complete
  * top-level JSON object from the text stream (tolerant of arrays, commas, code
  * fences and pretty-printing) and validate it ourselves — no provider-side
  * structured output, which has been unreliable across Gemini/Groq/NVIDIA.
- * Retries once on empty output; on overload, walks the model fallback chain.
+ * Retries once on empty output; on overload or a model that never answers at
+ * all, walks the model fallback chain.
  */
-async function streamBeats({ models, system, messages, signal, send }: StreamArgs) {
+async function streamBeats({
+  models,
+  system,
+  messages,
+  signal,
+  send,
+  temperature = 0.6,
+  salvageProse = false,
+}: StreamArgs) {
   let lastErr: string | null = null;
   for (let mi = 0; mi < models.length; mi++) {
     const { model, label } = models[mi];
@@ -180,21 +233,27 @@ async function streamBeats({ models, system, messages, signal, send }: StreamArg
       let errMsg: string | null = null;
       let beatCount = 0;
       let raw = "";
+      // Separate from `signal` on purpose: `signal` aborting means the student
+      // walked away and we must go quiet, while this firing means the model let
+      // us down and we should try another one.
+      const watchdog = new AbortController();
+      const timer = setTimeout(() => watchdog.abort(), FIRST_BEAT_TIMEOUT_MS);
       try {
         const result = streamText({
           model,
           system,
           messages,
-          temperature: 0.6,
+          temperature,
           maxOutputTokens: 3000,
           maxRetries: 1,
-          abortSignal: signal,
+          abortSignal: AbortSignal.any([signal, watchdog.signal]),
           onError: ({ error }) => {
             errMsg ??= errorMessage(error);
           },
         });
         const scanner = new BeatScanner((beat) => {
           beatCount++;
+          clearTimeout(timer); // it is answering; let it finish at its own pace
           send({ type: "beat", beat });
         });
         for await (const delta of result.textStream) {
@@ -204,9 +263,17 @@ async function streamBeats({ models, system, messages, signal, send }: StreamArg
         }
       } catch (err) {
         errMsg ??= errorMessage(err);
+      } finally {
+        clearTimeout(timer);
       }
 
       if (signal.aborted) return;
+      if (watchdog.signal.aborted && beatCount === 0) {
+        errMsg = `No response from ${label} within ${FIRST_BEAT_TIMEOUT_MS / 1000}s`;
+        console.warn(`[tutor] ${errMsg}; abandoning it`);
+        lastErr = errMsg;
+        break; // don't retry a model that is not answering — move to the next
+      }
       if (beatCount > 0) {
         if (errMsg) send({ type: "error", message: errMsg });
         else send({ type: "done" });
@@ -220,6 +287,15 @@ async function streamBeats({ models, system, messages, signal, send }: StreamArg
         );
         continue;
       }
+      // Last attempt on this model: if it answered in plain prose instead of
+      // beats, say that out loud rather than dropping the answer.
+      const prose = salvageProse ? asProse(raw) : null;
+      if (prose) {
+        console.warn(`[tutor] ${label} answered in prose; salvaging it as one spoken beat`);
+        send({ type: "beat", beat: BeatSchema.parse({ say: prose, draw: [] }) });
+        send({ type: "done" });
+        return;
+      }
       break; // try next model (especially on overload)
     }
     if (mi + 1 < models.length && isOverloadedError(lastErr)) {
@@ -231,6 +307,22 @@ async function streamBeats({ models, system, messages, signal, send }: StreamArg
     }
   }
   send({ type: "error", message: lastErr ?? "The tutor did not produce a valid response. Please try again." });
+}
+
+/**
+ * A model reply that is prose rather than beats, cleaned up for TTS: fences,
+ * stray JSON fragments and markdown stripped. Null when there is nothing
+ * speakable, so the caller falls through to its normal error path.
+ */
+function asProse(raw: string): string | null {
+  const text = raw
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/\{[\s\S]*$/, " ") // a truncated or invalid JSON tail
+    .replace(/^\s*-{3,}\s*$/gm, " ")
+    .replace(/[*_#`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length >= 20 ? text.slice(0, 600) : null;
 }
 
 /**
@@ -258,16 +350,21 @@ async function streamPlan({
           system,
           messages,
           temperature: 0.4,
-          maxOutputTokens: 4000,
+          // Thinking is ON here and reasoning tokens come out of the same
+          // budget, so leave room for a full 8-step plan after the model has
+          // finished thinking.
+          maxOutputTokens: 6000,
           maxRetries: 1,
           abortSignal: signal,
           onError: ({ error }) => {
             errMsg ??= errorMessage(error);
           },
         });
+        const steps = new StepScanner((step, index) => send({ type: "planstep", index, step }));
         for await (const delta of result.textStream) {
           if (signal.aborted) return;
           raw += delta;
+          steps.push(delta);
         }
       } catch (err) {
         errMsg ??= errorMessage(err);
@@ -416,6 +513,62 @@ class BeatScanner {
     }
     const parsed = BeatSchema.safeParse(value);
     if (parsed.success) this.onBeat(parsed.data);
+  }
+}
+
+/**
+ * Pulls the plan's step objects out of the planner's text stream as each one is
+ * finished writing, so the student's waiting screen fills with the real roadmap
+ * instead of a spinner. Step objects are the ones that close at depth 2 — one
+ * level inside the top-level plan object (brackets don't count, so `"steps":[`
+ * doesn't shift the depth). Emitting early is cosmetic only: `extractPlan` still
+ * has the last word on the plan that gets taught, so a stray object that happens
+ * to validate here costs a row on a loading screen and nothing more.
+ */
+class StepScanner {
+  private buf = "";
+  private depth = 0;
+  private start = -1;
+  private inStr = false;
+  private esc = false;
+  private count = 0;
+
+  constructor(private onStep: (step: LessonStep, index: number) => void) {}
+
+  push(chunk: string) {
+    const base = this.buf.length;
+    this.buf += chunk;
+    for (let i = base; i < this.buf.length; i++) {
+      const c = this.buf[i];
+      if (this.inStr) {
+        if (this.esc) this.esc = false;
+        else if (c === "\\") this.esc = true;
+        else if (c === '"') this.inStr = false;
+        continue;
+      }
+      if (c === '"') this.inStr = true;
+      else if (c === "{") {
+        this.depth++;
+        if (this.depth === 2) this.start = i;
+      } else if (c === "}") {
+        if (this.depth === 2 && this.start >= 0) {
+          this.flush(this.buf.slice(this.start, i + 1));
+          this.start = -1;
+        }
+        this.depth = Math.max(0, this.depth - 1);
+      }
+    }
+  }
+
+  private flush(objText: string) {
+    let value: unknown;
+    try {
+      value = JSON.parse(objText);
+    } catch {
+      return; // not a finished step object
+    }
+    const parsed = LessonStepSchema.safeParse(value);
+    if (parsed.success && parsed.data.title.trim()) this.onStep(parsed.data, this.count++);
   }
 }
 

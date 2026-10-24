@@ -107,6 +107,57 @@ TITLES = {
         7: "The Mathematics of Maybe: Introduction to Probability",
         8: "Predicting What Comes Next: Exploring Sequences and Progressions",
     },
+    # ---- Science. Classes 3-5 are EVS ("Looking Around"), 6-8 "Curiosity", 9-10 "Science".
+    "ncert-class-6-science": {
+        1: "The Wonderful World of Science", 2: "Diversity in the Living World",
+        3: "Mindful Eating: A Path to a Healthy Body", 4: "Exploring Magnets",
+        5: "Measurement of Length and Motion", 6: "Materials Around Us",
+        7: "Temperature and its Measurement", 8: "A Journey through States of Water",
+        9: "Methods of Separation in Everyday Life", 10: "Living Creatures: Exploring their Characteristics",
+        11: "Nature's Treasures", 12: "Beyond Earth",
+    },
+    "ncert-class-7-science": {
+        1: "The Ever-Evolving World of Science", 2: "Exploring Substances: Acidic, Basic and Neutral",
+        3: "Electricity: Circuits and their Components", 4: "The World of Metals and Non-metals",
+        5: "Changes Around Us: Physical and Chemical", 6: "Adolescent Health and Well-being",
+        7: "Heat Transfer in Nature", 8: "Measurement of Time and Motion",
+        9: "Life Processes in Animals", 10: "Life Processes in Plants",
+        11: "Light: Shadows and Reflections", 12: "Earth, Moon and the Sun",
+    },
+    "ncert-class-8-science": {
+        1: "Exploring the Investigative World of Science",
+        2: "The Invisible Living World: Beyond Our Naked Eye",
+        3: "Health: The Ultimate Treasure",
+        4: "Electricity: Magnetic and Heating Effects",
+        5: "Exploring Forces", 6: "Pressure, Winds, Storms, and Cyclones",
+        7: "Particulate Nature of Matter",
+        8: "Nature of Matter: Elements, Compounds, and Mixtures",
+        9: "The Amazing World of Solutes, Solvents, and Solutions",
+        10: "Light: Mirrors and Lenses", 11: "Keeping Time with the Skies",
+        12: "How Nature Works in Harmony",
+        13: "Our Home: Earth, a Unique Life Sustaining Planet",
+    },
+    # Class 9 is the rewritten "Exploration" book (2025), not the old Science textbook.
+    "ncert-class-9-science": {
+        1: "Exploration: Entering the World of Secondary Science",
+        2: "Cell: The Building Block of Life", 3: "Tissues in Action",
+        4: "Describing Motion Around Us", 5: "Exploring Mixtures and their Separation",
+        6: "How Forces Affect Motion", 7: "Work, Energy, and Simple Machines",
+        8: "Journey Inside the Atom", 9: "Atomic Foundations of Matter",
+        10: "Sound Waves: Characteristics and Applications",
+        11: "Reproduction: How Life Continues",
+        12: "Patterns in Life: Diversity and Classification",
+        13: "Earth as a System: Energy, Matter, and Life",
+    },
+    "ncert-class-10-science": {
+        1: "Chemical Reactions and Equations", 2: "Acids, Bases and Salts",
+        3: "Metals and Non-metals", 4: "Carbon and its Compounds",
+        5: "Life Processes", 6: "Control and Coordination",
+        7: "How do Organisms Reproduce?", 8: "Heredity",
+        9: "Light - Reflection and Refraction", 10: "The Human Eye and the Colourful World",
+        11: "Electricity", 12: "Magnetic Effects of Electric Current",
+        13: "Our Environment",
+    },
     "ncert-class-10-maths": {
         1: "Real Numbers", 2: "Polynomials", 3: "Pair of Linear Equations in Two Variables",
         4: "Quadratic Equations", 5: "Arithmetic Progressions", 6: "Triangles",
@@ -182,14 +233,26 @@ def printed_number(page_text: str) -> int | None:
     return None
 
 
-def printed_offset(doc: "pymupdf.Document") -> int:
-    """printed_page - (pdf_page_index + 1), taken as the mode over detectable pages."""
+def printed_offset_votes(doc: "pymupdf.Document") -> tuple[int, int]:
+    """(offset, how many pages agree on it), offset = printed_page - (pdf_index + 1).
+
+    The vote count is what tells a real offset from one or two stray matches on a
+    picture-heavy chapter — see the caller in extract().
+    """
     offsets = []
     for i in range(doc.page_count):
         p = printed_number(clean(doc[i].get_text()))
         if p is not None:
             offsets.append(p - (i + 1))
-    return Counter(offsets).most_common(1)[0][0] if offsets else 0
+    if not offsets:
+        return 0, 0
+    offset, votes = Counter(offsets).most_common(1)[0]
+    return offset, votes
+
+
+def printed_offset(doc: "pymupdf.Document") -> int:
+    """printed_page - (pdf_page_index + 1), taken as the mode over detectable pages."""
+    return printed_offset_votes(doc)[0]
 
 
 # ---------------------------------------------------------------- structure
@@ -203,6 +266,9 @@ _EX_NUM = re.compile(r"Example\s+(\d+)")
 _TH_REF = re.compile(r"Theorem\s+(\d+\.\d+)")
 _EXR_REF = re.compile(r"EXERCISE\s+(A?\d+\.\d+)")
 _QNUM = re.compile(r"(?m)^\s*(\d{1,2})\.\s")
+# A chapter offset is trusted only when at least this many pages agree on it;
+# below that it is one or two stray matches, and the chapter chain wins.
+MIN_OFFSET_VOTES = 3
 MAX_UNIT_CHARS = 1800
 MAX_Q_CHARS = 700
 
@@ -295,6 +361,45 @@ def add_structure(struct: dict, ch: int | None, full: str, page_at) -> None:
             }
 
 
+def title_from_pdf(doc: "pymupdf.Document", ch: int | None) -> str | None:
+    """Chapter title read off page 1: the largest-font text, minus the chapter number.
+
+    NCERT rewrites books (Maths Mela, Curiosity, Exploration ...) and renames every
+    chapter when it does, so a hardcoded TITLES entry goes stale silently. This reads
+    the title from the PDF itself, and is used whenever TITLES has no entry.
+    Returns None when page 1 has no clear title cluster (then the label is "Chapter N").
+    """
+    try:
+        spans: list[tuple[float, str]] = []
+        for block in doc[0].get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                for sp in line.get("spans", []):
+                    t = sp["text"].strip()
+                    if t:
+                        spans.append((round(sp["size"], 1), t))
+        if not spans:
+            return None
+        top = max(s for s, _ in spans)
+        # The chapter number is often the single largest glyph; ignore pure numbers,
+        # and keep every fragment within 2pt of the biggest remaining text.
+        named = [(s, t) for s, t in spans if not re.fullmatch(r"\d{1,3}", t)]
+        if not named:
+            return None
+        top = max(s for s, _ in named)
+        parts = [t for s, t in named if s >= top - 2]
+        title = re.sub(r"\s+", " ", " ".join(parts)).strip(" :-—·")
+        # Drop a leading "Chapter N" / "N" the title block sometimes repeats.
+        title = re.sub(r"^(?:Chapter\s*\d{0,3}\s*[-—:·]?\s*)", "", title, flags=re.I).strip()
+        if ch is not None:
+            title = re.sub(rf"^{ch}\s*[-—:·.]?\s*", "", title).strip()
+        # A title is a few words, not a paragraph of body text.
+        if not (3 <= len(title) <= 70) or len(title.split()) > 10:
+            return None
+        return title
+    except Exception:
+        return None
+
+
 def extract(book: str, edition: str) -> tuple[list[dict], dict]:
     titles = TITLES.get(book, {})
     src = SOURCES / book / edition
@@ -304,17 +409,51 @@ def extract(book: str, edition: str) -> tuple[list[dict], dict]:
     chunks: list[dict] = []
     struct = {"examples": {}, "theorems": {}, "exercises": {}, "sections": {}, "outlines": {}}
     cid = 0
+    expected_offset = 0  # running printed-page total, for chapters with no readable header
     for pdf in pdfs:
         if pdf.stat().st_size < 10000:  # skip truncated / 404-error files
             print(f"  skip {pdf.name} (too small)")
             continue
         m = re.search(r"(\d\d)(?:\D*)$", pdf.stem)
         ch = int(m.group(1)) if m else None
-        title = titles.get(ch) if ch is not None else None
-        label = f"Chapter {ch}: {title}" if title else (f"Chapter {ch}" if ch else pdf.stem)
         kind = "answers" if pdf.stem.endswith("an") else "chapter"
         doc = pymupdf.open(pdf)
-        offset = printed_offset(doc)
+        # Prefer the curated title; fall back to reading it off the PDF (new editions).
+        title = titles.get(ch) if ch is not None else None
+        if not title and kind == "chapter":
+            title = title_from_pdf(doc, ch)
+        label = f"Chapter {ch}: {title}" if title else (f"Chapter {ch}" if ch else pdf.stem)
+        # NCERT paginates a book's chapters consecutively, so the offset of each chapter
+        # is the previous one's offset plus its page count. That chain is a far stronger
+        # signal than the running head on a picture-heavy page: some chapters have no
+        # readable header at all (offset 0, i.e. "this chapter starts at printed page 1")
+        # and others yield a nonsense offset from one or two stray matches (Class 7 Maths
+        # ch1 read -23; Class 5 Maths ch5 read +4 where the chain says +46). Trust the
+        # detected value only when enough pages agree on it; otherwise follow the chain.
+        offset, votes = printed_offset_votes(doc)
+        # A negative offset is impossible — a chapter cannot start before printed page 1.
+        # It means the numbers being read aren't textbook pages: these files often have
+        # an answer key appended with its own numbering (Class 7 Maths ch1 is 23 chapter
+        # pages plus an answer sheet numbered from 1, which 7 pages "agree" is -23).
+        # Reject it however well supported, falling back to the chain, or to 0 for the
+        # first chapter, where there is no chain yet.
+        if offset < 0:
+            print(f"  {pdf.name}: detected printed offset {offset:+d} ({votes} vote(s)) is "
+                  f"negative; using {expected_offset:+d}")
+            offset = expected_offset
+        elif expected_offset and offset != expected_offset:
+            if votes < MIN_OFFSET_VOTES:
+                print(f"  {pdf.name}: detected printed offset {offset:+d} ({votes} vote(s)) "
+                      f"rejected; using chained offset {expected_offset:+d}")
+                offset = expected_offset
+            else:
+                # Well supported and plausible. The chain only holds when page_count is
+                # the chapter's own length; these PDFs append answer keys, so a confident
+                # detected offset is the better value (verified against the printed book).
+                print(f"  {pdf.name}: printed offset {offset:+d} ({votes} pages agree) "
+                      f"differs from chained {expected_offset:+d}; keeping detected")
+        # Where the next chapter should start, if its own header is unreadable too.
+        expected_offset = offset + doc.page_count
 
         # Full chapter text with a char-offset -> (pdf page, printed page) map for structure.
         full = ""

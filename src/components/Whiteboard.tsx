@@ -8,6 +8,7 @@
 import { Excalidraw, WelcomeScreen } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
 import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
+import { useEffect, useRef } from "react";
 import { BoardPlayer } from "@/lib/canvas/player";
 import { isTutorElement, summarizeScene } from "@/lib/canvas/summary";
 import { LogoMark } from "./Logo";
@@ -20,14 +21,46 @@ export type Board = {
 };
 
 export default function Whiteboard({ onReady }: { onReady: (board: Board) => void }) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const playerRef = useRef<BoardPlayer | null>(null);
+
+  // The board frames exactly one page, so a container resize has to re-fit it.
+  // Excalidraw's own ResizeObserver silently rewrites appState.width/height and
+  // nothing re-frames; api.refresh() only updates offsetLeft/offsetTop. We run
+  // after its observer has settled.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || typeof ResizeObserver === "undefined") return;
+    let t: ReturnType<typeof setTimeout> | null = null;
+    const ro = new ResizeObserver(() => {
+      if (t) clearTimeout(t);
+      t = setTimeout(() => playerRef.current?.refit(), 140);
+    });
+    ro.observe(host);
+    return () => {
+      ro.disconnect();
+      if (t) clearTimeout(t);
+    };
+  }, []);
+
+  // View mode: the board is a display surface Guru draws on. The student asks by
+  // voice or text, not by drawing, so Excalidraw's tool palette and the stroke/
+  // background properties panel stay hidden and never cover the canvas. The
+  // imperative API still works in view mode, so Guru draws normally.
   return (
-    // View mode: the board is a display surface Guru draws on. The student asks by
-    // voice or text, not by drawing, so Excalidraw's tool palette and the stroke/
-    // background properties panel stay hidden and never cover the canvas. The
-    // imperative API still works in view mode, so Guru draws normally.
+    <div ref={hostRef} className="h-full w-full">
     <Excalidraw
       viewModeEnabled
-      excalidrawAPI={(api) => onReady({ api, player: new BoardPlayer(api), isTutorElement, summarizeScene })}
+      excalidrawAPI={(api) => {
+        const player = new BoardPlayer(api);
+        playerRef.current = player;
+        onReady({ api, player, isTutorElement, summarizeScene });
+      }}
+      // Fires on viewport changes too, which is the only signal that the
+      // student dragged the board themselves. The player compares it with what
+      // it last wrote and, if they have moved away, stops following Indica and
+      // offers the way back.
+      onChange={() => playerRef.current?.notifyViewport()}
       initialData={{
         appState: {
           // Transparent so the decorative `.board-surface` behind the canvas
@@ -62,5 +95,6 @@ export default function Whiteboard({ onReady }: { onReady: (board: Board) => voi
         </WelcomeScreen.Center>
       </WelcomeScreen>
     </Excalidraw>
+    </div>
   );
 }

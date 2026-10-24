@@ -1,4 +1,5 @@
 import { isSupportedLanguage, sarvamVoice, toSarvamLang } from "@/lib/languages";
+import { ttsPace } from "@/lib/llm";
 
 export const maxDuration = 30;
 
@@ -9,12 +10,15 @@ export const maxDuration = 30;
  * voice exists, falling back to v3 for Tamil/Malayalam/Odia/Punjabi which v4
  * doesn't cover yet. SARVAM_TTS_MODEL / SARVAM_TTS_SPEAKER force one value for
  * all languages. 204 when no key is set so the browser uses speechSynthesis.
+ *
+ * `pace` lets the caller slow one line down (a roadmap preview, say) below the
+ * session default from TTS_PACE; omitted, every line comes back at that default.
  */
 export async function POST(req: Request) {
   const key = process.env.SARVAM_API_KEY;
   if (!key) return new Response(null, { status: 204 });
 
-  const { text, lang } = (await req.json()) as { text?: string; lang?: string };
+  const { text, lang, pace } = (await req.json()) as { text?: string; lang?: string; pace?: number };
   const clean = (text ?? "").trim();
   if (!clean) return new Response(null, { status: 204 });
 
@@ -30,7 +34,7 @@ export async function POST(req: Request) {
     language_code,
     speaker,
     model,
-    pace: Number(process.env.SARVAM_TTS_PACE || 1.0),
+    pace: Number.isFinite(pace) ? Math.min(1.5, Math.max(0.5, pace as number)) : ttsPace(),
     output_audio_codec: "mp3",
     speech_sample_rate: 22050,
   };

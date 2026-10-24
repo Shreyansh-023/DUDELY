@@ -12,9 +12,7 @@ export default function Transcript({ messages, status }: { messages: ChatMessage
 
   // A failed turn can leave an assistant message with no text; never show an
   // empty "GURU" bubble (pending-with-empty-text is fine — that's the dots).
-  const visible = messages.filter(
-    (m) => !m.hidden && (m.role !== "assistant" || m.pending || m.text.trim()),
-  );
+  const visible = messages.filter((m) => m.role !== "assistant" || m.pending || m.text.trim());
 
   if (!visible.length) {
     return (

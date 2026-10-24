@@ -9,13 +9,19 @@ export type TtsMode = "sarvam" | "browser";
 /**
  * Fetches synthesized speech from the server (Sarvam Bulbul). Returns null
  * when the server has no TTS configured so the caller falls back to the
- * browser's speechSynthesis.
+ * browser's speechSynthesis. `pace` overrides the server's session default
+ * (TTS_PACE) for this one line.
  */
-export async function fetchSpeech(text: string, lang: string, signal?: AbortSignal): Promise<Blob | null> {
+export async function fetchSpeech(
+  text: string,
+  lang: string,
+  signal?: AbortSignal,
+  pace?: number,
+): Promise<Blob | null> {
   const res = await fetch("/api/tts", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text, lang }),
+    body: JSON.stringify({ text, lang, ...(pace ? { pace } : {}) }),
     signal,
   });
   if (res.status === 204) return null;
@@ -68,6 +74,31 @@ export function playBlob(blob: Blob, signal: AbortSignal, onProgress?: (fraction
   });
 }
 
+/**
+ * Speech for one of the app's own fixed lines — the familiarity question, the
+ * lines Indica says while the planner thinks. They are identical every lesson,
+ * so they are synthesized once per language and then start instantly, which
+ * matters most for the filler: it is what covers the planner's thinking time and
+ * so has to begin the moment the student stops talking.
+ *
+ * Deliberately not tied to a turn's AbortSignal: a cached entry outlives the
+ * turn that created it, and an aborted fetch would poison it for the rest of the
+ * session. These are single sentences, so letting one finish costs nothing.
+ */
+const fixedSpeech = new Map<string, Promise<Blob | null>>();
+
+export function fetchFixedSpeech(text: string, lang: string, pace?: number): Promise<Blob | null> {
+  const key = `${lang}|${pace ?? ""}|${text}`;
+  const hit = fixedSpeech.get(key);
+  if (hit) return hit;
+  const pending = fetchSpeech(text, lang, undefined, pace).catch(() => null);
+  // There are only a handful of fixed lines per language, but don't let a
+  // language-hopping session grow this without bound.
+  if (fixedSpeech.size > 32) fixedSpeech.clear();
+  fixedSpeech.set(key, pending);
+  return pending;
+}
+
 let voicesLoaded = false;
 function pickVoice(lang: string): SpeechSynthesisVoice | undefined {
   const voices = window.speechSynthesis.getVoices();
@@ -80,13 +111,16 @@ function pickVoice(lang: string): SpeechSynthesisVoice | undefined {
 /**
  * Browser fallback: free, works offline, voice quality varies by OS.
  * `onBoundary` fires with the character index of each word as the engine
- * reaches it — exact word-level timing for karaoke captions.
+ * reaches it — exact word-level timing for karaoke captions. `rate` is the
+ * speechSynthesis counterpart of Sarvam's `pace`, so both voices speak at the
+ * one pace the session was configured with.
  */
 export function speakBrowser(
   text: string,
   lang: string,
   signal: AbortSignal,
   onBoundary?: (charIndex: number) => void,
+  rate = 1.0,
 ): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted || typeof window === "undefined" || !("speechSynthesis" in window)) return resolve();
@@ -106,11 +140,12 @@ export function speakBrowser(
     u.lang = toWebSpeechLang(lang);
     const voice = pickVoice(u.lang);
     if (voice) u.voice = voice;
-    u.rate = 1.0;
+    u.rate = Math.min(2, Math.max(0.5, rate));
     // Chrome sometimes never fires onend (and headless browsers have no voices), so cap the wait
-    // at a generous estimate of the speaking time.
+    // at a generous estimate of the speaking time — which stretches as the rate drops,
+    // or the cap would cut a deliberately slow voice off mid-sentence.
     const words = text.trim().split(/\s+/).length;
-    const maxMs = 1500 + words * 550;
+    const maxMs = (1500 + words * 550) / u.rate;
     // The cap can't count time spent frozen, so track what's left and restart it
     // across a pause/resume.
     let timer: ReturnType<typeof setTimeout>;

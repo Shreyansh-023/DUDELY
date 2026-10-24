@@ -15,6 +15,19 @@ here in `rag/`. `rag/data/` is git-ignored (NCERT PDFs are copyright; the index 
 pip install -r rag/requirements.txt                 # pymupdf + httpx (one-time)
 # NVIDIA_API_KEY must be in .env or the environment (used for embeddings)
 
+# Whole corpus in one command: classes 1–10 x {maths, science}.
+# Per book it downloads the chapter PDFs, embeds them, writes the index, then
+# DELETES that book's PDFs (so peak disk is one book, not the whole corpus).
+PYTHONPATH="rag" python rag/build_corpus.py
+PYTHONPATH="rag" python rag/build_corpus.py --dry-run          # show the plan only
+PYTHONPATH="rag" python rag/build_corpus.py --subject science  # one subject
+PYTHONPATH="rag" python rag/build_corpus.py --grades 9 10      # some classes
+PYTHONPATH="rag" python rag/build_corpus.py --keep-pdfs        # keep the sources
+
+# Books already indexed are skipped (--force rebuilds). Classes 1–2 Science are
+# skipped with a reason: NCERT publishes no such book under the NCF scheme.
+
+# ---- or the two manual steps (what build_corpus.py calls underneath) ----
 # Maths classes 1–9 (downloads current NCF English PDFs, then embeds):
 PYTHONPATH="rag" python rag/download_ncert_maths.py --grades 1 2 3 4 5 6 7 8 9
 PYTHONPATH="rag" python rag/build_index.py --grades 1 2 3 4 5 6 7 8 9 --edition english

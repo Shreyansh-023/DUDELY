@@ -68,6 +68,15 @@ body {
   display: none !important;
 }
 
+/* Excalidraw's own "Scroll back to content" button. It cannot do the right
+   thing here: it frames the bounding box of the WHOLE book, which lands between
+   pages (usually near the plan), and it writes the viewport itself rather than
+   going through the player. BoardPager renders the button under this same name,
+   and takes the student back to the page Indica is actually writing on. */
+.excalidraw .scroll-back-to-content {
+  display: none !important;
+}
+
 /* Slim, quiet scrollbars (chat panel, captions). */
 * {
   scrollbar-width: thin;

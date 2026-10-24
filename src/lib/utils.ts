@@ -36,6 +36,17 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
     for (const w of this.waiters.splice(0)) w({ value: undefined as never, done: true });
   }
 
+  /**
+   * Let go of a consumer that is parked on `next()` WITHOUT closing the queue:
+   * its iteration ends and later pushes pile up in `items` for whoever iterates
+   * next. A consumer that just walks away leaves its resolver in `waiters`, and
+   * the next push is handed to that abandoned promise and lost — which is how a
+   * paused lesson would drop the first beat it was meant to resume on.
+   */
+  detach() {
+    for (const w of this.waiters.splice(0)) w({ value: undefined as never, done: true });
+  }
+
   get size() {
     return this.items.length;
   }
