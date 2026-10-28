@@ -73,7 +73,12 @@ SARVAM_API_KEY=...                # Saaras v4 STT + Bulbul TTS; without it → b
 # SARVAM_STT_MODEL=saaras:v4
 # SARVAM_TTS_MODEL=...
 # SARVAM_TTS_SPEAKER=...
-# SARVAM_TTS_PACE=1.0
+# TTS_PACE=0.9                    # 0.5..1.5, how fast Indica speaks; paces Sarvam AND
+#                                 # browser speech. Below 1 on purpose: a student needs
+#                                 # time to look at what was just drawn, and the slower
+#                                 # delivery is what lets the next lesson step finish
+#                                 # generating before the current one stops speaking.
+# SARVAM_TTS_PACE=0.9             # legacy name for the same thing; TTS_PACE wins
 # SARVAM_TTS_PITCH=0.0
 # SARVAM_TTS_LOUDNESS=1.0
 
@@ -136,14 +141,25 @@ Needs `NVIDIA_API_KEY` in `.env` / `.env.local` or the shell environment.
 
 Download NCERT chapter PDFs (copyright; do not commit them — `rag/data/` is gitignored).
 
+**Maths classes 1–9** (current NCF English editions) — automated:
+
+```bash
+# Windows PowerShell
+$env:PYTHONPATH="rag"; python rag/download_ncert_maths.py --grades 1 2 3 4 5 6 7 8 9
+
+# macOS / Linux
+PYTHONPATH="rag" python rag/download_ncert_maths.py --grades 1 2 3 4 5 6 7 8 9
+```
+
+Or place PDFs manually:
+
 ```
 rag/data/sources/<book>/<edition>/*.pdf
 ```
 
-Examples:
-
 | Book key | Example PDF stem |
 | --- | --- |
+| `ncert-class-1-maths` … `ncert-class-9-maths` | see `rag/download_ncert_maths.py` / `rag/README.md` |
 | `ncert-class-10-maths` | `jemh104.pdf` (chapter 4) |
 | `ncert-class-9-science` | `iesc101.pdf` (chapter 1) |
 
@@ -152,11 +168,14 @@ Book keys match `textbookKey(grade, subject)` in `src/lib/curriculum.ts` (e.g. C
 ### 5.3 Build the index
 
 ```bash
-# Windows PowerShell
+# Windows PowerShell — all maths 1–9
+$env:PYTHONPATH="rag"; python rag/build_index.py --grades 1 2 3 4 5 6 7 8 9 --edition english
+
+# Single book
 $env:PYTHONPATH="rag"; python rag/build_index.py --book ncert-class-10-maths --edition english
 
 # macOS / Linux
-PYTHONPATH="rag" python rag/build_index.py --book ncert-class-10-maths --edition english
+PYTHONPATH="rag" python rag/build_index.py --grades 1 2 3 4 5 6 7 8 9 --edition english
 ```
 
 Output lands in:

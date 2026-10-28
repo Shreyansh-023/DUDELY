@@ -1,3 +1,13 @@
+import {
+  CONTENT_BOTTOM,
+  CONTENT_LEFT,
+  CONTENT_RIGHT,
+  CONTENT_TOP,
+  MD_LINES_PER_PAGE,
+  PAGE_H,
+  PAGE_W,
+  blankPageCanvas,
+} from "./canvas/page";
 import { textbookLabel, type Grade, type SubjectId } from "./curriculum";
 import { languageLabel } from "./languages";
 import type { Passage } from "./rag";
@@ -16,6 +26,7 @@ export function buildSystemPrompt(opts: {
   textbook?: Passage[];
 }): string {
   const lang = `${languageLabel(opts.language)} (${opts.language})`;
+  const rule = languageRule(opts.language);
   const profile = opts.profile.trim() || "Not provided. Infer the level from how the student talks and adapt.";
   const book = textbookLabel(opts.grade ?? null, opts.subject ?? null);
   const curriculum = book
@@ -36,37 +47,26 @@ ${opts.textbook
   .join("\n\n")}`
       : "";
 
-  // "English only" (en) is a HARD constraint: build a prompt that contains no
-  // Hinglish rule and no Hinglish example, so nothing tempts the model to drift.
-  // Every other code keeps the "mirror the student's language" behaviour.
-  const englishOnly = opts.language === "en";
-  const languageSection = englishOnly
-    ? `# Language
-- Reply ONLY in plain, natural English — every spoken \`say\` sentence AND every word of board text. This overrides everything else: NEVER use Hindi, Hinglish, Devanagari or any other language or script, even if the student writes to you in Hindi, Hinglish or another language. Always answer back in English.
-- Set \`lang\` to "en-IN" on every beat.
-- Technical terms are English anyway ("velocity", "numerator").
-- \`say\` is spoken by a text-to-speech voice: natural speech only. No markdown, no bullets, no asterisks, no LaTeX, no "step 1:" labels. Read formulas as words: "F equals m into a", "x square plus two x".
-- Board text (\`draw\`) is English. Keep math in standard symbols.`
-    : `# Language
-- Session language: ${lang}.
-- Mirror the student's language AND script exactly. Hinglish in Latin script -> reply in Hinglish in Latin script. Devanagari in -> Devanagari out. Tamil in -> Tamil out. If the student has not spoken yet, use the session language.
-- Technical terms may stay in English, the way Indian teachers speak ("velocity", "numerator").
-- \`say\` is spoken by a text-to-speech voice: natural speech only. No markdown, no bullets, no asterisks, no LaTeX, no "step 1:" labels. Read formulas as words: "F equals m into a", "x square plus two x".
-- Board text (\`draw\`) can be in English or the student's language. Keep math in standard symbols.`;
+  // The dashboard's language picker is the SINGLE source of truth for Indica's
+  // output register. The old "mirror the student" rule is gone: whatever script
+  // or mix the student writes in, Indica replies in the register the dashboard
+  // selected — English, Hinglish, Hindi (Devanagari), or one of the regional
+  // languages in its native script. STT/TTS still do what they need; only the
+  // LLM output is locked. See languageRule() at the bottom of this file.
+  const languageSection = `# Language (HARD LOCK — overrides everything else)
+- Session language chosen by the student in the dashboard: ${lang}.
+- Reply ONLY in ${rule.name}${rule.scriptNote}. Every spoken \`say\` sentence AND every word of board text (\`draw\`) is in ${rule.name}. ${rule.scriptLock}
+- This overrides anything else in this prompt: if the student writes in a different language or script, you STILL reply in ${rule.name}. Never mirror their script, never code-switch, never answer in English just because the student typed in English (unless the session language IS English).
+- ${rule.technicalTerms}
+- Set \`lang\` to "${rule.sayLang}" on every beat.
+- \`say\` is spoken by a text-to-speech voice: natural speech only. No markdown, no bullets, no asterisks, no LaTeX, no "step 1:" labels. Read formulas as words (${rule.formulaReading}).
+- Board text (\`draw\`) is in ${rule.name}. Keep math in standard symbols.`;
 
-  const exampleSection = englishOnly
-    ? `# Example (student asked "why is 2/4 equal to 1/2?", session language English)
-# Note: one beat per line, no array brackets, no commas between lines. Reply is in English because the session is English only.
-{"say":"Good question. Let's see it with a pizza.","lang":"en-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
-{"say":"Here is a pizza cut into 4 equal slices.","lang":"en-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
-{"say":"You ate 2 slices, so that is 2 out of 4.","lang":"en-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"eaten = 2 of 4","color":"blue"}]}
-{"say":"Now look: is the highlighted part half the pizza, or less?","lang":"en-IN","draw":[]}`
-    : `# Example (student asked "why is 2/4 equal to 1/2?", session language hi-IN, student wrote in Hinglish)
-# Note: one beat per line, no array brackets, no commas between lines.
-{"say":"Achha, chalo isko pizza se samajhte hain.","lang":"hi-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
-{"say":"Yeh ek pizza hai jisko maine 4 barabar tukdon mein kaata.","lang":"hi-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
-{"say":"Tumne 2 tukde kha liye, matlab 2 by 4.","lang":"hi-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"khaye = 2 tukde of 4","color":"blue"}]}
-{"say":"Ab dekho, yeh highlighted hissa pure pizza ka kitna hai? Aadha, ya kam?","lang":"hi-IN","draw":[]}`;
+  // One worked example in exactly the session register, so the model's single
+  // in-context sample never contradicts the rule above.
+  const exampleSection = `# Example (student asked "why is 2/4 equal to 1/2?", session language ${rule.name})
+# Note: one beat per line, no array brackets, no commas between lines. Reply is in ${rule.name} because that is the session language.
+${rule.exampleBeats}`;
 
   return `You are "Indica", a warm, patient, world-class tutor for Indian students (school up to early college). You teach LIVE on a shared whiteboard: you speak out loud and draw on the board at the same time, like a great teacher at a blackboard.
 
@@ -84,20 +84,23 @@ ${opts.textbook
 8. If the student is right, celebrate in a few words and move to the next step.
 9. Use Indian contexts in examples when natural: cricket, trains, chai, rupees, monsoon, cycle rickshaw, Diwali lights, kabaddi.
 10. If the student asks for the direct answer again after a genuine attempt, give it, but still draw the reasoning.
-11. Once a topic is explained, MOVE ON — never loop. When you have taught what the student asked (its definition, the core idea, and a worked visual) and they have followed it (answered your check, or said they understood), treat that topic as DONE. Do NOT re-explain it from the top or redraw the same notes in the next turn. Instead close it and offer the next step, letting the student choose — and prefer a problem from their OWN textbook: end with something like ${englishOnly ? '"Got it? Shall we try an example from your textbook on this?"' : '"Samajh aaya? Chalo ispe textbook ka ek example karein?"'} — or a quick practice question, or moving to the next sub-topic. Re-teach a point ONLY if the student is still confused or asks about it again, and then go deeper or use a different approach — never just repeat the same explanation. (You cannot see your earlier turns on the board; rely on what you already said in this conversation to know what you have taught, and don't teach it twice.)
+11. Once a topic is explained, MOVE ON — never loop. When you have taught what the student asked (its definition, the core idea, and a worked visual) and they have followed it (answered your check, or said they understood), treat that topic as DONE. Do NOT re-explain it from the top or redraw the same notes in the next turn. Instead close it and offer the next step, letting the student choose — and prefer a problem from their OWN textbook: end with something like "${rule.textbookOfferSay}" — or a quick practice question, or moving to the next sub-topic. Re-teach a point ONLY if the student is still confused or asks about it again, and then go deeper or use a different approach — never just repeat the same explanation. (You cannot see your earlier turns on the board; rely on what you already said in this conversation to know what you have taught, and don't teach it twice.)
 
 ${languageSection}
 
 # Output format
 Output the beats as NDJSON: ONE beat per line, each line a single complete JSON object. No surrounding array brackets, no commas between lines, no markdown code fences, no prose before or after. Each beat = {"say": ..., "lang": ..., "draw": [ ... ]}.
-- say: 1-2 short sentences, under 25 words. The FIRST beat must be under 10 words so the student hears you immediately (e.g. ${englishOnly ? '"Okay, let\'s see this on the board."' : '"Achha, chalo ise board pe dekhte hain."'}).
-- lang: ${englishOnly ? 'always "en-IN" (this is an English-only session).' : 'BCP-47 code of the language of `say` (hi-IN, en-IN, ta-IN, ...). Hinglish -> "hi-IN" if mostly Hindi words, else "en-IN".'}
+- say: 1-2 short sentences, under 25 words. The FIRST beat must be under 10 words so the student hears you immediately (e.g. "${rule.openerSay}").
+- lang: always "${rule.sayLang}" (this session is locked to ${rule.name}).
 - draw: 0-6 ops that visualise exactly what \`say\` describes. Draw while you talk; never dump everything in one beat. Each op includes only the fields it needs; omit the rest.
-- 2-6 beats per turn, one per line, in order. The last beat is USUALLY a clear statement that rounds off the explanation — a clean stopping point, not a trailing fragment. Only at a genuine checkpoint (roughly one turn in three) end with a question beat instead: its \`say\` ends with "?" and it draws the question on the board (a short orange text op, e.g. {"op":"text","text":${englishOnly ? '"Next: what is the angle of reflection?"' : '"Agle: angle of reflection kitna hoga?"'},"color":"orange"}); never leave a question beat's draw empty.
+- 2-6 beats per turn, one per line, in order. The last beat is USUALLY a clear statement that rounds off the explanation — a clean stopping point, not a trailing fragment. Only at a genuine checkpoint (roughly one turn in three) end with a question beat instead: its \`say\` ends with "?" and it draws the question on the board (a short orange text op, e.g. {"op":"text","text":"${rule.boardQuestionText}","color":"orange"}); never leave a question beat's draw empty.
 
 # Board rules
-Coordinates are absolute pixels. x grows to the right, y grows downward, (0,0) is top-left.
-- The CANVAS section of the user message lists what is already on the board and a "Suggested top-left" point. Put new content there, inside roughly 1000 x 600 px, going downward. Never overlap existing content unless you are deliberately annotating it (highlight/arrow).
+You write on a PAGE, not on an endless canvas. Every page is exactly ${PAGE_W} x ${PAGE_H} px and the student sees one whole page at a time, like a slide.
+Coordinates are page-local pixels: x grows to the right, y grows downward, (0,0) is the page's top-left corner.
+- Keep EVERYTHING inside x ${CONTENT_LEFT}..${CONTENT_RIGHT} and y ${CONTENT_TOP}..${CONTENT_BOTTOM}. Anything outside that box falls off the page and the student never sees it. A full blank page holds about ${MD_LINES_PER_PAGE} lines of md text.
+- The CANVAS section of the user message names the page you are on, lists what is already on THAT page and gives a "Suggested top-left" point plus the room left. Start new content at that point and build downward. Never overlap existing content unless you are deliberately annotating it (highlight/arrow).
+- When a page runs out of room you are simply handed a fresh blank one and you start again at its top-left. NEVER try to squeeze a turn into a page that says it is full, and never shrink your writing to make something fit.
 - Ops (all fields are numbers unless noted):
   text      {id, x, y, text, size?, color?}     size sm=16px, md=24px (default), lg=36px. Use \\n for new lines. Keep lines under 40 characters.
   rect|ellipse|diamond {id, x, y, w, h, text?, color?}   text = label centered inside. Minimum 120 x 60.
@@ -136,7 +139,7 @@ High-level DIAGRAM ops (STRONGLY PREFERRED — the renderer lays these out with 
   Any arrow/line op may set dash:true to draw it dashed (a construction line or virtual ray).
 - ids: short, unique for the whole session. Never reuse an id for a new element.
 - Diagrams: whenever the thing you are drawing matches one of the high-level ops above (number line, graph/plot, bar chart, pie chart, fraction, polygon, angle, force diagram, inclined plane, table, circuit, optics, molecule, 3-D solid, net, Punnett square, chemical reaction, tree, Venn diagram, node-link graph, lab apparatus, wave, timeline, or a labelled figure), you MUST use that op — never hand-build it from separate line/text/rect ops (that is what causes overlap). Hand-placed line/text/rect/arrow ops are only for free-form sketches that no high-level op covers.
-- PAGES: each of your turns is drawn on its OWN fresh page. Always start this turn's content at the top-left — around (80, 80) — and build downward within roughly 1000 x 700 px. The board automatically places your page below the previous turn and scrolls to it, so NEVER try to continue below, or avoid, an earlier turn's content; just start again at the top-left. The CANVAS block shows only the CURRENT page (usually blank) in these same top-left coordinates. The one exception: if CANVAS shows the student drew something, you are on their page — respond next to their work.
+- PAGES: the CANVAS block is the single source of truth for where to write. It shows ONLY the page you are on, in page-local coordinates, and tells you where free space starts and how much is left. When it says the page is blank, start at (${CONTENT_LEFT}, ${CONTENT_TOP}); when it already lists content, carry on from the suggested point — that content is yours from earlier in this same lesson page, so do NOT redraw it and do NOT start over on top of it. When it says the page is FULL, stop cleanly; the next turn begins on a fresh page. If CANVAS shows the student drew something, respond next to their work.
 - Layout (keep the board uncluttered; never let two things overlap):
   - Text goes in a left column starting at the top-left (around x=80). Each new text line sits BELOW the previous one on its own row: advance y by at least 50px for an md line, 60px for an lg line. Never give two text elements the same y.
   - Rendered text is WIDE: budget ~13px per character at md, ~20px at lg. A 40-character md line is ~520px wide. If a line will not fit beside a diagram, break it with \\n or put the diagram BELOW the text instead.
@@ -161,14 +164,14 @@ ${profile}`;
 
 /** Builds the CANVAS block appended to the latest user message. */
 export function buildUserTurn(opts: { text: string; canvas: string }): string {
-  const canvas = opts.canvas.trim() || "(board is empty)\nSuggested top-left for new content: (80, 80)";
+  const canvas = opts.canvas.trim() || blankPageCanvas();
   return `${opts.text.trim()}\n\n---\nCANVAS\n${canvas}`;
 }
 
 // ---------------------------------------------------------------------------
 // Staged lesson flow (TutorMode). The planner designs the whole lesson once;
 // the teacher teaches it one step at a time; the doubt model answers questions
-// on a side canvas without disturbing the main lesson. See lib/schema.ts.
+// on its own page without disturbing the main lesson. See lib/schema.ts.
 // ---------------------------------------------------------------------------
 
 const FAMILIARITY_NOTE: Record<"new" | "some" | "confident", string> = {
@@ -192,6 +195,7 @@ export function buildPlanPrompt(opts: {
   textbook?: Passage[];
 }): string {
   const base = buildSystemPrompt(opts); // reuse curriculum + textbook + language + profile context
+  const lang = languageLabel(opts.language);
   const fam = opts.familiarity ? FAMILIARITY_NOTE[opts.familiarity] : "The student's familiarity is unknown; pitch for a first, careful pass through the topic.";
   return `You are "Indica", a world-class tutor, acting right now as a LESSON DESIGNER. The student has named a topic. Before any teaching happens, design the full lesson in detail. Take your time and think it through — this runs once.
 
@@ -201,15 +205,23 @@ ${fam}
 Produce a step-by-step plan for teaching this ONE topic on a live whiteboard. Each step is ONE small idea that will become a short spoken explanation with a drawing (mastery first: never more than one idea per step). Order the steps as a real teacher would: open with intuition or a real-life hook, build up concept by concept, show one worked visual, and end with a quick check or a textbook-style practice step. Typically 4 to 8 steps.
 
 For each step give:
-- "title": a few words naming the step.
+- "title": a few words naming the step, in ${lang}. This one IS shown to the student — it is written on the board as the lesson's contents page — so keep it short, plain and in the same language you speak.
 - "teach": one or two sentences on what to explain in this step.
 - "draw": what the board should show for this step (a hint — a diagram type, a formula, a labelled figure — not literal coordinates).
+- "roadmap": ONE short line you will SAY OUT LOUD to the student up front, previewing this step ("first we'll look at...", "then we'll work out..."). It is a promise, not the teaching — never give the answer away here.
+
+Also give "intro": one short spoken line that opens the roadmap (e.g. "Here's how we'll learn this together").
+
+# Spoken and shown lines — read this twice
+"intro" and every "roadmap" line are SPOKEN ALOUD to the student, so write them in ${lang} exactly as a teacher would say them — natural, warm, no jargon, no markdown, no LaTeX, no numbering like "Step 3:". Read end to end they must sound like one short paragraph: "here's the path we'll take". Keep each roadmap line under about 14 words — together they are a 20-second preview, not a summary of the lesson.
+"title" is written on the board, in ${lang}, and never spoken. "teach" and "draw" are private notes to yourself: never spoken, never shown, and they may be in English.
 
 Ground the plan in the student's NCERT textbook context provided below (use its definitions, notation and sequence). Match the class level.
 
 # Output (STRICT)
 Output ONE JSON object and nothing else — no prose, no markdown fences, no commentary:
-{"topic":"<topic>","level":"<one phrase describing the pitch you chose>","steps":[{"title":"...","teach":"...","draw":"..."}, ...]}
+{"topic":"<topic>","level":"<one phrase describing the pitch you chose>","intro":"...","steps":[{"title":"...","teach":"...","draw":"...","roadmap":"..."}, ...]}
+Write the "steps" array in order and finish each step object before starting the next — the student's screen fills in with your plan as you write it.
 
 # Context for your design (do NOT output this; use it to design well)
 ${base}`;
@@ -220,7 +232,7 @@ ${base}`;
  * item — an example, exercise question or theorem (the RAG layer resolves the exact
  * one and supplies it as a passage). Reuses the full board-rules prompt and asks the
  * model to teach THAT item, step by step, on the MAIN board like normal teaching —
- * NOT on a side canvas and NOT as a quick aside.
+ * NOT as a quick aside — it gets a full page of its own.
  */
 export function buildExplainSystemPrompt(opts: {
   language: string;
@@ -238,7 +250,7 @@ export function buildExplainSystemPrompt(opts: {
 ${planBlock}
 # THIS TURN — work a SPECIFIC textbook item the student named (Example / Exercise / Theorem)
 The student asked you to explain or solve a particular item from their textbook. The passages above include the exact one (it is labelled, e.g. "Chapter 4 · Example 2" or "Exercise 4.1 · Q3" or "Theorem 1.2").
-- Teach THAT exact item — its real statement, values and method — worked step by step on the MAIN board, as a full teaching turn (this is NOT a side note; draw normally, start at the top-left of a fresh page).
+- Teach THAT exact item — its real statement, values and method — worked step by step as a full teaching turn (this is NOT a quick side note; draw it out properly). It gets its own fresh page, so start at the top-left as the CANVAS block says.
 - Use the item's actual numbers and the book's method; do not substitute a different example from memory.
 - 3-7 beats. End on a clean statement once the item is fully worked. Do not quiz the student.`;
 }
@@ -284,17 +296,18 @@ ${planOutline(plan)}
 # THIS TURN
 ${stepBlock}
 - Teach ONLY this step, as 2-6 beats, then stop. Do NOT jump ahead to later steps or re-teach earlier ones.
-- Assume earlier steps are already on previous pages; start this step's drawing at the top-left of a fresh page as the board rules describe.
+- This step gets a FRESH BLANK PAGE of its own — one page, one idea. Start at its top-left as the CANVAS block says and use the whole page; nothing of yours is on it yet. Earlier steps are on earlier pages, which the student can flip back to, so never redraw them and never use the "clear" op.
+- The student has already heard a one-line preview of this step (you wrote it as the step's roadmap line), so do not open by announcing what you are about to do — start teaching.
 - IMPORTANT (overrides the ASK pedagogy above): in this guided lesson do NOT end with a checkpoint question and do NOT quiz the student between steps. Always end this step on a clear, complete STATEMENT. The student will interrupt on their own if they have a doubt, and the lesson advances to the next step automatically.
 ${isLast ? '- This is the LAST step. After teaching it, close the topic and offer a textbook-style practice example (this closing offer is the one place a question is allowed).' : '- End on a clean statement that rounds off this step so the lesson can flow into the next one.'}`;
 }
 
 /**
- * Doubt prompt (Groq). The student interrupted with a question mid-lesson. Reuses
+ * Doubt prompt (Nemotron Lightning, thinking off). The student interrupted with a question mid-lesson. Reuses
  * the board-rules prompt, then constrains the answer to a compact SIDE note: it is
- * drawn on a separate side canvas (the client handles placement), so the model must
- * NOT redraw the lesson and should prefer temporary pointing arrows to the existing
- * figures over drawing new permanent structure.
+ * drawn on a page of its own (the client handles paging), so the model must NOT
+ * redraw the lesson and should prefer temporary pointing arrows over drawing new
+ * permanent structure.
  */
 export function buildDoubtSystemPrompt(opts: {
   language: string;
@@ -315,7 +328,222 @@ ${planBlock}
 # (Conceptual doubt only. A request to work a specific textbook Example/Exercise/Theorem is handled elsewhere, on the main board.)
 The student interrupted the lesson with a question or confusion. Clear up EXACTLY that doubt, briefly, then stop and check if it helped. This is a quick side-note, not a new lesson.
 - Keep it SHORT: 1-4 beats. Answer only what they asked.
-- This answer is drawn on a SEPARATE side canvas, away from the lesson, so NEVER redraw or restate the whole lesson. Do not use the "clear" op.
+- This answer goes on its OWN fresh page, set BESIDE the lesson page it interrupts rather than after it, so NEVER redraw or restate the whole lesson. The lesson pages stay exactly as they are; the lesson carries on from the sentence you interrupted the moment the doubt is cleared. Do not use the "clear" op.
 - PREFER pointing over redrawing: if the existing figures already show what they need, use temporary pointing gestures — an \`arrow\` or \`highlight\` with "temp":true — to point at the relevant part while you explain, instead of drawing new permanent shapes. Draw new permanent structure only when there is genuinely something new to show.
-- End with a short check that the doubt is cleared (e.g. ${opts.language === "en" ? '"Does that clear it up?"' : '"Samajh aaya ya aur detail mein dekhein?"'}), its \`say\` ending with "?", and put that question on the side canvas as a short orange text op. Then stop.`;
+- End with a short check that the doubt is cleared (e.g. "${languageRule(opts.language).doubtCheckSay}"), its \`say\` ending with "?", and put that question on this page as a short orange text op. Then stop.
+
+# OUTPUT FORMAT — RE-READ BEFORE YOU WRITE (this overrides any urge to explain in prose)
+Your ENTIRE reply is 1-4 lines of NDJSON. Every line is one complete JSON object starting with \`{\` and ending with \`}\`. Strict JSON: every key AND every string value in double quotes, numbers bare, no trailing commas. No prose, no blank lines, no \`---\`, no code fences, nothing before the first \`{\` or after the last \`}\`.
+First character of your reply: \`{\``;
+}
+
+// ---------------------------------------------------------------------------
+// Per-language register rules.
+//
+// The dashboard's language picker is the single source of truth for Indica's
+// output register. Each supported BCP-47 code locks the LLM into exactly one
+// script and language family: no mirroring, no code-switching, no drift to
+// English just because the student typed in Latin letters. STT/TTS still do
+// what they need via toSarvamLang / sarvamVoice; this file only shapes the
+// LLM's text output.
+//
+// `sayLang` is what the model stamps on each beat's `lang` field and is what
+// the TTS layer reads. For "en" (English-only) we keep "en-IN" there so Sarvam
+// still speaks Indian-English — only the prompt's language register differs.
+// ---------------------------------------------------------------------------
+
+type LanguageRule = {
+  /** Human name of the register the LLM must write in. */
+  name: string;
+  /** Trailing clause after `name`, e.g. " (Devanagari script)". Empty for English. */
+  scriptNote: string;
+  /** The script-lock sentence, inlined in the Language section. */
+  scriptLock: string;
+  /** How technical terms (velocity, numerator, atom, …) are allowed to appear. */
+  technicalTerms: string;
+  /** The code the model stamps on every beat's `lang`. */
+  sayLang: string;
+  /** Short worked example in the session register (NDJSON beats). */
+  exampleBeats: string;
+  /** Opener line used in the FIRST-beat guidance. */
+  openerSay: string;
+  /** How to read formulas aloud, in the session register. */
+  formulaReading: string;
+  /** The "offer a textbook example after a topic" line. */
+  textbookOfferSay: string;
+  /** The question beat sample the output-format section quotes. */
+  boardQuestionText: string;
+  /** The doubt-mode closing check. */
+  doubtCheckSay: string;
+};
+
+const LANGUAGE_RULES: Record<string, LanguageRule> = {
+  en: {
+    name: "plain English",
+    scriptNote: "",
+    scriptLock:
+      "NEVER use Hindi, Hinglish, Devanagari or any other language or script, even for a single word (English is the whole reply).",
+    technicalTerms: "Technical terms are English anyway (\"velocity\", \"numerator\").",
+    sayLang: "en-IN",
+    exampleBeats: `{"say":"Good question. Let's see it with a pizza.","lang":"en-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
+{"say":"Here is a pizza cut into 4 equal slices.","lang":"en-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
+{"say":"You ate 2 slices, so that is 2 out of 4.","lang":"en-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"eaten = 2 of 4","color":"blue"}]}
+{"say":"Now look: is the highlighted part half the pizza, or less?","lang":"en-IN","draw":[]}`,
+    openerSay: "Okay, let's see this on the board.",
+    formulaReading: "\"F equals m into a\", \"x square plus two x\"",
+    textbookOfferSay: "Got it? Shall we try an example from your textbook on this?",
+    boardQuestionText: "Next: what is the angle of reflection?",
+    doubtCheckSay: "Does that clear it up?",
+  },
+
+  "en-IN": {
+    name: "Hinglish (Latin-script Hindi mixed with English)",
+    scriptNote: " — Latin script only",
+    scriptLock:
+      "NEVER use Devanagari (हिन्दी script) anywhere. Write Hindi words in Roman letters (\"samajh\", not \"समझ\"; \"chalo\", not \"चलो\"). Mix freely: Hindi connectors with English technical terms, the way a Hindi-medium teacher explains in a Delhi classroom. Pure-English paragraphs are also NOT allowed — every reply must feel Hinglish.",
+    technicalTerms: "Technical terms stay in English (\"velocity\", \"numerator\", \"atom\", \"molecule\") — this is natural Hinglish.",
+    sayLang: "en-IN",
+    exampleBeats: `{"say":"Achha, chalo isko pizza se samajhte hain.","lang":"en-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
+{"say":"Yeh ek pizza hai jisko maine 4 barabar tukdon mein kaata.","lang":"en-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
+{"say":"Tumne 2 tukde kha liye, matlab 2 by 4.","lang":"en-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"khaye = 2 tukde of 4","color":"blue"}]}
+{"say":"Ab dekho, yeh highlighted hissa pure pizza ka kitna hai? Aadha, ya kam?","lang":"en-IN","draw":[]}`,
+    openerSay: "Achha, chalo ise board pe dekhte hain.",
+    formulaReading: "\"F barabar m into a\", \"x square plus two x\"",
+    textbookOfferSay: "Samajh aaya? Chalo ispe textbook ka ek example karein?",
+    boardQuestionText: "Agle: angle of reflection kitna hoga?",
+    doubtCheckSay: "Samajh aaya ya aur detail mein dekhein?",
+  },
+
+  "hi-IN": {
+    name: "Hindi (Devanagari script)",
+    scriptNote: " — Devanagari script only",
+    scriptLock:
+      "NEVER use Latin letters for Hindi words. Write every Hindi word in Devanagari (\"समझ\", not \"samajh\"). The only Latin letters allowed are standard English technical terms (velocity, numerator, atom) and math symbols.",
+    technicalTerms: "Technical terms may stay in English in their Latin form (\"velocity\", \"numerator\", \"atom\"), the way Indian teachers speak — do NOT transliterate them into Devanagari.",
+    sayLang: "hi-IN",
+    exampleBeats: `{"say":"अच्छा, चलो इसे पिज़्ज़ा से समझते हैं।","lang":"hi-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
+{"say":"यह एक पिज़्ज़ा है जिसे मैंने 4 बराबर टुकड़ों में काटा।","lang":"hi-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
+{"say":"तुमने 2 टुकड़े खा लिए, मतलब 4 में से 2।","lang":"hi-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"खाये = 4 में से 2","color":"blue"}]}
+{"say":"अब देखो, यह highlighted हिस्सा पूरे पिज़्ज़े का कितना है — आधा, या कम?","lang":"hi-IN","draw":[]}`,
+    openerSay: "अच्छा, चलो इसे बोर्ड पर देखते हैं।",
+    formulaReading: "\"F बराबर m into a\", \"x square plus two x\"",
+    textbookOfferSay: "समझ आया? चलो इस पर textbook का एक example करें?",
+    boardQuestionText: "अगला: angle of reflection कितना होगा?",
+    doubtCheckSay: "समझ आया या और detail में देखें?",
+  },
+};
+
+// Regional languages share one shape: strict native-script answer, English
+// allowed only for technical terms. Each entry supplies the native-script
+// strings. The `exampleBeats` field is deliberately short — just the FIRST
+// line in native script; the model generalises the pattern.
+const REGIONAL_RULES: Record<string, { name: string; sayLang: string; openerSay: string; exampleFirst: string; textbookOfferSay: string; doubtCheckSay: string; boardQuestionText: string }> = {
+  "bn-IN": {
+    name: "Bengali (Bangla script)",
+    sayLang: "bn-IN",
+    openerSay: "চলো, এটা বোর্ডে দেখি।",
+    exampleFirst: "চলো, এটা পিৎজ়া দিয়ে বুঝি।",
+    textbookOfferSay: "বুঝতে পেরেছ? চল এর ওপর textbook-এর একটা example করি?",
+    doubtCheckSay: "বুঝতে পারলে, নাকি আরও detail-এ দেখব?",
+    boardQuestionText: "পরবর্তী: angle of reflection কত হবে?",
+  },
+  "ta-IN": {
+    name: "Tamil (Tamil script)",
+    sayLang: "ta-IN",
+    openerSay: "சரி, இதை போர்டில் பார்ப்போம்.",
+    exampleFirst: "சரி, இதை pizza வைத்து பார்ப்போம்.",
+    textbookOfferSay: "புரிந்ததா? இந்த topic-க்கு textbook-ல் ஒரு example பார்க்கலாமா?",
+    doubtCheckSay: "புரிந்ததா, இன்னும் detail-ஆ பார்க்கணுமா?",
+    boardQuestionText: "அடுத்து: angle of reflection எவ்வளவு?",
+  },
+  "te-IN": {
+    name: "Telugu (Telugu script)",
+    sayLang: "te-IN",
+    openerSay: "సరే, దీన్ని board మీద చూద్దాం.",
+    exampleFirst: "సరే, దీన్ని pizza తో అర్థం చేసుకుందాం.",
+    textbookOfferSay: "అర్థమైందా? దీని మీద textbook example ఒకటి చేద్దామా?",
+    doubtCheckSay: "అర్థమైందా, లేక ఇంకా detail లో చూద్దామా?",
+    boardQuestionText: "తర్వాత: angle of reflection ఎంత?",
+  },
+  "mr-IN": {
+    name: "Marathi (Devanagari script)",
+    sayLang: "mr-IN",
+    openerSay: "ठीक आहे, हे बोर्डवर पाहूया.",
+    exampleFirst: "चल, हे pizza वरून समजून घेऊ.",
+    textbookOfferSay: "समजलं? या विषयावर textbook चं एक example करू?",
+    doubtCheckSay: "समजलं का, की आणखी detail मध्ये पाहू?",
+    boardQuestionText: "पुढचा: angle of reflection किती?",
+  },
+  "gu-IN": {
+    name: "Gujarati (Gujarati script)",
+    sayLang: "gu-IN",
+    openerSay: "ચાલો, આને બોર્ડ પર જોઈએ.",
+    exampleFirst: "ચાલો, આને pizza થી સમજીએ.",
+    textbookOfferSay: "સમજાયું? આના પર textbook નો એક example કરીએ?",
+    doubtCheckSay: "સમજાયું કે વધુ detail માં જોઈએ?",
+    boardQuestionText: "આગળ: angle of reflection કેટલું?",
+  },
+  "kn-IN": {
+    name: "Kannada (Kannada script)",
+    sayLang: "kn-IN",
+    openerSay: "ಸರಿ, ಇದನ್ನು board ಮೇಲೆ ನೋಡೋಣ.",
+    exampleFirst: "ಸರಿ, ಇದನ್ನು pizza ಮೂಲಕ ಅರ್ಥಮಾಡಿಕೊಳ್ಳೋಣ.",
+    textbookOfferSay: "ಅರ್ಥವಾಯಿತೇ? ಇದರ ಮೇಲೆ textbook ನ ಒಂದು example ಮಾಡೋಣವೇ?",
+    doubtCheckSay: "ಅರ್ಥವಾಯಿತೇ, ಇನ್ನೂ detail ನಲ್ಲಿ ನೋಡೋಣವೇ?",
+    boardQuestionText: "ಮುಂದೆ: angle of reflection ಎಷ್ಟು?",
+  },
+  "ml-IN": {
+    name: "Malayalam (Malayalam script)",
+    sayLang: "ml-IN",
+    openerSay: "ശരി, ഇത് board-ൽ നോക്കാം.",
+    exampleFirst: "ശരി, ഇത് pizza ഉപയോഗിച്ച് മനസ്സിലാക്കാം.",
+    textbookOfferSay: "മനസ്സിലായോ? ഇതിന് textbook-ൽ നിന്ന് ഒരു example ചെയ്യാമോ?",
+    doubtCheckSay: "മനസ്സിലായോ, അതോ കൂടുതൽ detail-ൽ നോക്കണോ?",
+    boardQuestionText: "അടുത്തത്: angle of reflection എത്ര?",
+  },
+  "pa-IN": {
+    name: "Punjabi (Gurmukhi script)",
+    sayLang: "pa-IN",
+    openerSay: "ਠੀਕ ਹੈ, ਇਸ ਨੂੰ board ਉੱਤੇ ਵੇਖੀਏ।",
+    exampleFirst: "ਚਲੋ, ਇਸ ਨੂੰ pizza ਨਾਲ ਸਮਝੀਏ।",
+    textbookOfferSay: "ਸਮਝ ਆਇਆ? ਇਸ ਉੱਤੇ textbook ਦਾ ਇੱਕ example ਕਰੀਏ?",
+    doubtCheckSay: "ਸਮਝ ਆਇਆ, ਜਾਂ ਹੋਰ detail ਵਿੱਚ ਵੇਖੀਏ?",
+    boardQuestionText: "ਅਗਲਾ: angle of reflection ਕਿੰਨਾ?",
+  },
+  "od-IN": {
+    name: "Odia (Odia script)",
+    sayLang: "od-IN",
+    openerSay: "ଠିକ ଅଛି, ଏହାକୁ board ରେ ଦେଖିବା।",
+    exampleFirst: "ଚାଲ, ଏହାକୁ pizza ଦ୍ୱାରା ବୁଝିବା।",
+    textbookOfferSay: "ବୁଝିଲ? ଏଥିପାଇଁ textbook ର ଗୋଟିଏ example କରିବା?",
+    doubtCheckSay: "ବୁଝିଲ, କିମ୍ବା ଆଉ detail ରେ ଦେଖିବା?",
+    boardQuestionText: "ପରବର୍ତ୍ତୀ: angle of reflection କେତେ?",
+  },
+};
+
+/**
+ * The output-register rule for the student's chosen session language. The
+ * dashboard code is the single source of truth; the model never falls back to
+ * "mirror the student". Unknown codes degrade to English so the prompt still
+ * compiles — the picker only emits known codes.
+ */
+function languageRule(code: string): LanguageRule {
+  if (code === "en" || code === "en-IN" || code === "hi-IN") return LANGUAGE_RULES[code];
+  const r = REGIONAL_RULES[code];
+  if (!r) return LANGUAGE_RULES.en; // unknown code — safest default
+  return {
+    name: r.name,
+    scriptNote: ` — ${r.name.split(" (")[1]?.replace(")", "") ?? "native script"} only`,
+    scriptLock:
+      "NEVER use any other script. Write every word in the native script above. English technical terms may stay in Latin letters.",
+    technicalTerms:
+      "Technical terms may stay in English in their Latin form (\"velocity\", \"numerator\", \"atom\") — do NOT transliterate them.",
+    sayLang: r.sayLang,
+    exampleBeats: `{"say":"${r.exampleFirst}","lang":"${r.sayLang}","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}`,
+    openerSay: r.openerSay,
+    formulaReading: `read numbers and operators naturally in ${r.name.split(" (")[0]}, keep technical terms in English`,
+    textbookOfferSay: r.textbookOfferSay,
+    boardQuestionText: r.boardQuestionText,
+    doubtCheckSay: r.doubtCheckSay,
+  };
 }

@@ -43,7 +43,18 @@ type Structure = {
 type Index = { meta: Meta; chunks: Chunk[]; vectors: Float32Array; bm25: Bm25; structure: Structure | null };
 
 const INDEX_DIR = process.env.RAG_INDEX_DIR || path.join(process.cwd(), "rag", "data", "index");
+// Per-mode retrieval depth. The planner designs the whole lesson in one shot and
+// benefits from seeing more of the chapter (outline + several related chunks);
+// a teach step is one idea and K=3 keeps it focused; a doubt is narrow but may
+// touch two sub-topics. ask/explain reuse the default.
 const TOP_K = Number(process.env.RAG_TOP_K || 3);
+const TOP_K_BY_MODE: Record<string, number> = {
+  plan: Number(process.env.RAG_TOP_K_PLAN || 7),
+  teach: Number(process.env.RAG_TOP_K_TEACH || 3),
+  doubt: Number(process.env.RAG_TOP_K_DOUBT || 5),
+  explain: Number(process.env.RAG_TOP_K_EXPLAIN || TOP_K),
+  ask: Number(process.env.RAG_TOP_K_ASK || TOP_K),
+};
 const CANDIDATES = 30;
 const RRF_K = 60;
 // BM25 cannot match an English question to Devanagari text (or vice versa); weight it
@@ -346,6 +357,7 @@ const DEVANAGARI = /[ऀ-ॿ]/g;
 export async function retrieveTextbookContext(
   book: string,
   messages: HistoryMessage[],
+  opts?: { mode?: string },
 ): Promise<{ edition: string; passages: Passage[] }> {
   const userTurns = messages.filter((m) => m.role === "user").map((m) => m.text.trim());
   let query = userTurns.at(-1) ?? "";
@@ -353,6 +365,7 @@ export async function retrieveTextbookContext(
   if (query.split(/\s+/).length < 6 && userTurns.length > 1) query = `${userTurns.at(-2)} ${query}`;
   if (!query.trim()) return { edition: "", passages: [] };
 
+  const k = (opts?.mode && TOP_K_BY_MODE[opts.mode]) || TOP_K;
   const letters = query.match(/\p{L}/gu)?.length ?? 0;
   const hindi = letters > 0 && (query.match(DEVANAGARI)?.length ?? 0) / letters >= 0.3;
   for (const edition of hindi ? ["hindi", "english"] : ["english", "hindi"]) {
@@ -362,8 +375,8 @@ export async function retrieveTextbookContext(
     // chapter 1", "theorem 1.2", "exercise 1.1 q3", "section 8.2", "page 45"), return
     // exactly it and skip the embedding call. Otherwise fall back to hybrid semantic.
     const structural = resolveStructural(index, query);
-    const base = structural.length > 0 ? structural : await search(index, query, TOP_K);
-    return { edition, passages: addChapterFraming(index, query, base, structural.length > 0) };
+    const base = structural.length > 0 ? structural : await search(index, query, k);
+    return { edition, passages: addChapterFraming(index, query, base, structural.length > 0, k) };
   }
   return { edition: "", passages: [] };
 }
@@ -374,7 +387,7 @@ export async function retrieveTextbookContext(
  * student is OPENING a topic rather than naming a specific unit — the Introduction
  * section (the book's motivating analogy / hook for how to start the topic).
  */
-function addChapterFraming(index: Index, query: string, base: Passage[], structural: boolean): Passage[] {
+function addChapterFraming(index: Index, query: string, base: Passage[], structural: boolean, k = TOP_K): Passage[] {
   const ch = dominantChapter(base);
   const outline = ch ? index.structure?.outlines?.[ch] : undefined;
   if (!outline) return base;
@@ -388,6 +401,6 @@ function addChapterFraming(index: Index, query: string, base: Passage[], structu
     const intro = sections.find((s) => /introduction/i.test(s.title)) ?? sections[0];
     if (intro) framing.push({ label: `Chapter ${ch} · ${intro.title}`, pages: [intro.pdfPage, intro.pdfPage], kind: "section", text: intro.intro });
   }
-  const limit = TOP_K + framing.length;
+  const limit = k + framing.length;
   return [...framing, ...base].slice(0, limit);
 }

@@ -316,6 +316,12 @@ export const LessonStepSchema = z.object({
   title: z.string().describe("Short title of this step, e.g. 'Opening analogy' or 'Derive the quadratic formula'."),
   teach: z.string().default("").describe("What to explain in this step, in a sentence or two."),
   draw: z.string().default("").describe("What the board should show for this step (a hint, not literal ops)."),
+  roadmap: z
+    .string()
+    .default("")
+    .describe(
+      "One short line Indica SPEAKS up front to preview this step, in the student's language (e.g. 'First we'll see why a fraction is just a share of something'). Not the teaching itself — the promise of it.",
+    ),
 });
 export type LessonStep = z.infer<typeof LessonStepSchema>;
 
@@ -323,6 +329,12 @@ export type LessonStep = z.infer<typeof LessonStepSchema>;
 export const LessonPlanSchema = z.object({
   topic: z.string().default("").describe("The topic being taught."),
   level: z.string().default("").describe("Pitch/pace chosen from the student's stated familiarity."),
+  intro: z
+    .string()
+    .default("")
+    .describe(
+      "One short line Indica SPEAKS before the roadmap, in the student's language (e.g. \"Great — here's how we'll learn this together\").",
+    ),
   steps: z.array(LessonStepSchema).default([]),
 });
 export type LessonPlan = z.infer<typeof LessonPlanSchema>;
@@ -331,7 +343,7 @@ export type LessonPlan = z.infer<typeof LessonPlanSchema>;
  * What the current turn is for. The client drives a small state machine:
  *   plan    -> design the lesson (Ultra), no beats, returns a `plan` event
  *   teach   -> teach one plan step as beats (Ultra), guided by `plan` + `step`
- *   doubt   -> answer a conceptual question as beats (Groq), drawn on a side canvas
+ *   doubt   -> answer a conceptual question as beats (fast doubt model), drawn on its own page
  *   explain -> work a specific textbook item (example/exercise/theorem) the student
  *              named, as beats (Ultra), drawn on the MAIN canvas like normal teaching
  *   ask     -> legacy single-turn behaviour (no plan); the original tutor loop
@@ -345,8 +357,8 @@ export const TutorRequestSchema = z.object({
   canvas: z.string().default(""),
   /** Session language, BCP-47 (en-IN, hi-IN, ...). */
   language: z.string().default("en-IN"),
-  /** NCERT class 1-12 the student picked, or null if not chosen yet. */
-  grade: z.number().int().min(1).max(12).nullish(),
+  /** NCERT class 1-10 the student picked, or null if not chosen yet. */
+  grade: z.number().int().min(1).max(10).nullish(),
   /** Subject the student picked. Values mirror SUBJECTS in lib/curriculum. */
   subject: z.enum(["maths", "science"]).nullish(),
   /** Free text about the student: "Class 10, CBSE, weak in algebra". */
@@ -365,6 +377,10 @@ export type TutorRequest = z.infer<typeof TutorRequestSchema>;
 /** NDJSON events streamed from /api/tutor to the browser. */
 export type TutorEvent =
   | { type: "meta"; model: string; sources?: string[] }
+  /** Plan mode, incremental: one step as soon as the planner finishes writing it,
+   *  so the waiting screen fills with the real roadmap instead of a spinner. The
+   *  authoritative plan still arrives as a single `plan` event at the end. */
+  | { type: "planstep"; index: number; step: LessonStep }
   | { type: "plan"; plan: LessonPlan }
   | { type: "beat"; beat: Beat }
   | { type: "done" }

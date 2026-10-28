@@ -68,6 +68,15 @@ body {
   display: none !important;
 }
 
+/* Excalidraw's own "Scroll back to content" button. It cannot do the right
+   thing here: it frames the bounding box of the WHOLE book, which lands between
+   pages (usually near the plan), and it writes the viewport itself rather than
+   going through the player. BoardPager renders the button under this same name,
+   and takes the student back to the page Indica is actually writing on. */
+.excalidraw .scroll-back-to-content {
+  display: none !important;
+}
+
 /* Slim, quiet scrollbars (chat panel, captions). */
 * {
   scrollbar-width: thin;
@@ -91,4 +100,110 @@ body {
 /* Brand-tinted text selection. */
 ::selection {
   background: rgba(252, 211, 77, 0.45);
+}
+
+/* ── Doubt mode ──────────────────────────────────────────────────────────────
+   While a doubt is being answered the whole viewport is framed in a glowing
+   orange-red rule, with the mode named on the top edge — the frame breaks around
+   the label so the words sit *in* the line rather than on top of it. Purely
+   decorative and click-through; the state it reports is `lessonPhase === "doubt"`. */
+.doubt-frame {
+  --doubt-ink: #e03e22;
+  --doubt-ink-soft: #f97316;
+  --doubt-halo: rgba(234, 88, 12, 0.5);
+  position: fixed;
+  inset: 13px;
+  z-index: 60;
+  pointer-events: none;
+  animation: doubt-frame-in 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* Radiance: light bleeding inwards off the rule, breathing slowly. */
+.doubt-frame::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: 12px;
+  box-shadow:
+    inset 0 0 42px 2px rgba(234, 88, 12, 0.17),
+    inset 0 0 120px 10px rgba(234, 88, 12, 0.07);
+  animation: doubt-breathe 3.4s ease-in-out infinite;
+}
+
+/* The rule itself, in five pieces: the top edge is split so the label can sit
+   in the gap, the other three edges are single bars. Medium weight — 5px. */
+.doubt-frame i {
+  position: absolute;
+  display: block;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--doubt-ink-soft), var(--doubt-ink) 22%, var(--doubt-ink) 78%, var(--doubt-ink-soft));
+  box-shadow:
+    0 0 9px 0 var(--doubt-halo),
+    0 0 26px 2px rgba(234, 88, 12, 0.3);
+  animation: doubt-breathe 3.4s ease-in-out infinite;
+}
+.doubt-frame .edge-l,
+.doubt-frame .edge-r {
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  background: linear-gradient(180deg, var(--doubt-ink-soft), var(--doubt-ink) 22%, var(--doubt-ink) 78%, var(--doubt-ink-soft));
+}
+.doubt-frame .edge-l { left: 0; }
+.doubt-frame .edge-r { right: 0; }
+.doubt-frame .edge-b { left: 0; right: 0; bottom: 0; height: 5px; }
+
+/* Top edge + label, laid out as one row so the gap tracks the label's width. */
+.doubt-frame header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 5px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.doubt-frame header i {
+  position: static;
+  height: 5px;
+  flex: 1 1 0;
+}
+.doubt-frame b {
+  flex: 0 0 auto;
+  font-family: Excalifont, "Segoe Print", var(--font-display), cursive;
+  font-weight: 400;
+  font-size: 17px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  color: var(--doubt-ink);
+  text-shadow:
+    0 0 10px rgba(234, 88, 12, 0.45),
+    0 0 22px rgba(234, 88, 12, 0.22);
+  animation: doubt-breathe 3.4s ease-in-out infinite;
+}
+
+@media (max-width: 767px) {
+  .doubt-frame { inset: 10px; }
+  .doubt-frame b { font-size: 15px; }
+  .doubt-frame header { gap: 10px; }
+}
+
+@keyframes doubt-frame-in {
+  from { opacity: 0; transform: scale(1.012); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes doubt-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.74; }
+}
+
+/* Motion-sensitive students get the frame without the pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .doubt-frame,
+  .doubt-frame::after,
+  .doubt-frame i,
+  .doubt-frame b {
+    animation: none;
+  }
 }

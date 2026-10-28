@@ -89,10 +89,36 @@ The API supports more than a single “answer me” turn (`mode` on the request)
 | Mode | Role |
 | --- | --- |
 | `ask` | Legacy single-turn explain (also used by `LLM_PROVIDER=mock`) |
-| `plan` | Design a short lesson plan (heavier / lesson model) |
-| `teach` | Teach one step of the plan on the board |
+| `plan` | Design the lesson, **thinking on** — runs once, streams a `planstep` per step as it is written, then the whole `plan` |
+| `teach` | Teach one step of the plan on the board, **thinking off** — has to come back in seconds |
 | `explain` | Work a named textbook item with grounding |
 | `doubt` | Fast answer to an interruption / conceptual doubt (prefer Groq) |
+
+### How a lesson is paced
+
+A lesson is one long turn, pipelined so the student never hears silence
+(`runLesson` in [`src/components/Tutor.tsx`](src/components/Tutor.tsx)):
+
+1. The student answers the familiarity question. Indica immediately speaks local
+   filler lines (`PLANNING_LINES`) while the planner thinks, and the board shows
+   the plan filling in step by step.
+2. The plan arrives. Indica speaks its roadmap — one line per step, written by the
+   planner — and writes the step titles up as a contents page. No model call:
+   those beats are built from the plan on the client.
+3. Step 1 is requested the moment the roadmap starts speaking, so the roadmap is
+   what hides its latency. From then on step *i+1* is generated while step *i* is
+   still being spoken, one step ahead and no further (`LOOKAHEAD_STEPS`).
+
+Two things make the overlap safe. Every step gets a **fresh page of its own**
+(`beginTeachTurn({ newPage: true })`), so a step can be asked for without knowing
+what the previous one drew. And beats wait in a queue with their speech already
+fetched, so what has been generated and what has been *said* are deliberately
+different places in the lesson — the request history follows the former, the
+transcript and the board follow the latter.
+
+Everything Indica says is paced by `TTS_PACE` (default 0.9): slow enough for a
+student to follow a new idea on a board, which is also what gives generation its
+head start.
 
 Pedagogy lives mainly in [`src/lib/prompt.ts`](src/lib/prompt.ts): diagnose → draw → ask; mirror the student’s language; use Indian contexts; avoid dumping the full answer at once.
 

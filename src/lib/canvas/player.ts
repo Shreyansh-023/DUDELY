@@ -4,7 +4,6 @@ import {
   CaptureUpdateAction,
   convertToExcalidrawElements,
   getCommonBounds,
-  getVisibleSceneBounds,
   newElementWith,
 } from "@excalidraw/excalidraw";
 import type {
@@ -13,11 +12,61 @@ import type {
   ExcalidrawTextElement,
   OrderedExcalidrawElement,
 } from "@excalidraw/excalidraw/element/types";
-import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
+import type { ExcalidrawImperativeAPI, NormalizedZoomValue } from "@excalidraw/excalidraw/types";
 import type { DrawOp } from "../schema";
 import { clamp, sleep } from "../utils";
-import { opToSkeleton } from "./ops";
-import { PRIMITIVES } from "./primitives";
+import { isPermanentNote, opToSkeleton, type TutorMeta } from "./ops";
+import {
+  CLEARANCE,
+  CONTENT_BOTTOM,
+  CONTENT_TOP,
+  FIT_MARGIN,
+  MIN_TURN_ROOM,
+  PAGE_H,
+  PAGE_W,
+  TWEEN_MS,
+  cellAtScene,
+  cellRect,
+  fitPage,
+  pageRect,
+  type Cell,
+  type PageFrame,
+  type PageKind,
+  type Rect,
+} from "./page";
+import { PRIMITIVES, type Expanded } from "./primitives";
+
+/** One page of the board, plus the bookkeeping the UI and the spill test need.
+ *  `Cell` is where it sits on the sheet; `index` is only the order it was
+ *  allocated in. */
+type Page = Rect &
+  Cell & {
+    /** Allocation order. This is what `customData.page` tags and what the
+     *  "Page N of M" header counts; the geometry is (row, col). */
+    index: number;
+    kind: PageKind;
+    /** At least one permanent element has been committed here. */
+    used: boolean;
+    /** Lowest occupied PAGE-LOCAL y; CONTENT_TOP while empty. */
+    bottom: number;
+    /** Bumps on every commit to this page — the thumbnail cache key. */
+    rev: number;
+    /** turn -> every element id it created here, so dropTurn can wipe a turn. */
+    turnIds: Map<number, Set<string>>;
+  };
+
+export type PageInfo = Cell & { index: number; kind: PageKind; used: boolean; rev: number };
+/** `pages` is in ALLOCATION order; reading order is by row, then col — which is
+ *  what puts a step's doubts straight after the step. See BoardPager. */
+export type PageSnapshot = {
+  pages: readonly PageInfo[];
+  /** Page Indica is writing on; -1 before the first permanent element. */
+  activeIndex: number;
+  /** Page the camera is framing; -1 before the first frame. */
+  viewIndex: number;
+  /** False while the student is reading a page other than activeIndex. */
+  follow: boolean;
+};
 
 /**
  * Plays draw ops onto a live Excalidraw scene with a "hand-drawn" feel:
@@ -28,6 +77,8 @@ import { PRIMITIVES } from "./primitives";
 export class BoardPlayer {
   /** LLM-chosen id -> actual element id in the scene. */
   private idMap = new Map<string, string>();
+  /** Every scene id ever handed out, so one is never issued twice. See resolveId. */
+  private minted = new Set<string>();
   /** The turn currently being drawn, so "jump to Guru" knows where to look. */
   private currentTurn = 0;
   /** The last turn we auto-recentered on, so we jump once at the start of each turn. */
@@ -41,75 +92,497 @@ export class BoardPlayer {
   /** Pending fade-out timers for transient annotations, cancelled on clear. */
   private ephemeralTimers = new Set<ReturnType<typeof setTimeout>>();
   /**
-   * Slide/paging: the model draws every turn in a PAGE-LOCAL frame (top-left ≈
-   * 80,80). The player shifts each turn's content down by `pageShiftY` so turns
-   * stack as "pages" on the infinite canvas and never pile up on each other. The
-   * matching summary reports existing content in the same page-local frame.
+   * Paging: the board is a column of fixed PAGE_W x PAGE_H pages rather than one
+   * endless surface. The model always draws in PAGE-LOCAL coordinates and the
+   * player adds the page origin at draw time, so a page is simply a rect in
+   * scene space that the camera frames exactly.
+   *
+   * Pages are allocated LAZILY — only when a beat actually commits a permanent
+   * element — so the planner turn, the familiarity question and a doubt that
+   * comes back as prose with no drawing can never mint a blank page the student
+   * then has to scroll past.
    */
-  private pageShiftY = 0;
-  private static PAGE_TOP = 80;
-  private static PAGE_GAP = 110;
-  /**
-   * Doubt "side canvas": while answering a doubt the player shifts that turn's
-   * content to the RIGHT of everything else (pageShiftX) instead of below it, so
-   * the quick side-note never disturbs the main lesson flow. Its elements are
-   * tracked so `clearSide` can wipe just the doubt when the student moves on.
-   */
-  private pageShiftX = 0;
-  private sideMode = false;
-  private sideIds = new Set<string>();
-  private static SIDE_GAP = 140;
+  private pages: Page[] = [];
+  /** Where the NEXT content lands. Valid before the page exists (== pages.length). */
+  private plannedIndex = 0;
+  /** The grid cell that planned page occupies — the geometry `plannedIndex`
+   *  alone can no longer give, now that doubts sit beside the lesson. */
+  private plannedCell: Cell = { row: 0, col: 0 };
+  private plannedKind: PageKind = "teach";
+  private activeIndex = -1;
+  /** The teaching page to continue, and to return to after a doubt. */
+  private teachIndex = -1;
+  /** teachIndex captured at the FIRST doubt of a run of them. */
+  private returnIndex = -1;
+  private framedIndex = -1;
+  private doubtMode = false;
+  /** Re-anchors a beat at the top of a fresh page after a mid-turn spill. */
+  private pageAnchorDy = 0;
+  /** False while the student is reading a page other than the one being written. */
+  private follow = true;
+  private tween: number | null = null;
+  /** The last viewport we wrote, so a student pan can be told from our own tween. */
+  private lastWrote: { scrollX: number; scrollY: number; zoom: number } | null = null;
+  private listeners = new Set<() => void>();
+  private snapshot: PageSnapshot = { pages: [], activeIndex: -1, viewIndex: -1, follow: true };
+  /** Primitives are expanded once per op: the fit test and the draw share this. */
+  private expandCache = new WeakMap<object, Expanded>();
 
   constructor(private api: ExcalidrawImperativeAPI) {}
 
-  /** How far the current turn's page-local coordinates are shifted down the canvas. */
-  get pageShift(): number {
-    return this.pageShiftY;
-  }
+  // --- write-cursor intent -------------------------------------------------
+  // These say where the NEXT content goes. They allocate nothing and touch no
+  // scene state, so Tutor can call them synchronously before the fetch and then
+  // summarise the very page the model is about to draw on.
 
   /**
-   * Begin a doubt answer: place this turn's content on a side canvas to the RIGHT
-   * of everything drawn so far, and let transient pointing arrows linger longer (a
-   * doubt is read more slowly than a teaching aside). Keeps the vertical position
-   * so the side-note sits beside the current lesson page, not below it.
+   * Begin a teaching turn. Continues the current teaching page while it still
+   * has room, otherwise starts a fresh page on a NEW ROW at the head of the
+   * teaching column — which is what keeps the lesson running straight down one
+   * column and never into a doubt's page beside it.
+   * `stayOnPage` keeps the reply beside work the student just drew.
+   *
+   * `newPage` forces a fresh page even when the current one has room. The staged
+   * lesson uses it to give every plan step a page of its own: one page, one idea,
+   * and — the reason it exists — a step's page state no longer depends on what
+   * the previous step drew, so the next step can be generated while this one is
+   * still being drawn without being told the wrong amount of room.
    */
-  beginSide() {
-    const els = this.all().filter((e) => !e.isDeleted && e.width >= 0 && e.height >= 0);
-    const right = els.length ? Math.max(...els.map((e) => e.x + e.width)) : 1000;
-    this.pageShiftX = Math.max(0, right + BoardPlayer.SIDE_GAP - BoardPlayer.PAGE_TOP);
-    this.sideMode = true;
-    this.ephemeralLingerMs = BoardPlayer.SIDE_LINGER_MS;
-  }
-
-  /** Wipe just the doubt's side canvas and return to the main lesson flow. */
-  clearSide() {
-    if (this.sideIds.size) this.deleteIds(new Set(this.sideIds));
-    this.sideIds.clear();
-    this.pageShiftX = 0;
-    this.sideMode = false;
+  beginTeachTurn(opts?: { stayOnPage?: boolean; newPage?: boolean }) {
+    this.doubtMode = false;
+    this.plannedKind = "teach";
+    this.pageAnchorDy = 0;
     this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
-  }
-
-  /** True while a doubt is being answered on the side canvas. */
-  get inSideMode(): boolean {
-    return this.sideMode;
-  }
-
-  /**
-   * Start a new page for the next turn. Normally advances to a fresh band just
-   * below everything drawn so far, so each turn gets its own clean page. When the
-   * student has just drawn something (`stayOnPage`), we keep the current page so
-   * the reply lands next to their work instead of jumping away.
-   */
-  advancePage(stayOnPage: boolean) {
-    if (stayOnPage) return;
-    const els = this.all().filter((e) => !e.isDeleted && e.width >= 0 && e.height >= 0);
-    if (!els.length) {
-      this.pageShiftY = 0;
+    if (opts?.stayOnPage && this.activeIndex >= 0) {
+      this.planAt(this.pages[this.activeIndex]);
+      this.emit();
       return;
     }
-    const bottom = Math.max(...els.map((e) => e.y + e.height));
-    this.pageShiftY = Math.max(0, bottom + BoardPlayer.PAGE_GAP - BoardPlayer.PAGE_TOP);
+    if (opts?.newPage) {
+      this.planAt(this.freshTeachSlot());
+      this.emit();
+      return;
+    }
+    const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
+    this.planAt(
+      cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_TURN_ROOM ? cur : this.freshTeachSlot(),
+    );
+    this.emit();
+  }
+
+  /**
+   * Begin a doubt answer on its own new page, placed in the same row as the
+   * lesson page it interrupts and one column to its right — a neighbour, so the
+   * quick side-note never breaks the teaching column and the way back is one
+   * step left onto the page the lesson paused on.
+   *
+   * Transient pointing arrows linger longer here: a confused student re-reads a
+   * pointer more slowly than a teaching aside.
+   */
+  beginDoubtTurn() {
+    this.pageAnchorDy = 0;
+    if (!this.doubtMode) this.returnIndex = this.teachIndex; // only the FIRST doubt sets the way back
+    this.doubtMode = true;
+    this.plannedKind = "doubt";
+    this.planAt(this.freshDoubtSlot());
+    this.ephemeralLingerMs = BoardPlayer.SIDE_LINGER_MS;
+    this.emit();
+  }
+
+  /**
+   * The doubt is cleared. The doubt page is KEPT — it holds an answer the
+   * student may want to look back at — and both the camera and the write cursor
+   * step back left onto the lesson page, which still holds everything taught
+   * before the doubt and is where teaching carries on.
+   */
+  endDoubt() {
+    this.doubtMode = false;
+    this.plannedKind = "teach";
+    this.pageAnchorDy = 0;
+    this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
+    const back = this.returnIndex;
+    this.returnIndex = -1;
+    const home = back >= 0 ? this.pages[back] : undefined;
+    if (home) {
+      this.planAt(home);
+      this.teachIndex = home.index;
+      this.activeIndex = home.index;
+      this.follow = true;
+      this.showPage(home.index, { animate: true }); // emits
+    } else {
+      this.planAt(this.freshTeachSlot());
+      this.follow = true;
+      this.emit();
+    }
+  }
+
+  /** Point the write cursor at a cell — an existing page, or a slot for one. */
+  private planAt(slot: { index: number; row: number; col: number } | undefined) {
+    if (!slot) return;
+    this.plannedIndex = slot.index;
+    this.plannedCell = { row: slot.row, col: slot.col };
+  }
+
+  /** The lowest row any page occupies; -1 while the book is empty. */
+  private lastRow(): number {
+    let row = -1;
+    for (const p of this.pages) row = Math.max(row, p.row);
+    return row;
+  }
+
+  /**
+   * The cell a fresh TEACHING page takes: a new row at the head of column 0.
+   *
+   * The CURRENT teaching page is reused instead when nothing is on it — which
+   * is what a step interrupted by a doubt leaves behind once its half-drawn
+   * beat has been dropped. That reuse is the one thing that makes the lesson
+   * carry on where it paused: it is keyed on the teaching page rather than on
+   * the last page in the book, which after a doubt is the doubt's own page.
+   */
+  private freshTeachSlot(): { index: number; row: number; col: number } {
+    const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
+    if (cur && cur.kind === "teach" && !cur.used) return cur;
+    return { index: this.pages.length, row: this.lastRow() + 1, col: 0 };
+  }
+
+  /**
+   * The cell a doubt answer takes: the SAME ROW as the lesson page it
+   * interrupts, one column further right. The teaching column stays unbroken,
+   * and the way back from a doubt is one step left onto the very page the
+   * lesson paused on.
+   */
+  private freshDoubtSlot(): { index: number; row: number; col: number } {
+    const anchor = this.pages[this.teachIndex] ?? this.pages[this.activeIndex];
+    const row = anchor ? anchor.row : 0;
+    // Reuse only a doubt page in this row nothing was ever drawn on (a doubt
+    // that came back as prose); every answered doubt gets a page of its own.
+    const spare = this.pages.find((p) => p.kind === "doubt" && p.row === row && !p.used);
+    if (spare) return spare;
+    let col = 0;
+    for (const p of this.pages) if (p.row === row) col = Math.max(col, p.col);
+    return { index: this.pages.length, row, col: col + 1 };
+  }
+
+  /** The page the model is about to draw on, as the summary and prompt describe it. */
+  pageFrame(): PageFrame {
+    if (this.plannedIndex > this.pages.length) this.plannedIndex = this.pages.length;
+    const index = this.plannedIndex;
+    const { row, col } = this.pages[index] ?? this.plannedCell;
+    return {
+      ...cellRect(row, col),
+      row,
+      col,
+      index,
+      count: Math.max(this.pages.length, index + 1),
+      kind: this.plannedKind,
+    };
+  }
+
+  /** True while a doubt is being answered. */
+  get inDoubtMode(): boolean {
+    return this.doubtMode;
+  }
+
+  /** Pages drawn so far. */
+  get pageCount(): number {
+    return this.pages.length;
+  }
+
+  /**
+   * The page `beginTeachTurn({ newPage: true })` would start on. The staged
+   * lesson reads it to describe the page a step will own while that step is
+   * still being generated. See `freshTeachSlot` for the reuse rule.
+   */
+  nextTeachPage(): number {
+    return this.freshTeachSlot().index;
+  }
+
+  // --- React bridge --------------------------------------------------------
+
+  subscribe(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => {
+      this.listeners.delete(fn);
+    };
+  }
+
+  /** The CACHED snapshot. Never rebuild here: useSyncExternalStore would loop. */
+  getPageState(): PageSnapshot {
+    return this.snapshot;
+  }
+
+  private emit() {
+    this.snapshot = {
+      pages: this.pages.map((p) => ({
+        index: p.index,
+        row: p.row,
+        col: p.col,
+        kind: p.kind,
+        used: p.used,
+        rev: p.rev,
+      })),
+      activeIndex: this.activeIndex,
+      viewIndex: this.framedIndex,
+      follow: this.follow,
+    };
+    for (const fn of this.listeners) fn();
+  }
+
+  // --- allocation and bookkeeping -----------------------------------------
+
+  private ensurePage(): Page {
+    if (this.plannedIndex > this.pages.length) this.plannedIndex = this.pages.length;
+    let p = this.pages[this.plannedIndex];
+    if (!p) {
+      const { row, col } = this.plannedCell;
+      p = {
+        ...cellRect(row, col),
+        row,
+        col,
+        index: this.pages.length,
+        kind: this.plannedKind,
+        used: false,
+        bottom: CONTENT_TOP,
+        rev: 0,
+        turnIds: new Map(),
+      };
+      this.pages.push(p);
+      this.plannedIndex = p.index;
+    }
+    this.activeIndex = p.index;
+    if (p.kind === "teach") this.teachIndex = p.index;
+    return p;
+  }
+
+  /** A fresh page of `kind` for a beat that spilled off the one it started on:
+   *  teaching carries on down its column, a doubt along its row. */
+  private appendPage(kind: PageKind): Page {
+    this.plannedKind = kind;
+    this.planAt(kind === "doubt" ? this.freshDoubtSlot() : { index: this.pages.length, row: this.lastRow() + 1, col: 0 });
+    return this.ensurePage();
+  }
+
+  private recordOnPage(i: number, turn: number, created: ExcalidrawElement[]) {
+    const p = this.pages[i];
+    if (!p) return;
+    let ids = p.turnIds.get(turn);
+    if (!ids) {
+      ids = new Set();
+      p.turnIds.set(turn, ids);
+    }
+    for (const e of created) ids.add(e.id);
+    const keep = created.filter((e) => isPermanentNote(e));
+    if (keep.length) {
+      // Post-collision committed bounds: where the content actually landed.
+      const [, , , y2] = getCommonBounds(keep);
+      p.bottom = Math.max(p.bottom, y2 - p.y);
+      p.used = true;
+    }
+    p.rev++;
+    this.emit();
+  }
+
+  /**
+   * Erase the elements one BEAT drew. A doubt can land in the middle of a beat,
+   * and that beat is spoken again from its start when the lesson resumes — so
+   * its half-drawn fragment has to come off the page first. Everything else the
+   * step drew stays exactly where the student left it, which is what lets the
+   * lesson carry on down the same page instead of starting over on a new one.
+   */
+  dropElements(ids: readonly string[]) {
+    if (!ids.length) return;
+    const set = new Set(ids);
+    for (const p of this.pages) for (const s of p.turnIds.values()) for (const id of set) s.delete(id);
+    this.deleteIds(set, true);
+    for (const id of set) this.minted.delete(id);
+    this.recomputePages();
+    // The replay lays the beat out again from the model's own coordinates, so
+    // neither the collision shift the abandoned attempt accumulated nor the page
+    // it had spilled onto may carry over into it.
+    this.turnShift = { turn: 0, dx: 0, dy: 0 };
+    this.pageAnchorDy = 0;
+    this.emit();
+  }
+
+  /**
+   * Erase everything one turn drew. Used when a step has to be taught again from
+   * the top (the model never finished it) — without this its half-drawn fragment
+   * would be left under the replay.
+   */
+  dropTurn(turn: number) {
+    const ids = new Set<string>();
+    for (const p of this.pages) {
+      const s = p.turnIds.get(turn);
+      if (s) {
+        for (const id of s) ids.add(id);
+        p.turnIds.delete(turn);
+      }
+    }
+    if (!ids.size) return;
+    this.deleteIds(ids);
+    this.recomputePages();
+    this.emit();
+  }
+
+  /** Re-derive every page's occupancy from what is actually left on the board. */
+  private recomputePages() {
+    const live = this.all().filter((e) => !e.isDeleted && isPermanentNote(e));
+    for (const p of this.pages) {
+      const mine = live.filter((e) => (e.customData as TutorMeta | undefined)?.page === p.index);
+      if (!mine.length) {
+        p.used = false;
+        p.bottom = CONTENT_TOP;
+      } else {
+        const [, , , y2] = getCommonBounds(mine);
+        p.used = true;
+        p.bottom = Math.max(CONTENT_TOP, y2 - p.y);
+      }
+      p.rev++;
+    }
+  }
+
+  /** Back to an empty book. Shared by the `clear` op and clearAll(). */
+  private resetPages() {
+    this.pages = [];
+    this.plannedIndex = 0;
+    this.plannedCell = { row: 0, col: 0 };
+    this.plannedKind = "teach";
+    this.activeIndex = -1;
+    this.teachIndex = -1;
+    this.returnIndex = -1;
+    this.framedIndex = -1;
+    this.doubtMode = false;
+    this.pageAnchorDy = 0;
+    this.follow = true;
+    this.recenteredTurn = 0; // so the next beat takes the re-frame branch
+    this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
+    this.expandCache = new WeakMap();
+    this.emit();
+    this.showPage(0, { animate: false });
+  }
+
+  /** This page's permanent content, for a thumbnail. */
+  pageElements(index: number): readonly ExcalidrawElement[] {
+    return this.all().filter((e) => {
+      const m = e.customData as TutorMeta | undefined;
+      return !e.isDeleted && !m?.temp && m?.page === index;
+    });
+  }
+
+  pageSceneRect(index: number): Rect {
+    const p = this.pages[index];
+    return p ? { x: p.x, y: p.y, w: p.w, h: p.h } : pageRect(index);
+  }
+
+  // --- camera --------------------------------------------------------------
+  //
+  // Excalidraw's own scrollToContent / zoomToFitBounds floor the zoom to 0.1
+  // steps, which can never frame a page exactly, so we do the maths ourselves
+  // and write scrollX/scrollY/zoom straight onto appState.
+
+  private fitRect(r: Rect) {
+    const { width: W, height: H } = this.api.getAppState();
+    return fitPage(r, W, H);
+  }
+
+  private writeView(v: { scrollX: number; scrollY: number; zoom: number }) {
+    this.lastWrote = v;
+    this.api.updateScene({
+      appState: { scrollX: v.scrollX, scrollY: v.scrollY, zoom: { value: v.zoom as NormalizedZoomValue } },
+      captureUpdate: CaptureUpdateAction.NEVER, // a page turn is not an edit to undo
+    });
+  }
+
+  /** True when the viewport moved from somewhere other than our own last write. */
+  private userMoved(tol = 0.5): boolean {
+    const l = this.lastWrote;
+    if (!l) return false;
+    const s = this.api.getAppState();
+    return (
+      Math.abs(s.scrollX - l.scrollX) > tol ||
+      Math.abs(s.scrollY - l.scrollY) > tol ||
+      Math.abs(s.zoom.value - l.zoom) > 1e-4
+    );
+  }
+
+  /**
+   * Excalidraw's onChange. A viewport we did not write, with no tween in flight
+   * to explain it, means the student grabbed the canvas and is reading
+   * somewhere of their own choosing — so Indica stops dragging the camera after
+   * them and the board's "Scroll back to content" button appears.
+   *
+   * `lastWrote` is then dropped: the viewport is theirs now, not ours, so the
+   * next animated move measures itself against where they left it instead of
+   * mistaking their pan for a grab. The tolerance is slack for the rounding
+   * Excalidraw does to what it stores.
+   */
+  notifyViewport() {
+    if (this.tween != null || !this.lastWrote) return;
+    if (!this.userMoved(2)) return;
+    this.lastWrote = null;
+    if (!this.follow) return;
+    this.follow = false;
+    this.emit();
+  }
+
+  /**
+   * Frame a page. `manual` marks a student-driven move: the camera then stops
+   * following Indica until they come back to the page she is writing on, so
+   * browsing to an earlier page is not undone by the very next beat.
+   */
+  showPage(index: number, opts?: { animate?: boolean; manual?: boolean }) {
+    const to = this.fitRect(this.pageSceneRect(index));
+    if (!to) return;
+    this.framedIndex = index;
+    if (opts?.manual) this.follow = index === this.activeIndex;
+    this.emit();
+    if (this.tween != null) {
+      cancelAnimationFrame(this.tween);
+      this.tween = null;
+    }
+    if (!opts?.animate) {
+      this.writeView(to);
+      return;
+    }
+    const s = this.api.getAppState();
+    const from = { scrollX: s.scrollX, scrollY: s.scrollY, zoom: s.zoom.value };
+    // The grab test below compares the live viewport against our own last
+    // write. This tween starts from wherever the viewport is NOW, so that is
+    // the baseline. Without this line any move we did not make — a student pan,
+    // Excalidraw's own scroll-back button, a resize — reads as a grab on the
+    // very FIRST frame: the camera gives up before it has moved at all and
+    // latches `follow` off, so from then on page turns only change the page
+    // number and Indica writes off-screen for the rest of the session.
+    this.lastWrote = from;
+    const t0 = performance.now();
+    const step = (now: number) => {
+      // The student grabbed the canvas mid-flight: let them have it.
+      if (this.userMoved()) {
+        this.tween = null;
+        this.follow = false;
+        this.emit();
+        return;
+      }
+      const t = Math.min(1, (now - t0) / TWEEN_MS);
+      const e = 1 - Math.pow(1 - t, 3);
+      this.writeView({
+        scrollX: from.scrollX + (to.scrollX - from.scrollX) * e,
+        scrollY: from.scrollY + (to.scrollY - from.scrollY) * e,
+        zoom: from.zoom * Math.pow(to.zoom / from.zoom, e), // geometric, as Excalidraw interpolates
+      });
+      this.tween = t < 1 ? requestAnimationFrame(step) : null;
+    };
+    this.tween = requestAnimationFrame(step);
+  }
+
+  /** Re-frame the current page without animating — after a container resize. */
+  refit() {
+    this.showPage(this.framedIndex >= 0 ? this.framedIndex : 0, { animate: false });
+  }
+
+  /** Jump back to the page Indica is writing on ("Back to Indica"). */
+  recenter() {
+    this.showPage(this.activeIndex >= 0 ? this.activeIndex : 0, { animate: true, manual: true });
   }
 
   private all(): readonly OrderedExcalidrawElement[] {
@@ -125,55 +598,157 @@ export class BoardPlayer {
     this.commit(this.all().map((e) => (e.id === updated.id ? updated : e)));
   }
 
+  /**
+   * A scene id for the model's own id, unique against EVERY id the board has
+   * ever held.
+   *
+   * It used to check only the ids of elements that are not deleted — but
+   * `commit` rebuilds the scene from `getSceneElementsIncludingDeleted()`, so
+   * an id belonging to a soft-deleted element is still in the array. Handing it
+   * out again made `typeText`/`growLine`/`fadeIn` append a SECOND element with
+   * that id, and Excalidraw's fractional-index invariant threw. A doubt made
+   * this routine: `dropElements` deletes the interrupted beat and the replay
+   * immediately asks for its ids back.
+   *
+   * `minted` covers ids handed out earlier in this same beat, which are not in
+   * the scene yet, and ids whose elements have since been purged outright.
+   */
   private resolveId(llmId: string | null | undefined): string {
     const base = (llmId || "el").replace(/[^a-zA-Z0-9_-]/g, "_");
-    const live = new Set(this.all().filter((e) => !e.isDeleted).map((e) => e.id));
+    const taken = new Set(this.all().map((e) => e.id));
     let candidate = base;
     let n = 2;
-    while (live.has(candidate) || this.idMap.has(candidate)) candidate = `${base}_${n++}`;
+    while (taken.has(candidate) || this.minted.has(candidate)) candidate = `${base}_${n++}`;
+    this.minted.add(candidate);
     if (llmId) this.idMap.set(llmId, candidate);
     return candidate;
   }
 
-  private deleteIds(ids: Set<string>) {
-    const next = this.all().map((e) => {
+  /**
+   * Erase elements by id. `purge` drops them from the scene array outright
+   * instead of leaving a tombstone: used for content that is about to be drawn
+   * again, where a tombstone is pure debris — it would pile up one beat per
+   * doubt and keep pushing the replay's ids onto ever longer suffixes.
+   */
+  private deleteIds(ids: Set<string>, purge = false) {
+    const hit = (e: ExcalidrawElement) => {
       const group = (e.customData as { group?: string } | undefined)?.group;
-      const hit =
+      return (
         ids.has(e.id) ||
         (group != null && ids.has(group)) || // erase the whole primitive by its parent id
-        ("containerId" in e && e.containerId != null && ids.has(e.containerId));
-      return hit && !e.isDeleted ? newElementWith(e, { isDeleted: true }) : e;
-    });
-    this.commit(next);
+        ("containerId" in e && e.containerId != null && ids.has(e.containerId))
+      );
+    };
+    this.commit(
+      purge
+        ? this.all().filter((e) => !hit(e))
+        : this.all().map((e) => (hit(e) && !e.isDeleted ? newElementWith(e, { isDeleted: true }) : e)),
+    );
   }
 
-  /** Applies a beat's ops in order. Resolves when all animation is done or the signal aborts. */
+  /**
+   * Applies a beat's ops in order. Resolves when all animation is done or the
+   * signal aborts.
+   *
+   * Before any drawing: work out which page this beat belongs on and frame it.
+   * A beat that would run off the bottom of a used page spills onto a fresh one
+   * of the same kind, re-anchored at that page's top — so a long doubt simply
+   * continues on the next page instead of folding back over its own content.
+   */
   async applyBeat(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
     this.currentTurn = turn;
+    // erase/clear-only beats (and a beat with no draw ops at all) must not
+    // allocate a page or move the camera, or an answer given in words alone
+    // would leave a blank page behind.
+    const drawing = ops.filter((o) => o.op !== "clear" && o.op !== "erase");
+    if (drawing.length) {
+      const page = this.ensurePage();
+      const carried = this.turnShift.turn === turn ? this.turnShift : { dx: 0, dy: 0 };
+      const box = this.measureBeat(drawing, carried);
+      if (box && page.used) {
+        // Collision avoidance will push this beat below what is already here;
+        // model that push, or the beat spills one page later than it should.
+        const push = Math.max(0, page.bottom + CLEARANCE - box.y1);
+        if (box.y2 + push + FIT_MARGIN > CONTENT_BOTTOM) {
+          this.appendPage(page.kind);
+          this.turnShift = { turn, dx: 0, dy: 0 }; // stays page-local
+          this.pageAnchorDy = CONTENT_TOP - box.y1;
+        }
+      }
+      const target = this.pages[this.activeIndex];
+      if (target && this.follow && (target.index !== this.framedIndex || turn !== this.recenteredTurn)) {
+        this.recenteredTurn = turn;
+        this.showPage(target.index, { animate: true }); // navigate, THEN draw
+      }
+    }
     const created: ExcalidrawElement[] = [];
     for (const op of ops) {
       if (signal.aborted) break;
       try {
-        const els = await this.applyOp(op, turn, signal);
-        created.push(...els);
-        // Remember side-canvas elements so a later clearSide() can wipe just the doubt.
-        if (this.sideMode) for (const e of els) this.sideIds.add(e.id);
+        created.push(...(await this.applyOp(op, turn, signal)));
       } catch (err) {
         console.warn("[board] failed op", op, err);
       }
       await sleep(80, signal);
     }
-    if (created.length) {
-      // Jump to the new turn's work area the first time it draws, then just follow
-      // along (only scroll if later beats in the turn spill off-screen).
-      if (turn !== this.recenteredTurn) {
-        this.recenteredTurn = turn;
-        this.recenter();
+    if (created.length) this.recordOnPage(this.activeIndex, turn, created);
+    return created;
+  }
+
+  /** Expand a primitive once and reuse it: the fit test and the draw agree. */
+  private expand(op: DrawOp): Expanded {
+    let e = this.expandCache.get(op as object);
+    if (!e) {
+      e = PRIMITIVES[op.op](op);
+      this.expandCache.set(op as object, e);
+    }
+    return e;
+  }
+
+  /**
+   * The page-local box this beat WOULD occupy, before collision avoidance.
+   * Built from real converted elements rather than measure.ts (which sizes a
+   * stand-in font) or `e.y + e.height` (wrong for an arrow drawn upward).
+   * Transient gestures are skipped: they fade, so they must not force a break.
+   */
+  private measureBeat(
+    ops: DrawOp[],
+    carried: { dx: number; dy: number },
+  ): { x1: number; y1: number; x2: number; y2: number } | null {
+    let x1 = Infinity;
+    let y1 = Infinity;
+    let x2 = -Infinity;
+    let y2 = -Infinity;
+    const add = (ax1: number, ay1: number, ax2: number, ay2: number) => {
+      x1 = Math.min(x1, ax1);
+      y1 = Math.min(y1, ay1);
+      x2 = Math.max(x2, ax2);
+      y2 = Math.max(y2, ay2);
+    };
+    for (const op of ops) {
+      if (op.temp === true) continue;
+      if (op.op === "arrow" && op.temp !== false) continue; // a bare arrow is a pointing gesture
+      if (PRIMITIVES[op.op]) {
+        const ex = this.expand(op);
+        // The declared bbox carries padding the children do not report; the
+        // children are exact where the bbox under-covers. Use both.
+        add(ex.bbox.x, ex.bbox.y, ex.bbox.x + ex.bbox.w, ex.bbox.y + ex.bbox.h);
+        for (const c of ex.ops) this.measureLow(c, add);
       } else {
-        this.ensureVisible(turn);
+        this.measureLow(op, add);
       }
     }
-    return created;
+    if (!Number.isFinite(x1)) return null;
+    return { x1: x1 + carried.dx, y1: y1 + carried.dy, x2: x2 + carried.dx, y2: y2 + carried.dy };
+  }
+
+  private measureLow(op: DrawOp, add: (x1: number, y1: number, x2: number, y2: number) => void) {
+    const skel = opToSkeleton(op, 0, "__measure__");
+    if (!skel) return;
+    const els = convertToExcalidrawElements([skel], { regenerateIds: false });
+    if (!els.length) return;
+    const [x1, y1, x2, y2] = getCommonBounds(els);
+    add(x1, y1, x2, y2);
   }
 
   private async applyOp(op: DrawOp, turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
@@ -182,12 +757,9 @@ export class BoardPlayer {
       const next = this.all().map((e) => (e.isDeleted ? e : newElementWith(e, { isDeleted: true })));
       this.commit(next);
       this.idMap.clear();
+      this.minted.clear();
       this.turnShift = { turn: 0, dx: 0, dy: 0 };
-      this.pageShiftY = 0; // board wiped: the next content starts a fresh first page
-      this.pageShiftX = 0;
-      this.sideMode = false;
-      this.sideIds.clear();
-      this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
+      this.resetPages(); // board wiped: back to a single blank first page
       return [];
     }
     if (op.op === "erase") {
@@ -212,8 +784,13 @@ export class BoardPlayer {
     const ephemeral = op.op === "arrow" ? op.temp !== false : op.temp === true;
     if (ephemeral !== Boolean(op.temp)) op = { ...op, temp: ephemeral };
 
+    const page = this.ensurePage();
+    // The page origin is added HERE and never stored, so turnShift stays
+    // page-local and its clamp keeps measuring the right quantity.
+    const ox = page.x;
+    const oy = page.y + this.pageAnchorDy;
     const elementId = this.resolveId(op.id);
-    const skeleton = opToSkeleton(shiftOp(op, carried.dx + this.pageShiftX, carried.dy + this.pageShiftY), turn, elementId);
+    const skeleton = opToSkeleton(shiftOp(op, carried.dx + ox, carried.dy + oy), turn, elementId, page.index);
     if (!skeleton) return [];
 
     const converted = convertToExcalidrawElements([skeleton], { regenerateIds: false });
@@ -224,12 +801,12 @@ export class BoardPlayer {
     let primary: ExcalidrawElement = converted[0];
     if (primary.type === "text") {
       // Keep free-standing text from landing on top of anything already drawn.
-      const { dx, dy } = this.collisionPush(primary);
+      const { dx, dy } = this.collisionPush(primary, page.index);
       if (dx || dy) primary = newElementWith(primary, { x: primary.x + dx, y: primary.y + dy });
     } else if (op.op === "rect" || op.op === "ellipse" || op.op === "diamond") {
       // Shapes dodge existing content too — and drag the rest of the turn with
       // them, so arrows drawn next still connect where the model expected.
-      const { dx, dy } = this.collisionPush(primary);
+      const { dx, dy } = this.collisionPush(primary, page.index);
       if (dx || dy) {
         primary = newElementWith(primary, { x: primary.x + dx, y: primary.y + dy });
         rest = rest.map((e) => newElementWith(e, { x: e.x + dx, y: e.y + dy }));
@@ -276,28 +853,31 @@ export class BoardPlayer {
     turn: number,
     signal: AbortSignal,
   ): Promise<ExcalidrawElement[]> {
-    const { ops: children, bbox, label } = PRIMITIVES[op.op](op);
+    const page = this.ensurePage();
+    const ox = page.x;
+    const oy = page.y + this.pageAnchorDy;
+    const { ops: children, bbox, label } = this.expand(op);
     // Dodge existing content as a single block (carried = shift from earlier ops
     // this turn). The combined shift is applied to the children, so it works for
     // every primitive — including ones positioned by `points` (polygon), not x/y.
     // We do NOT feed the group's own placement back into turnShift.
     const probe = {
       id: "__group__",
-      x: bbox.x + carried.dx + this.pageShiftX,
-      y: bbox.y + carried.dy + this.pageShiftY,
+      x: bbox.x + carried.dx + ox,
+      y: bbox.y + carried.dy + oy,
       width: bbox.w,
       height: bbox.h,
     } as unknown as ExcalidrawElement;
-    const { dx, dy } = this.collisionPush(probe);
-    const tx = carried.dx + dx + this.pageShiftX;
-    const ty = carried.dy + dy + this.pageShiftY;
+    const { dx, dy } = this.collisionPush(probe, page.index);
+    const tx = carried.dx + dx + ox;
+    const ty = carried.dy + dy + oy;
     const placed = tx || ty ? children.map((c) => shiftOp(c, tx, ty)) : children;
 
     const groupId = this.resolveId(op.id); // one stable id for the whole group
     const created: ExcalidrawElement[] = [];
     for (const child of placed) {
       if (signal.aborted) break;
-      const base = opToSkeleton(child, turn, this.resolveId(child.id));
+      const base = opToSkeleton(child, turn, this.resolveId(child.id), page.index);
       if (!base) continue;
       // Tag children so the summary collapses the group and erase can target it.
       const skel = { ...base, customData: { ...(base.customData as object), group: groupId, groupLabel: label } };
@@ -357,9 +937,22 @@ export class BoardPlayer {
     return el.x < b.x2 + gap && el.x + el.width > b.x1 - gap && el.y < b.y2 + gap && el.y + el.height > b.y1 - gap;
   }
 
-  /** Large penalty for a move that would push the element above or left of the board origin. */
-  private boundsPenalty(el: ExcalidrawElement, dx: number, dy: number): number {
-    return el.y + dy < 0 || el.x + dx < 0 ? 1e6 : 0;
+  /** Large penalty for a move that would push the element off its own page. */
+  private boundsPenalty(el: ExcalidrawElement, dx: number, dy: number, pageIndex: number): number {
+    const r = this.pageSceneRect(pageIndex);
+    const y1 = el.y + dy;
+    const y2 = y1 + el.height;
+    const x1 = el.x + dx;
+    const x2 = x1 + el.width;
+    return y1 < r.y + CONTENT_TOP - 40 || y2 > r.y + PAGE_H - 20 || x1 < r.x + 24 || x2 > r.x + PAGE_W - 24 ? 1e6 : 0;
+  }
+
+  /** The page an element belongs to — its tag, or its grid cell as a last resort. */
+  private pageOf(e: ExcalidrawElement): number {
+    const p = (e.customData as TutorMeta | undefined)?.page;
+    if (typeof p === "number") return p;
+    const { row, col } = cellAtScene(e.x + e.width / 2, e.y + e.height / 2);
+    return this.pages.find((q) => q.row === row && q.col === col)?.index ?? 0;
   }
 
   /**
@@ -375,13 +968,11 @@ export class BoardPlayer {
    * label is nudged just off the line and stays hugging it. Highlights (translucent
    * overlays) and transient 'temp' gestures are never obstacles.
    */
-  private collisionPush(el: ExcalidrawElement): { dx: number; dy: number } {
+  private collisionPush(el: ExcalidrawElement, pageIndex: number): { dx: number; dy: number } {
+    // Only this page's own content is an obstacle: pages are separate sheets,
+    // so content on the previous one must never push this beat around.
     const obstacles = this.all().filter(
-      (e) =>
-        !e.isDeleted &&
-        e.id !== el.id &&
-        !(e.customData as { temp?: boolean; highlight?: boolean } | undefined)?.temp &&
-        !(e.customData as { highlight?: boolean } | undefined)?.highlight,
+      (e) => !e.isDeleted && e.id !== el.id && isPermanentNote(e) && this.pageOf(e) === pageIndex,
     );
     if (!obstacles.length) return { dx: 0, dy: 0 };
     const boxes = obstacles.map((o) => this.obstacleBox(o));
@@ -400,8 +991,10 @@ export class BoardPlayer {
     // Default: prefer up, then down, then sideways. For a thin-line overprint, keep
     // the label on whichever side of the line its centre already leans — so numbers
     // the model put above the line stay above and tick labels below stay below.
-    let wUp = 1.0;
-    let wDown = 1.15;
+    // "Up" now means "toward the top of a fixed page", where there is far less
+    // room to give, so the preference flips: dodge downward by default.
+    let wUp = 1.15;
+    let wDown = 1.0;
     if (onlyThin) {
       const bandCy = (hit[0].y1 + hit[0].y2) / 2;
       if (el.y + el.height / 2 >= bandCy) {
@@ -423,7 +1016,7 @@ export class BoardPlayer {
     let best: { dx: number; dy: number } | null = null;
     let bestScore = Infinity;
     for (const c of cands) {
-      const score = Math.abs(c.dx || c.dy) * c.w + this.boundsPenalty(el, c.dx, c.dy);
+      const score = Math.abs(c.dx || c.dy) * c.w + this.boundsPenalty(el, c.dx, c.dy, pageIndex);
       if (score < bestScore - 0.01) {
         bestScore = score;
         best = { dx: c.dx, dy: c.dy };
@@ -579,47 +1172,15 @@ export class BoardPlayer {
     this.ephemeralTimers.clear();
   }
 
-  /** Scroll/zoom so this turn's drawings are on screen, only if they are not already. */
-  private ensureVisible(turn: number) {
-    const mine = this.all().filter(
-      (e) => !e.isDeleted && (e.customData as { tutor?: boolean; turn?: number } | undefined)?.turn === turn,
-    );
-    if (!mine.length) return;
-    const [x1, y1, x2, y2] = getCommonBounds(mine);
-    const [vx1, vy1, vx2, vy2] = getVisibleSceneBounds(this.api.getAppState());
-    const inside = x1 >= vx1 && y1 >= vy1 && x2 <= vx2 && y2 <= vy2;
-    if (inside) return;
-    this.api.scrollToContent(mine, { fitToContent: true, animate: true, duration: 450 });
-  }
-
-  /**
-   * Scroll/zoom to what Guru is drawing right now (or last drew). Backs the
-   * "Jump to Guru" button, for when the student has panned or zoomed away.
-   * Falls back to all tutor content if the current turn drew nothing.
-   */
-  recenter() {
-    const mine = this.all().filter(
-      (e) => !e.isDeleted && (e.customData as { turn?: number } | undefined)?.turn === this.currentTurn,
-    );
-    const target = mine.length
-      ? mine
-      : this.all().filter((e) => !e.isDeleted && (e.customData as { tutor?: boolean } | undefined)?.tutor);
-    if (!target.length) return;
-    this.api.scrollToContent(target, { fitToContent: true, animate: true, duration: 450 });
-  }
-
   /** Marks everything as deleted (used by the "New topic" button). */
   clearAll() {
     this.cancelEphemeralFades();
     const next = this.all().map((e) => (e.isDeleted ? e : newElementWith(e, { isDeleted: true })));
     this.commit(next);
     this.idMap.clear();
+    this.minted.clear();
     this.turnShift = { turn: 0, dx: 0, dy: 0 };
-    this.pageShiftY = 0;
-    this.pageShiftX = 0;
-    this.sideMode = false;
-    this.sideIds.clear();
-    this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
+    this.resetPages();
   }
 }
 

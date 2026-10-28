@@ -89,10 +89,26 @@ export type TutorMeta = {
   // of the parent removes the whole group.
   group?: string;
   groupLabel?: string;
+  /** Index of the page this element belongs to. Set at draw time: collision
+   *  avoidance can move an element up to 400px AFTER the page origin was
+   *  applied, so the page is not recoverable from e.y. */
+  page?: number;
 };
 
-function meta(turn: number, opId?: string | null, temp?: boolean | null): TutorMeta {
-  return { tutor: true, turn, opId: opId ?? undefined, temp: temp ? true : undefined };
+function meta(turn: number, opId?: string | null, temp?: boolean | null, page?: number): TutorMeta {
+  return { tutor: true, turn, opId: opId ?? undefined, temp: temp ? true : undefined, page };
+}
+
+/**
+ * The ONE definition of "counts as a permanent note". The player's obstacle set,
+ * its page-bottom tracking and the board summary all ask this question, and a
+ * page reports itself full when they disagree — so they share one answer.
+ * Transient pointing gestures fade on their own and highlights are overlays:
+ * neither is part of the notes.
+ */
+export function isPermanentNote(e: { isDeleted?: boolean; customData?: unknown }): boolean {
+  const m = e.customData as TutorMeta | undefined;
+  return !e.isDeleted && !m?.temp && !m?.highlight;
 }
 
 /**
@@ -103,6 +119,7 @@ export function opToSkeleton(
   op: DrawOp,
   turn: number,
   elementId: string,
+  page?: number,
 ): ExcalidrawElementSkeleton | null {
   const color = op.color ?? "black";
   const stroke = STROKE[color];
@@ -120,7 +137,7 @@ export function opToSkeleton(
         fontFamily: boardFontFamily(op.text),
         strokeColor: stroke,
         textAlign: "left",
-        customData: meta(turn, op.id, op.temp),
+        customData: meta(turn, op.id, op.temp, page),
       };
     }
     case "rect":
@@ -141,7 +158,7 @@ export function opToSkeleton(
         fillStyle: "hachure",
         roughness: 1,
         roundness: type === "rectangle" ? { type: 3 } : null,
-        customData: meta(turn, op.id, op.temp),
+        customData: meta(turn, op.id, op.temp, page),
         ...(op.text ? { label: { text: op.text, fontSize: 20, fontFamily: boardFontFamily(op.text) } } : {}),
       };
     }
@@ -168,7 +185,7 @@ export function opToSkeleton(
         roughness: 1,
         endArrowhead: op.op === "arrow" ? "arrow" : null,
         startArrowhead: null,
-        customData: meta(turn, op.id, op.temp),
+        customData: meta(turn, op.id, op.temp, page),
         ...(op.text ? { label: { text: op.text, fontSize: 16, fontFamily: boardFontFamily(op.text) } } : {}),
       } as ExcalidrawElementSkeleton;
     }
@@ -188,7 +205,7 @@ export function opToSkeleton(
         roundness: { type: 3 },
         // Tagged so collision avoidance never treats a translucent highlight as an
         // obstacle — it is meant to overlay the very content it points at.
-        customData: { ...meta(turn, op.id, op.temp), highlight: true },
+        customData: { ...meta(turn, op.id, op.temp, page), highlight: true },
       };
     }
     case "numberline":

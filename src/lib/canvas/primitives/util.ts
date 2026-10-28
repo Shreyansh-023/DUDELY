@@ -15,6 +15,18 @@ export { measureText };
 
 export const TEXT_H = 18; // rough rendered height of one text line
 
+/**
+ * Rendered box of a (possibly multi-line) label: the widest line by the number
+ * of lines. Line height scales with the font so a `md`/`lg` label is measured
+ * as tall as it actually draws.
+ */
+export function textBox(text: string, fontPx: number): { w: number; h: number } {
+  const lines = String(text ?? "").split("\n");
+  const w = Math.max(0, ...lines.map((l) => measureText(l, fontPx)));
+  const lineH = Math.max(TEXT_H, Math.round(fontPx * 1.25));
+  return { w, h: lines.length * lineH };
+}
+
 /** A "nice" tick step (1/2/5 x 10^n) giving roughly ten intervals across the span. */
 export function niceStep(span: number): number {
   const raw = (Math.abs(span) || 1) / 10;

@@ -10,19 +10,25 @@ import {
   familiarityQuestion,
   isDoubtCleared,
   isExplainRequest,
+  planningLines,
+  resumeLine,
+  roadmapIntro,
   voicePrompts,
 } from "@/lib/languages";
+import { blankPageCanvas, CONTENT_LEFT, CONTENT_TOP } from "@/lib/canvas/page";
 import type { Beat, HistoryMessage, LessonPlan, TutorEvent } from "@/lib/schema";
 import { AsyncQueue, uid } from "@/lib/utils";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
 import { LiveTranscriber, liveSttUnavailable, prewarmLiveStt, relayUrl } from "@/lib/voice/live-stt";
-import { fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
+import { fetchFixedSpeech, fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
 import { isPlaybackPaused, pausePlayback, resumePlayback } from "@/lib/voice/playback";
+import BoardPager from "./BoardPager";
 import ClassSubjectPicker from "./ClassSubjectPicker";
 import Composer, { joinDictation } from "./Composer";
 import { LogoTile, Wordmark } from "./Logo";
 import LanguageMenu from "./LanguageMenu";
 import Transcript from "./Transcript";
+import VoiceCapture from "./VoiceCapture";
 import VoiceReview from "./VoiceReview";
 import { useVoiceLoop } from "./useVoiceLoop";
 import type { Board } from "./Whiteboard";
@@ -42,16 +48,17 @@ const Avatar = dynamic(() => import("./Avatar"), {
 });
 
 export type Status = "idle" | "listening" | "transcribing" | "thinking" | "teaching";
-// `hidden` messages are sent to the model but never rendered in the transcript —
-// used for the voice loop's silent "keep teaching" nudge after a statement turn.
-export type ChatMessage = HistoryMessage & { id: string; pending?: boolean; hidden?: boolean };
+// Only real student text and Indica's replies live here. The lesson's internal
+// "next step" nudges are never messages: they exist in the request history the
+// lesson pipeline keeps, which runs ahead of the transcript by design.
+export type ChatMessage = HistoryMessage & { id: string; pending?: boolean };
 
 /**
  * The staged lesson state machine (see lib/schema.ts `TutorMode`):
  *   none            — no lesson yet; the next topic starts one
  *   awaitFamiliarity— asked the familiarity question, waiting for the answer
  *   teaching        — teaching the plan step by step (Ultra)
- *   doubt           — answering a student's doubt on the side canvas (Groq), paused
+ *   doubt           — answering a student's doubt on its own new page (fast doubt model), paused
  */
 export type LessonPhase = "none" | "awaitFamiliarity" | "teaching" | "doubt";
 
@@ -65,6 +72,8 @@ export type Config = {
   llm: string | null;
   stt: SttMode;
   tts: TtsMode;
+  /** How fast Indica speaks, as a multiplier (server-side TTS_PACE). */
+  ttsPace: number;
   /** Which backend can stream words while the student is still speaking. */
   liveStt: "sarvam" | "browser" | null;
   sttRelayUrl: string | null;
@@ -74,11 +83,65 @@ const FALLBACK_CONFIG: Config = {
   llm: null,
   stt: "browser",
   tts: "browser",
+  ttsPace: 0.9,
   liveStt: "browser",
   sttRelayUrl: null,
   sttRelayPort: 8787,
 };
+/**
+ * A beat waiting its turn to be spoken — the "temporary cache" the staged lesson
+ * runs on. `step` is the plan step it belongs to (AGENDA_STEP for the spoken
+ * roadmap) and `turn` tags what it draws, so one step can be wiped and re-taught
+ * after a doubt without touching the others.
+ */
 type QueuedBeat = { beat: Beat; audio: Promise<Blob | null> | null };
+/** A queued beat inside a lesson run, tagged with where it belongs. */
+type QueuedStepBeat = QueuedBeat & { step: number; turn: number };
+
+/**
+ * A lesson run that survives being interrupted.
+ *
+ * A doubt used to abort the whole pipeline, and coming back re-asked the model
+ * for the interrupted step — 5-12 seconds of silence on a blank page, because
+ * the half-drawn step had to be wiped before it could be taught again. But
+ * nothing about a paused run is stale: its beats are generated, their speech is
+ * fetched, and the page they belong on is still there. So an interruption now
+ * stops only PLAYBACK. Generation carries on in the background (the lookahead
+ * gate keeps it one step ahead, as always), and the resume starts speaking
+ * again from the very beat it was cut off on.
+ */
+type LessonRun = {
+  /** Aborts GENERATION — the producer loop and its speech prefetch. A doubt
+   *  leaves this alone; only `discardRun` (a new topic, a new plan) fires it. */
+  gen: AbortController;
+  queue: AsyncQueue<QueuedStepBeat>;
+  gate: StepGate;
+  /** The live consumer, so a resume can wait for the paused one to let go. */
+  playing: Promise<void> | null;
+  /** The beat playback was cut off in, and the element ids it had drawn by
+   *  then. Spoken again from its start when the lesson resumes. */
+  held: { q: QueuedStepBeat; drawn: string[] } | null;
+  /** The step on the air and the transcript bubble it is writing into. Both
+   *  outlive the pause: without them a resume would start a new page and a
+   *  second bubble half-way through a step. */
+  step: number;
+  bubble: string;
+  /** Bubbles this run wrote, so `catchUp` can tell the student's doubts (worth
+   *  adding to the request history) from the run's own text (already there). */
+  ownIds: Set<string>;
+  /** True once the producer has pushed its last beat. */
+  done: boolean;
+};
+
+/** The spoken roadmap, queued like a step but generated locally from the plan. */
+const AGENDA_STEP = -1;
+/**
+ * How many steps may be generated ahead of the one being spoken. One is enough
+ * and more is waste: a step takes 25-40s to speak and 5-12s to generate, so a
+ * single step of lookahead already hides the whole wait — and anything further
+ * ahead is likely to be thrown away by the next doubt.
+ */
+const LOOKAHEAD_STEPS = 1;
 
 const STATUS_LABEL: Record<Status, string> = {
   idle: "Ready",
@@ -120,15 +183,6 @@ function PlusIcon() {
   );
 }
 
-function QuestionIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" />
-      <line x1="12" y1="17" x2="12" y2="17" />
-    </svg>
-  );
-}
-
 function PlayIcon() {
   return (
     <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -143,6 +197,65 @@ function PauseIcon() {
       <rect x="6.5" y="5" width="4" height="14" rx="1.2" />
       <rect x="13.5" y="5" width="4" height="14" rx="1.2" />
     </svg>
+  );
+}
+
+/**
+ * The planning screen. Designing a lesson is the one call in the app that takes
+ * real time (the planner reasons, on purpose), and a tutor that goes quiet and
+ * still for half a minute reads as broken. So the wait shows the work: each step
+ * title lands the moment the planner finishes writing it, with a pending row
+ * below for the one being written. Indica is talking over this.
+ */
+function PlanningCard({ steps }: { steps: (string | undefined)[] }) {
+  // Always one more row than we have, so the list visibly has somewhere to go.
+  const rows = Math.min(6, Math.max(steps.length + 1, 4));
+  return (
+    <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center p-6">
+      <div
+        aria-live="polite"
+        className="w-full max-w-md rounded-2xl border border-amber-200/50 bg-[#fffdf7]/85 p-5 shadow-xl shadow-amber-900/10 backdrop-blur-sm"
+      >
+        <div className="flex items-center gap-2.5">
+          <span className="flex gap-1" aria-hidden>
+            {[0, 1, 2].map((i) => (
+              <span
+                key={i}
+                className="h-1.5 w-1.5 animate-bounce rounded-full bg-amber-500"
+                style={{ animationDelay: `${i * 160}ms` }}
+              />
+            ))}
+          </span>
+          <p className="text-sm font-semibold text-amber-900">Planning your lesson…</p>
+        </div>
+        <ul className="mt-4 space-y-2.5">
+          {Array.from({ length: rows }, (_, i) => {
+            const title = steps[i];
+            return (
+              <li key={i} className="flex items-center gap-2.5 text-[13px]">
+                <span
+                  className={
+                    "grid h-5 w-5 shrink-0 place-items-center rounded-full text-[11px] font-semibold " +
+                    (title ? "bg-amber-500 text-white" : "bg-amber-200/60 text-amber-700/70")
+                  }
+                >
+                  {i + 1}
+                </span>
+                {title ? (
+                  <span className="text-neutral-700">{title}</span>
+                ) : (
+                  <span
+                    aria-hidden
+                    className="h-3 animate-pulse rounded-full bg-amber-200/50"
+                    style={{ width: `${58 - i * 6}%` }}
+                  />
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    </div>
   );
 }
 
@@ -300,6 +413,26 @@ export default function Tutor() {
     familiarity: "new" | "some" | "confident" | null;
   }>({ phase: "none", plan: null, step: 0, topic: "", familiarity: null });
   const [lessonPhase, setLessonPhase] = useState<LessonPhase>("none");
+  // The planner is thinking. Designing a lesson is the one genuinely slow call
+  // in the app, so the wait gets a screen of its own — and `planOutline` fills
+  // it with the real steps as the planner writes them, so the student is
+  // watching progress rather than a spinner.
+  const [planning, setPlanning] = useState(false);
+  const [planOutline, setPlanOutline] = useState<string[]>([]);
+  // True from the first teaching turn until the topic is dropped. Distinct from
+  // phase "teaching", which is already set while the plan is being designed —
+  // there is nothing on the board to have a doubt about until a step runs.
+  const [lessonStarted, setLessonStarted] = useState(false);
+  // The student pressed Doubt and the mic is opening. Tracked separately from
+  // lessonPhase because nothing is sent to ask() until they actually speak, and
+  // the button must disappear the instant it is pressed.
+  const [doubtPending, setDoubtPending] = useState(false);
+  // The last teaching turn and which step it was drawing, so an interrupted
+  // step's content can be wiped before that step is taught again.
+  const lastTeachRef = useRef<{ turn: number; step: number } | null>(null);
+  // The lesson run in flight, or the one paused on a doubt waiting to be picked
+  // back up. See `LessonRun`.
+  const runRef = useRef<LessonRun | null>(null);
   const setLesson = useCallback((p: LessonPhase) => {
     lessonRef.current.phase = p;
     setLessonPhase(p);
@@ -422,15 +555,23 @@ export default function Tutor() {
           begin();
           startPacer();
           // Browser TTS word boundaries: chars before the boundary = words spoken.
-          await speakBrowser(say, lang, signal, (charIndex) =>
-            advance(say.slice(0, charIndex).split(/\s+/).filter(Boolean).length),
+          await speakBrowser(
+            say,
+            lang,
+            signal,
+            (charIndex) => advance(say.slice(0, charIndex).split(/\s+/).filter(Boolean).length),
+            configRef.current?.ttsPace,
           );
         }
       } else {
         begin();
         startPacer();
-        await speakBrowser(say, lang, signal, (charIndex) =>
-          advance(say.slice(0, charIndex).split(/\s+/).filter(Boolean).length),
+        await speakBrowser(
+          say,
+          lang,
+          signal,
+          (charIndex) => advance(say.slice(0, charIndex).split(/\s+/).filter(Boolean).length),
+          configRef.current?.ttsPace,
         );
       }
     } finally {
@@ -466,20 +607,24 @@ export default function Tutor() {
   );
 
   /**
-   * One model-backed turn. The engine shared by every stage: it builds the board
-   * summary, posts to /api/tutor with the stage `mode` (+ plan/step/familiarity),
-   * stores any returned plan, and streams beats onto the board. `side` draws the
-   * turn on the doubt side canvas; `chain` keeps "thinking" at the end so a
-   * follow-up turn (plan → teach) starts without a flicker through idle.
+   * One self-contained model-backed turn: it builds the board summary, posts to
+   * /api/tutor with the stage `mode`, and streams beats onto the board, start to
+   * finish. `interrupt` puts the turn on its own new page (a doubt, or a
+   * textbook-example detour).
+   *
+   * The staged lesson does NOT come through here — it runs as one long pipelined
+   * turn (`startLessonRun`), because its steps have to be generated ahead of
+   * being spoken, and a turn that owns its own playback can't overlap with the
+   * next.
    */
   const runTurn = useCallback(
     async (spec: {
       text: string;
-      mode: "plan" | "teach" | "doubt" | "explain" | "ask";
-      hidden?: boolean;
-      step?: number;
-      side?: boolean;
-      chain?: boolean;
+      mode: "doubt" | "explain" | "ask";
+      /** Draw this turn on its own NEW page: a doubt, or an explain detour. Both
+       *  are interruptions whose content stays off the teaching page and is
+       *  skipped when teaching resumes. */
+      interrupt?: boolean;
     }) => {
       const b = boardRef.current;
       if (!b) return;
@@ -500,14 +645,14 @@ export default function Tutor() {
       const studentEls = elements.filter((e) => !b.isTutorElement(e));
       const changed = studentEls.filter((e) => (lastSeen.current.get(e.id) ?? -1) < e.version);
       for (const e of studentEls) lastSeen.current.set(e.id, e.version);
-      // A doubt answer goes on the side canvas (to the right, longer-lived pointers);
-      // every other turn starts a fresh page below previous turns, unless the student
-      // just drew (then stay on their page).
-      if (spec.side) b.player.beginSide();
-      else b.player.advancePage(changed.length > 0);
-      const canvas = b.summarizeScene(elements, new Set(changed.map((e) => e.id)), b.player.pageShift);
+      // Decide the page BEFORE summarising, so the model is told about the page
+      // it is actually going to draw on. An interruption gets a page of its own;
+      // teaching continues the current page while it has room.
+      if (spec.interrupt) b.player.beginDoubtTurn();
+      else b.player.beginTeachTurn({ stayOnPage: changed.length > 0 });
+      const canvas = b.summarizeScene(elements, new Set(changed.map((e) => e.id)), b.player.pageFrame());
 
-      const userMsg: ChatMessage = { id: uid("u"), role: "user", text: spec.text, hidden: spec.hidden };
+      const userMsg: ChatMessage = { id: uid("u"), role: "user", text: spec.text };
       const assistantId = uid("a");
       const history = [...messagesRef.current.filter((m) => !m.pending), userMsg];
       setMessages([...history, { id: assistantId, role: "assistant", text: "", pending: true }]);
@@ -517,11 +662,8 @@ export default function Tutor() {
       const playing = playQueue(queue, turn, assistantId, ac.signal);
 
       try {
-        const res = await fetch("/api/tutor", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          signal: ac.signal,
-          body: JSON.stringify({
+        await postTutorTurn(
+          {
             messages: history.slice(-12).map((m) => ({ role: m.role, text: m.text })),
             canvas,
             language: lang,
@@ -531,33 +673,25 @@ export default function Tutor() {
             subject: subjectRef.current,
             mode: spec.mode,
             plan: lessonRef.current.plan ?? undefined,
-            step: spec.step,
             familiarity: lessonRef.current.familiarity ?? undefined,
-          }),
-        });
-        if (!res.ok || !res.body) {
-          let msg = `Request failed (${res.status})`;
-          try {
-            const j = await res.json();
-            if (j?.error) msg = j.error;
-          } catch {}
-          throw new Error(msg);
-        }
-        await readNdjson(res.body, ac.signal, (ev) => {
-          if (ev.type === "beat") {
-            // Prefetch speech the moment a beat arrives so audio is ready when its turn comes.
-            const audio =
-              cfg.tts === "sarvam"
-                ? fetchSpeech(ev.beat.say, ev.beat.lang || lang, ac.signal).catch(() => null)
-                : null;
-            queue.push({ beat: ev.beat, audio });
-          } else if (ev.type === "plan") {
-            lessonRef.current.plan = ev.plan;
-            lessonRef.current.topic = ev.plan.topic || lessonRef.current.topic;
-          } else if (ev.type === "error") {
-            setError(ev.message);
-          }
-        });
+          },
+          ac.signal,
+          (ev) => {
+            if (ev.type === "beat") {
+              // Prefetch speech the moment a beat arrives so audio is ready when its turn comes.
+              const audio =
+                cfg.tts === "sarvam"
+                  ? fetchSpeech(ev.beat.say, ev.beat.lang || lang, ac.signal, cfg.ttsPace).catch(() => null)
+                  : null;
+              queue.push({ beat: ev.beat, audio });
+            } else if (ev.type === "plan") {
+              lessonRef.current.plan = ev.plan;
+              lessonRef.current.topic = ev.plan.topic || lessonRef.current.topic;
+            } else if (ev.type === "error") {
+              setError(ev.message);
+            }
+          },
+        );
       } catch (err) {
         if (!ac.signal.aborted) setError(err instanceof Error ? err.message : String(err));
       } finally {
@@ -574,24 +708,23 @@ export default function Tutor() {
           hadText: !!finalText.trim(),
           endedWithQuestion: isQuestionEnding(finalText),
         };
-        // Same policy as stopTurn: a reply that produced no text (e.g. the planner,
-        // which draws nothing, or a model error) disappears instead of leaving an
-        // empty bubble.
+        // Same policy as stopTurn: a reply that produced no text (a model error,
+        // say) disappears instead of leaving an empty bubble.
         setMessages((m) => m.flatMap((x) => (x.id === assistantId ? (x.text ? [{ ...x, pending: false }] : []) : [x])));
         setLiveCaption(null);
-        // `chain` turns keep the UI in "thinking" so the voice loop's resume effect
-        // doesn't fire in the gap before the next turn (plan → first teach step).
-        setStatus(spec.chain ? "thinking" : "idle");
-        if (!spec.chain) {
-          resumePlayback();
-          setSpeechPaused(false);
-        }
+        setStatus("idle");
+        resumePlayback();
+        setSpeechPaused(false);
       }
     },
     [playQueue, stopTurn],
   );
 
-  /** Play tutor beats we generated locally (no API), e.g. the fixed familiarity question. */
+  /**
+   * Play tutor beats we generated locally (no API): the fixed familiarity
+   * question. Its speech is cached across lessons, like the planning filler —
+   * the student hears this same sentence at the start of every topic.
+   */
   const playLocalBeats = useCallback(
     async (userText: string, beats: Beat[]) => {
       const b = boardRef.current;
@@ -604,7 +737,7 @@ export default function Tutor() {
       turnRef.current = ac;
       const turn = ++turnCounter.current;
       const cfg = configRef.current ?? FALLBACK_CONFIG;
-      b.player.advancePage(false);
+      b.player.beginTeachTurn();
 
       const userMsg: ChatMessage = { id: uid("u"), role: "user", text: userText };
       const assistantId = uid("a");
@@ -617,7 +750,7 @@ export default function Tutor() {
       for (const beat of beats) {
         const audio =
           cfg.tts === "sarvam"
-            ? fetchSpeech(beat.say, beat.lang || languageRef.current, ac.signal).catch(() => null)
+            ? fetchFixedSpeech(beat.say, beat.lang || languageRef.current, cfg.ttsPace)
             : null;
         queue.push({ beat, audio });
       }
@@ -641,33 +774,480 @@ export default function Tutor() {
     [playQueue, stopTurn],
   );
 
-  /** Teach the next un-taught plan step (then advance the pointer). No-op when done. */
-  const advanceLesson = useCallback(async () => {
-    const L = lessonRef.current;
-    if (L.phase !== "teaching" || !L.plan) return;
-    if (L.step >= L.plan.steps.length) return; // lesson complete; wait for the student
-    const step = L.step;
-    await runTurn({
-      text: step === 0 ? "Begin the lesson." : CONTINUE_NUDGE,
-      hidden: true,
-      mode: "teach",
-      step,
-    });
-    // Advance only if the step actually finished. If a doubt interrupted it,
-    // stopTurn marked the turn aborted — keep the pointer so resuming re-teaches it.
-    if (!lastTurnRef.current.aborted) lessonRef.current.step = step + 1;
-  }, [runTurn]);
+  /**
+   * Speaks a few local lines one after another, stopping early (between lines,
+   * never mid-sentence) once `until` settles. This is what covers the planner's
+   * thinking time: Indica says what it is doing instead of going silent.
+   */
+  const speakLines = useCallback(
+    async (lines: readonly string[], signal: AbortSignal, until?: Promise<unknown>) => {
+      let ready = false;
+      const mark = () => {
+        ready = true;
+      };
+      void until?.then(mark, mark);
+      for (const line of lines) {
+        if (signal.aborted || ready) return;
+        const cfg = configRef.current ?? FALLBACK_CONFIG;
+        const lang = languageRef.current;
+        const audio = cfg.tts === "sarvam" ? fetchFixedSpeech(line, lang, cfg.ttsPace) : null;
+        await speakBeat({ say: line, lang, draw: [] }, audio, signal);
+      }
+    },
+    [speakBeat],
+  );
+
+  /**
+   * Plan mode, fetch only: no board, no page, no transcript bubble — the planner
+   * draws nothing and says nothing. Kept apart from runTurn precisely so filler
+   * speech can run alongside it instead of being cancelled by it, and reports
+   * each step as the planner finishes writing it so the waiting screen fills in.
+   */
+  const designPlan = useCallback(
+    async (history: HistoryMessage[], signal: AbortSignal): Promise<LessonPlan | null> => {
+      const out: { plan: LessonPlan | null } = { plan: null };
+      try {
+        await postTutorTurn(
+          {
+            messages: history.slice(-12),
+            canvas: "",
+            language: languageRef.current,
+            grade: gradeRef.current,
+            subject: subjectRef.current,
+            mode: "plan",
+            familiarity: lessonRef.current.familiarity ?? undefined,
+          },
+          signal,
+          (ev) => {
+            if (ev.type === "planstep") {
+              setPlanOutline((s) => {
+                const next = [...s];
+                next[ev.index] = ev.step.title;
+                return next;
+              });
+            } else if (ev.type === "plan") {
+              out.plan = ev.plan;
+            } else if (ev.type === "error") {
+              setError(ev.message);
+            }
+          },
+        );
+      } catch (err) {
+        if (!signal.aborted) setError(err instanceof Error ? err.message : String(err));
+      }
+      return out.plan;
+    },
+    [],
+  );
+
+  /**
+   * Consumer of the lesson pipeline: speaks and draws queued beats in order,
+   * one page per step. Everything about "where are we in the lesson" is decided
+   * here rather than at generation time, because the student is only ever where
+   * the voice is — generation has already run ahead.
+   *
+   * It can be stopped and started again on the SAME run: on an interruption it
+   * leaves the beat it was cut off on in `run.held` (with the element ids that
+   * beat had managed to draw) and lets go of the queue, and the next consumer
+   * replays that beat from its start before carrying on. Nothing in between is
+   * re-fetched and nothing already on the page is redrawn.
+   */
+  const playLesson = useCallback(
+    async (run: LessonRun, signal: AbortSignal) => {
+      const player = boardRef.current?.player;
+      if (!player) return;
+      // A consumer that walks away while parked on the queue must let go of it,
+      // or the beat pushed next is handed to its abandoned promise and lost.
+      const detach = () => run.queue.detach();
+      signal.addEventListener("abort", detach, { once: true });
+      // Drop a step's bubble if it never got any text, like runTurn does.
+      const settle = () => {
+        const id = run.bubble;
+        if (!id) return;
+        setMessages((m) => m.flatMap((x) => (x.id === id ? (x.text ? [{ ...x, pending: false }] : []) : [x])));
+      };
+
+      /** Speak and draw one beat. `replay` means its words are already in the
+       *  transcript — the student only half heard them, so they are said again. */
+      const play = async (q: QueuedStepBeat, replay: boolean) => {
+        if (q.step !== run.step) {
+          // The previous step has been spoken in full, so a resume starts after it.
+          if (run.step >= 0) lessonRef.current.step = run.step + 1;
+          settle();
+          run.step = q.step;
+          // This step is on the air now — free the lookahead slot so the producer
+          // can go and fetch the next one while this one is being spoken.
+          // Something of Indica's is on the board from here on, roadmap
+          // included, so the student can break in on it.
+          setLessonStarted(true);
+          if (q.step >= 0) {
+            run.gate.release();
+            // Where the lesson stands, should the buffered run ever be thrown
+            // away and this step have to be asked for again.
+            lessonRef.current.step = q.step;
+            lastTeachRef.current = { turn: q.turn, step: q.step };
+          }
+          setStatus("teaching");
+          player.beginTeachTurn({ newPage: true }); // one page per step
+          run.bubble = uid("a");
+          const id = run.bubble;
+          run.ownIds.add(id);
+          setMessages((m) => [...m, { id, role: "assistant", text: "", pending: true }]);
+        }
+        if (!replay) {
+          const id = run.bubble;
+          setMessages((m) =>
+            m.map((x) => (x.id === id ? { ...x, text: x.text ? `${x.text} ${q.beat.say}` : q.beat.say } : x)),
+          );
+          turnTextRef.current = turnTextRef.current ? `${turnTextRef.current} ${q.beat.say}` : q.beat.say;
+        }
+        const [drawn] = await Promise.all([
+          player.applyBeat(q.beat.draw ?? [], q.turn, signal),
+          speakBeat(q.beat, q.audio, signal),
+        ]);
+        // Cut off part-way: hold this beat (and what it drew) for the resume.
+        run.held = signal.aborted ? { q, drawn: drawn.map((e) => e.id) } : null;
+      };
+
+      // Resuming: the beat the interruption landed in is spoken again from its
+      // start, on the page it was always on. Its half-drawn fragment comes off
+      // first so the replay does not double it up.
+      const held = run.held;
+      if (held && !signal.aborted) {
+        run.held = null;
+        player.dropElements(held.drawn);
+        await play(held.q, true);
+      }
+      for await (const q of run.queue) {
+        if (signal.aborted) break;
+        await play(q, false);
+      }
+      signal.removeEventListener("abort", detach);
+      // Only a run that reached its end moves the lesson on; an interrupted one
+      // is paused, and its step pointer has to keep pointing at the paused step.
+      if (!signal.aborted) {
+        if (run.step >= 0) lessonRef.current.step = run.step + 1;
+        settle();
+      }
+    },
+    [speakBeat],
+  );
+
+  /**
+   * Producer of the lesson pipeline: asks the model for one step at a time and
+   * streams its beats (with their speech already being fetched) into the run's
+   * queue, from `from` to the end of the plan.
+   *
+   * It stays exactly one step ahead of the voice, because the lookahead gate is
+   * released by the CONSUMER as each step goes on air. That is also what makes
+   * it safe to leave running while a doubt is answered: it fills at most one
+   * more step and then waits, so the pause is spent generating rather than
+   * throwing generated work away.
+   */
+  const generateLesson = useCallback(
+    async (run: LessonRun, plan: LessonPlan, from: number, agenda: LessonPlan | null) => {
+      const b = boardRef.current;
+      if (!b) return;
+      const signal = run.gen.signal;
+      const cfg = configRef.current ?? FALLBACK_CONFIG;
+      const lang = languageRef.current;
+      const voiceFor = (beat: Beat) =>
+        cfg.tts === "sarvam"
+          ? fetchSpeech(beat.say, beat.lang || lang, signal, cfg.ttsPace).catch(() => null)
+          : null;
+      try {
+        // The roadmap: spoken and written as a contents page straight from the
+        // plan, so step 1 is being generated throughout it.
+        if (agenda) {
+          const turn = ++turnCounter.current;
+          for (const beat of agendaBeats(agenda, lang)) {
+            run.queue.push({ beat, audio: voiceFor(beat), step: AGENDA_STEP, turn });
+          }
+        }
+
+        // Request history as GENERATED so far, which runs ahead of what has been
+        // spoken — step i+1 must be asked for in the light of step i's text even
+        // though the student has not heard it yet.
+        const history: HistoryMessage[] = [];
+        const seen = new Set<string>();
+        /** Fold anything new in the transcript into the request history: the
+         *  student's doubts and the answers they got are part of the lesson's
+         *  conversation, and the next step is taught in the light of them.
+         *  Bubbles this run wrote itself are skipped — `history` already has
+         *  their text, from the step that generated it. */
+        const catchUp = () => {
+          for (const m of messagesRef.current) {
+            if (m.pending || seen.has(m.id) || run.ownIds.has(m.id)) continue;
+            seen.add(m.id);
+            history.push({ role: m.role, text: m.text });
+          }
+        };
+        catchUp();
+        // Each step takes the next page down the teaching column and nothing
+        // else writes that column during a run, so the page a step will own is
+        // known before it is generated — which is the whole reason a step can be
+        // generated while the previous one is still being drawn. (The page
+        // NUMBER is a prediction, and only ever reaches the model as "Page 4 of
+        // 4" in the canvas header; the page it actually draws on is chosen at
+        // playback time.) The roadmap takes a page of its own first, so the
+        // steps start after it.
+        const basePage = b.player.nextTeachPage() + (agenda ? 1 : 0);
+
+        for (let i = from; i < plan.steps.length; i++) {
+          await run.gate.waitBelow(LOOKAHEAD_STEPS, signal);
+          if (signal.aborted) break;
+          run.gate.acquire();
+          const turn = ++turnCounter.current;
+          const page = basePage + (i - from);
+          catchUp();
+          history.push({ role: "user", text: i === 0 ? "Begin the lesson." : CONTINUE_NUDGE });
+          let said = "";
+          let beats = 0;
+          try {
+            await postTutorTurn(
+              {
+                messages: history.slice(-12),
+                canvas: blankPageCanvas(page, page + 1),
+                language: lang,
+                grade: gradeRef.current,
+                subject: subjectRef.current,
+                mode: "teach",
+                plan,
+                step: i,
+                familiarity: lessonRef.current.familiarity ?? undefined,
+              },
+              signal,
+              (ev) => {
+                if (ev.type === "beat") {
+                  beats++;
+                  said = said ? `${said} ${ev.beat.say}` : ev.beat.say;
+                  run.queue.push({ beat: ev.beat, audio: voiceFor(ev.beat), step: i, turn });
+                } else if (ev.type === "error") {
+                  setError(ev.message);
+                }
+              },
+            );
+          } catch (err) {
+            if (!signal.aborted) setError(err instanceof Error ? err.message : String(err));
+          }
+          if (signal.aborted) break;
+          history.push({ role: "assistant", text: said || "(drew on the board)" });
+          // Nothing came back: this step will never reach the consumer, so the
+          // slot it took has to be given back by hand. Stop there rather than
+          // marching through a plan the model has stopped answering — the error
+          // is already on screen and the step pointer still points here, so
+          // "continue" retries it.
+          if (beats === 0) {
+            run.gate.release();
+            break;
+          }
+        }
+      } finally {
+        run.done = true;
+        run.queue.close();
+      }
+    },
+    [],
+  );
+
+  /** Throw a buffered run away: generation stops and its beats are dropped.
+   *  Only a real break with the lesson does this — a new topic or a new plan. */
+  const discardRun = useCallback(() => {
+    const run = runRef.current;
+    runRef.current = null;
+    if (!run) return;
+    run.gen.abort();
+    run.queue.close();
+    run.held = null;
+  }, []);
+
+  /**
+   * Teaches the plan from the current step to the end on a FRESH run: the step
+   * is asked for again from the model. Used to open a lesson, and as the way
+   * back when there is no buffered run left to resume (the model stopped
+   * answering mid-plan, or the student started something new).
+   */
+  const startLessonRun = useCallback(
+    async (opts?: { controller?: AbortController; agenda?: LessonPlan | null }) => {
+      const b = boardRef.current;
+      const L = lessonRef.current;
+      if (!b || !L.plan || L.phase !== "teaching") return;
+      const plan = L.plan;
+      const from = L.step;
+      if (from >= plan.steps.length) return; // lesson complete; wait for the student
+
+      discardRun();
+      // Resuming comes in without a controller and starts its own turn; the
+      // opening run shares the controller planning already set up.
+      let ac = opts?.controller;
+      if (!ac) {
+        stopTurn();
+        setError(null);
+        setInterim("");
+        turnTextRef.current = "";
+        ac = new AbortController();
+        turnRef.current = ac;
+      }
+      setStatus("thinking");
+
+      // This step is about to be taught from the top again, so anything an
+      // earlier attempt left on its page has to come off, or the replay lands
+      // on top of it.
+      const prev = lastTeachRef.current;
+      if (prev && prev.step === from) b.player.dropTurn(prev.turn);
+
+      const run: LessonRun = {
+        gen: new AbortController(),
+        queue: new AsyncQueue<QueuedStepBeat>(),
+        gate: new StepGate(),
+        playing: null,
+        held: null,
+        step: Number.NaN,
+        bubble: "",
+        ownIds: new Set<string>(),
+        done: false,
+      };
+      runRef.current = run;
+      void generateLesson(run, plan, from, opts?.agenda ?? null);
+      run.playing = playLesson(run, ac.signal);
+      await run.playing;
+
+      if (turnRef.current === ac) {
+        turnRef.current = null;
+        const finalText = turnTextRef.current;
+        lastTurnRef.current = {
+          aborted: false,
+          hadText: !!finalText.trim(),
+          endedWithQuestion: isQuestionEnding(finalText),
+        };
+        setLiveCaption(null);
+        setStatus("idle");
+        resumePlayback();
+        setSpeechPaused(false);
+      }
+    },
+    [discardRun, generateLesson, playLesson, stopTurn],
+  );
+
+  /**
+   * Pick the paused lesson back up. Nothing is re-planned and nothing is
+   * re-fetched: the beats were generated before the doubt and their speech with
+   * them, so this is instant — one spoken handover line while the board walks
+   * back to the lesson page, and then the sentence the doubt cut into, said
+   * again in full, continuing down that same page.
+   *
+   * Falls back to a fresh run only when there is nothing buffered to resume.
+   */
+  const resumeLesson = useCallback(async () => {
+    const run = runRef.current;
+    if (!run || (run.done && !run.queue.size && !run.held)) {
+      await startLessonRun();
+      return;
+    }
+    stopTurn();
+    await run.playing; // the suspended consumer lets go of the queue first
+    setError(null);
+    setInterim("");
+    turnTextRef.current = "";
+    const ac = new AbortController();
+    turnRef.current = ac;
+    setStatus("teaching");
+    const cfg = configRef.current ?? FALLBACK_CONFIG;
+    const lang = languageRef.current;
+    const line = resumeLine(lang);
+    await speakBeat(
+      { say: line, lang, draw: [] },
+      cfg.tts === "sarvam" ? fetchFixedSpeech(line, lang, cfg.ttsPace) : null,
+      ac.signal,
+    );
+    if (ac.signal.aborted) return;
+    run.playing = playLesson(run, ac.signal);
+    await run.playing;
+
+    if (turnRef.current === ac) {
+      turnRef.current = null;
+      const finalText = turnTextRef.current;
+      lastTurnRef.current = {
+        aborted: false,
+        hadText: !!finalText.trim(),
+        endedWithQuestion: isQuestionEnding(finalText),
+      };
+      setLiveCaption(null);
+      setStatus("idle");
+      resumePlayback();
+      setSpeechPaused(false);
+    }
+  }, [playLesson, speakBeat, startLessonRun, stopTurn]);
+
+  /**
+   * Opens a lesson: design it, then teach it. One turn from the student's point
+   * of view, and deliberately so — Indica speaks from about a second after the
+   * familiarity answer (filler), through the planner's thinking, into the spoken
+   * roadmap, and straight on into step 1, with no silence anywhere in between.
+   */
+  const startLesson = useCallback(
+    async (text: string) => {
+      const b = boardRef.current;
+      if (!b) return;
+      stopTurn();
+      setError(null);
+      setInterim("");
+      turnTextRef.current = "";
+      const ac = new AbortController();
+      turnRef.current = ac;
+      setStatus("thinking");
+      setPlanning(true);
+      setPlanOutline([]);
+
+      // A fresh lesson: nothing of it has been drawn, so there is no interrupted
+      // step to wipe. Left over from the previous lesson, this would make the
+      // first step drop that lesson's step-1 page instead.
+      lastTeachRef.current = null;
+
+      const userMsg: ChatMessage = { id: uid("u"), role: "user", text };
+      const history = [...messagesRef.current.filter((m) => !m.pending), userMsg];
+      setMessages(history);
+
+      // Planning and filler speech run together: the fetch is the long pole, the
+      // filler is what makes the wait listenable.
+      const planned = designPlan(
+        history.map((m) => ({ role: m.role, text: m.text })),
+        ac.signal,
+      );
+      await speakLines(planningLines(languageRef.current), ac.signal, planned);
+      const plan = await planned;
+      setPlanning(false);
+      if (ac.signal.aborted) return;
+
+      if (!plan || plan.steps.length === 0) {
+        // Planning failed: fall back so the student isn't stuck on a blank board.
+        setLesson("none");
+        setLessonStarted(false);
+        if (turnRef.current === ac) {
+          turnRef.current = null;
+          setStatus("idle");
+        }
+        return;
+      }
+      lessonRef.current.plan = plan;
+      lessonRef.current.topic = plan.topic || lessonRef.current.topic;
+      lessonRef.current.step = 0;
+      await startLessonRun({ controller: ac, agenda: plan });
+    },
+    [designPlan, speakLines, setLesson, startLessonRun, stopTurn],
+  );
 
   /**
    * The student said/typed something. Routes it through the lesson state machine:
    *   none            → ask the fixed familiarity question (no API), then wait
-   *   awaitFamiliarity→ design the plan (Ultra), then teach step 1
-   *   teaching        → treat it as a DOUBT (Groq, side canvas), and pause
+   *   awaitFamiliarity→ design the lesson, preview it, then teach it step by step
+   *   teaching        → treat it as a DOUBT (fast doubt model, side canvas), and pause
    *   doubt           → "got it" resumes the lesson; anything else is another doubt
    */
   const ask = useCallback(
     async (rawText: string) => {
       const text = rawText.trim();
+      setDoubtPending(false);
       if (!text || !boardRef.current) return;
       const L = lessonRef.current;
 
@@ -685,14 +1265,7 @@ export default function Tutor() {
         L.familiarity = classifyFamiliarity(text);
         L.step = 0;
         setLesson("teaching");
-        await runTurn({ text, mode: "plan", chain: true }); // design the lesson (slow, once)
-        if (lessonRef.current.plan && lessonRef.current.plan.steps.length > 0) {
-          await advanceLesson(); // teach step 1
-        } else {
-          // Planning failed: fall back so the student isn't stuck on a blank board.
-          setLesson("none");
-          setStatus("idle");
-        }
+        await startLesson(text); // design it, preview it, then teach it step by step
         return;
       }
 
@@ -701,28 +1274,32 @@ export default function Tutor() {
       // afterwards (phase "doubt") so "got it" resumes it, like any interruption.
       if (isExplainRequest(text)) {
         setLesson("doubt");
-        await runTurn({ text, mode: "explain" }); // main canvas, Ultra
+        await runTurn({ text, mode: "explain", interrupt: true }); // its own page, Ultra
         return;
       }
 
       if (L.phase === "doubt" && isDoubtCleared(text)) {
-        boardRef.current?.player.clearSide();
+        // The doubt page is KEPT, as a neighbour of the lesson page; this walks
+        // the camera back left onto the lesson page, which still holds
+        // everything taught before the doubt.
+        boardRef.current?.player.endDoubt();
         setLesson("teaching");
-        await advanceLesson(); // resume with the next un-taught step
+        await resumeLesson(); // carries on from the sentence the doubt cut into
         return;
       }
 
-      // Otherwise it's a conceptual doubt → Groq on the side canvas, lesson paused.
+      // Otherwise it's a conceptual doubt → the doubt model on a new page, lesson paused.
       setLesson("doubt");
-      await runTurn({ text, mode: "doubt", side: true });
+      await runTurn({ text, mode: "doubt", interrupt: true });
     },
-    [advanceLesson, playLocalBeats, runTurn, setLesson],
+    [playLocalBeats, resumeLesson, runTurn, setLesson, startLesson],
   );
 
-  // Voice-loop hooks: after a statement teaching turn, keep teaching the next step.
+  // Voice-loop hooks: if a teaching run ended with steps still to go (a step the
+  // model failed to answer), carry on from there instead of stalling the lesson.
   const continueLesson = useCallback(() => {
-    void advanceLesson();
-  }, [advanceLesson]);
+    void startLessonRun();
+  }, [startLessonRun]);
   const shouldContinueLesson = useCallback(() => {
     const L = lessonRef.current;
     // Auto-advance only while teaching and there are steps left; the turn must have
@@ -889,6 +1466,7 @@ export default function Tutor() {
   // The captured utterance flows through ask(), which routes it to the doubt model
   // (or to Ultra, if the student names a textbook example/exercise/theorem).
   const raiseDoubt = useCallback(() => {
+    setDoubtPending(true);
     stopTurn();
     voiceBargeIn();
   }, [stopTurn, voiceBargeIn]);
@@ -984,12 +1562,18 @@ export default function Tutor() {
 
   const newTopic = () => {
     stopTurn();
+    discardRun();
     boardRef.current?.player.clearAll();
     lastSeen.current.clear();
     setMessages([]);
     setError(null);
     lessonRef.current = { phase: "none", plan: null, step: 0, topic: "", familiarity: null };
+    setPlanning(false);
+    setPlanOutline([]);
     setLessonPhase("none");
+    setLessonStarted(false);
+    setDoubtPending(false);
+    lastTeachRef.current = null;
   };
 
   const busy = status === "thinking" || status === "teaching";
@@ -1020,29 +1604,39 @@ export default function Tutor() {
   // Is there something a pause would act on right now? (Only then is the avatar a
   // pause control — while awaiting/idle there's nothing to stop.)
   const pausable = guruSpeaking || guruListening || status === "thinking";
+  // The words are being worked out — its own phase, so the box can say so
+  // without guessing from a status plus a non-empty interim.
+  const transcribing = voice.phase === "transcribing";
   // The student's words own the lower third from the mic opening until the text
-  // is sent: listening (empty, "Listening…") → filling → transcribing (last
-  // partial held) → review. The `interim` guard on the transcribing gap stops
-  // the box flashing up empty in the frame after a send.
-  const showSpeechBox =
-    reviewing ||
-    guruListening ||
-    (voice.phase === "processing" && status === "idle" && Boolean(interim.trim()));
+  // is sent: waveform while they talk → "Transcribing…" → the transcript, ready
+  // to edit and send.
+  const showSpeechBox = reviewing || guruListening || transcribing;
   // The only states worth a pill in the caption strip; everything else either
   // shows a caption (speaking) or the avatar's own affordance (paused → play).
-  // "processing" with no turn running yet is the gap between the student
-  // finishing and the review card appearing — say so rather than going blank.
-  const stripStatus = guruListening
-    ? "Listening…"
-    : status === "thinking"
-      ? "Thinking…"
-      : voice.phase === "processing" && status === "idle"
-        ? "Transcribing…"
-        : null;
+  // Listening and transcribing are not here: the speech box itself is showing
+  // them, and saying it twice in the same corner just reads as a duplicate.
+  const stripStatus = status === "thinking" ? "Thinking…" : null;
+  // The student pressed Doubt: keep the button hidden until the loop is at rest
+  // again. A barge-in that caught nothing speaks a re-prompt at phase
+  // "greeting" — with lessonPhase still "teaching" — and only then settles, so
+  // without this the button would flash back mid-re-prompt.
+  const doubtHold =
+    doubtPending && !(voice.phase === "awaiting" || voice.phase === "paused" || voice.phase === "off");
   // The Doubt button is offered while Guru is working (speaking/teaching/thinking)
   // and not already listening — those are the moments a student wants to break in.
+  // Gated on the lesson actually being underway: before that there is no lesson
+  // to interrupt, and "doubt" has nothing to attach itself to.
   const canRaiseDoubt =
-    !guruListening && !avatarPaused && (guruSpeaking || status === "thinking" || voice.phase === "processing");
+    lessonStarted &&
+    // Already answering a doubt (or about to be): the lesson is paused on it, so
+    // there is nothing to interrupt and a second "Doubt" button just competes
+    // with the answer.
+    !doubtHold &&
+    lessonPhase !== "doubt" &&
+    !guruListening &&
+    !transcribing &&
+    !avatarPaused &&
+    (guruSpeaking || status === "thinking" || voice.phase === "processing");
 
   return (
     <main className="flex h-dvh w-full flex-col-reverse bg-neutral-100 md:flex-row">
@@ -1140,6 +1734,13 @@ export default function Tutor() {
             {STATUS_LABEL[status]} <span className="opacity-60">· Esc to interrupt</span>
           </div>
         )}
+        {/* The lesson is being designed — the board is still blank, so the wait
+            owns the middle of it in both modes. */}
+        {planning && <PlanningCard steps={planOutline} />}
+        {/* Page navigation, and the way back to the page Indica is writing on.
+            Carries the name of Excalidraw's own "Scroll back to content"
+            (hidden in globals.css), which knows nothing about pages. */}
+        {board && <BoardPager player={board.player} />}
         {voiceMode && (
           <>
             {/* Hamburger — the single voice-mode control. It toggles between the
@@ -1165,18 +1766,28 @@ export default function Tutor() {
 
             {!chatPanelOpen && (
               <>
-                {/* Doubt button (top-left, under the hamburger): interrupt Guru and
-                    start listening so the student can ask a doubt hands-free. */}
+                {/* Doubt button (bottom-left, mirroring the presenter PiP): interrupt
+                    Guru and start listening so the student can ask a doubt hands-free.
+                    Word only — a "?" next to it said the same thing twice. */}
                 {canRaiseDoubt && (
-                  <button
-                    type="button"
-                    onClick={raiseDoubt}
-                    title="Ask a doubt"
-                    aria-label="Ask a doubt"
-                    className="absolute left-3 top-16 z-20 flex items-center gap-1.5 rounded-full bg-white/90 px-3 py-2 text-sm font-medium text-rose-600 shadow ring-1 ring-black/5 backdrop-blur transition hover:bg-white active:scale-95"
-                  >
-                    <QuestionIcon /> Doubt
-                  </button>
+                  <div className="absolute bottom-5 left-4 z-20 md:bottom-6 md:left-6">
+                    {/* A halo that keeps breathing while the button is on offer:
+                        it appears mid-lesson, so it has to be findable without
+                        competing with Guru's writing. */}
+                    <span
+                      aria-hidden
+                      className="pointer-events-none absolute -inset-1.5 animate-pulse rounded-full bg-orange-500/35 blur-md [animation-duration:2.8s]"
+                    />
+                    <button
+                      type="button"
+                      onClick={raiseDoubt}
+                      title="Ask a doubt"
+                      aria-label="Ask a doubt"
+                      className="relative block rounded-full bg-linear-to-b from-[#fb923c] to-[#e03e22] px-5 py-2.5 text-sm font-semibold tracking-wide text-white shadow-lg shadow-orange-900/30 ring-1 ring-inset ring-white/30 transition duration-150 hover:-translate-y-px hover:shadow-xl hover:shadow-orange-900/35 hover:brightness-105 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 active:translate-y-0 active:scale-95"
+                    >
+                      Doubt
+                    </button>
+                  </div>
                 )}
 
                 {/* Presenter PiP (bottom-right, like a video call). Mouth is driven
@@ -1245,13 +1856,21 @@ export default function Tutor() {
                     above it instead of running underneath. */}
                 {showSpeechBox && (
                   <div className="absolute inset-x-4 bottom-40 z-30 flex justify-center md:bottom-4">
-                    <VoiceReview
-                      value={reviewing ? voice.review : interim}
-                      onChange={voice.setReview}
-                      onSend={voice.sendReview}
-                      onRetry={voice.retryReview}
-                      live={!reviewing}
-                    />
+                    {reviewing ? (
+                      <VoiceReview
+                        value={voice.review}
+                        onChange={voice.setReview}
+                        onSend={voice.sendReview}
+                        onRetry={voice.retryReview}
+                      />
+                    ) : (
+                      <VoiceCapture
+                        state={transcribing ? "transcribing" : "live"}
+                        levelRef={voice.micLevelRef}
+                        onCancel={voice.pause}
+                        onStop={voice.endUtterance}
+                      />
+                    )}
                   </div>
                 )}
 
@@ -1279,8 +1898,129 @@ export default function Tutor() {
           </>
         )}
       </section>
+
+      {/* Doubt mode: the answer goes on its own new page, and the whole viewport
+          gets a glowing frame so it is obvious at a glance that the lesson is
+          paused on a doubt (say "got it" to resume). Decorative + click-through;
+          the markup is bare tags because globals.css styles it by element. */}
+      {lessonPhase === "doubt" && (
+        <div className="doubt-frame" aria-hidden>
+          <header>
+            <i />
+            <b>Doubt Mode</b>
+            <i />
+          </header>
+          <i className="edge-l" />
+          <i className="edge-r" />
+          <i className="edge-b" />
+        </div>
+      )}
     </main>
   );
+}
+
+/**
+ * Posts one turn to /api/tutor and dispatches its NDJSON events. The single
+ * place that knows the wire format, shared by the one-shot turns and by the
+ * staged lesson pipeline.
+ */
+async function postTutorTurn(
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+  onEvent: (ev: TutorEvent) => void,
+) {
+  const res = await fetch("/api/tutor", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    signal,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok || !res.body) {
+    let msg = `Request failed (${res.status})`;
+    try {
+      const j = await res.json();
+      if (j?.error) msg = j.error;
+    } catch {}
+    throw new Error(msg);
+  }
+  await readNdjson(res.body, signal, onEvent);
+}
+
+/**
+ * The lookahead gate. Counts steps that have been asked for but are not yet
+ * being spoken, and holds the producer back while that count is at the limit —
+ * so the pipeline stays exactly one step ahead of the voice instead of racing
+ * off and generating a whole lesson the next doubt may invalidate.
+ */
+class StepGate {
+  private held = 0;
+  private waiters: Array<() => void> = [];
+
+  acquire() {
+    this.held++;
+  }
+
+  release() {
+    if (this.held > 0) this.held--;
+    for (const w of this.waiters.splice(0)) w();
+  }
+
+  async waitBelow(limit: number, signal: AbortSignal) {
+    while (this.held >= limit && !signal.aborted) {
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          signal.removeEventListener("abort", done);
+          resolve();
+        };
+        this.waiters.push(done);
+        signal.addEventListener("abort", done, { once: true });
+      });
+    }
+  }
+}
+
+/**
+ * The spoken roadmap, as beats, straight from the plan — no model call, so it
+ * costs nothing and starts instantly. Indica says each step's one-line preview
+ * (the planner wrote those in the student's language) while writing the step
+ * titles up as a contents page the student can flip back to.
+ */
+function agendaBeats(plan: LessonPlan, lang: string): Beat[] {
+  const steps = plan.steps.slice(0, 8); // a page holds about this many lines
+  const beats: Beat[] = [
+    {
+      say: plan.intro?.trim() || roadmapIntro(lang),
+      lang,
+      draw: [
+        {
+          op: "text",
+          id: "agenda_title",
+          x: CONTENT_LEFT,
+          y: CONTENT_TOP,
+          text: plan.topic?.trim() || "Our plan",
+          size: "lg",
+          color: "purple",
+        },
+      ],
+    },
+  ];
+  steps.forEach((s, i) => {
+    beats.push({
+      say: s.roadmap?.trim() || `${i + 1}. ${s.title}`,
+      lang,
+      draw: [
+        {
+          op: "text",
+          id: `agenda_${i + 1}`,
+          x: CONTENT_LEFT + 30,
+          y: CONTENT_TOP + 100 + i * 56,
+          text: `${i + 1}. ${s.title}`,
+          size: "md",
+        },
+      ],
+    });
+  });
+  return beats;
 }
 
 /** Reads an NDJSON stream line by line and dispatches parsed events. */

@@ -252,6 +252,117 @@ export function isDoubtCleared(text: string): boolean {
  * Composer placeholder, written in the script of the selected language so the
  * input invites the student in the language they chose.
  */
+/**
+ * Spoken while the planner is thinking. Designing a lesson takes real time
+ * (reasoning is on, by design), and a tutor that goes silent for half a minute
+ * reads as broken — so Indica says what it is doing instead. Spoken one line at
+ * a time and cut short the moment the plan lands, so a fast plan never has to
+ * sit through all of it. Deliberately gender-neutral: Indica has no gender.
+ */
+export const PLANNING_LINES: Record<LanguageCode, readonly [string, string]> = {
+  en: [
+    "Good choice. Give me a moment — I'm planning how to teach you this.",
+    "Working out the best order to build this up, step by step.",
+  ],
+  "en-IN": [
+    "Achha topic hai. Ek minute do — iska plan ban raha hai.",
+    "Sabse achha order dhoondh rahe hain, taaki step by step samajh aaye.",
+  ],
+  "hi-IN": [
+    "अच्छा विषय है। एक मिनट दो — इसका प्लान बन रहा है।",
+    "सबसे अच्छा क्रम चुन रहे हैं, ताकि कदम दर कदम समझ आए।",
+  ],
+  "bn-IN": [
+    "ভালো বিষয় বেছেছ। এক মিনিট দাও — এর পরিকল্পনা তৈরি হচ্ছে।",
+    "সবচেয়ে ভালো ক্রম বেছে নিচ্ছি, যাতে ধাপে ধাপে বুঝতে পারো।",
+  ],
+  "ta-IN": [
+    "நல்ல தலைப்பு. ஒரு நிமிடம் கொடு — இதற்கான திட்டம் தயாராகிறது.",
+    "படிப்படியாக புரிய வைக்க சிறந்த வரிசையைத் தேர்ந்தெடுக்கிறேன்.",
+  ],
+  "te-IN": [
+    "మంచి అంశం. ఒక నిమిషం ఇవ్వు — దీనికి ప్రణాళిక తయారవుతోంది.",
+    "అడుగు అడుగునా అర్థమయ్యేలా మంచి క్రమాన్ని ఎంచుకుంటున్నాను.",
+  ],
+  "mr-IN": [
+    "चांगला विषय आहे. एक मिनिट दे — याचा आराखडा तयार होत आहे.",
+    "टप्प्याटप्प्याने समजेल असा उत्तम क्रम निवडत आहे.",
+  ],
+  "gu-IN": [
+    "સરસ વિષય છે. એક મિનિટ આપ — આનો પ્લાન તૈયાર થઈ રહ્યો છે.",
+    "પગલું પગલું સમજાય એવો ઉત્તમ ક્રમ પસંદ કરી રહ્યા છીએ.",
+  ],
+  "kn-IN": [
+    "ಒಳ್ಳೆಯ ವಿಷಯ. ಒಂದು ನಿಮಿಷ ಕೊಡು — ಇದಕ್ಕೆ ಯೋಜನೆ ಸಿದ್ಧವಾಗುತ್ತಿದೆ.",
+    "ಹಂತ ಹಂತವಾಗಿ ಅರ್ಥವಾಗುವಂತೆ ಉತ್ತಮ ಕ್ರಮವನ್ನು ಆಯ್ಕೆ ಮಾಡುತ್ತಿದ್ದೇನೆ.",
+  ],
+  "ml-IN": [
+    "നല്ല വിഷയം. ഒരു മിനിറ്റ് തരൂ — ഇതിന്റെ പ്ലാൻ തയ്യാറാകുന്നു.",
+    "ഘട്ടം ഘട്ടമായി മനസ്സിലാകാൻ നല്ല ക്രമം തിരഞ്ഞെടുക്കുന്നു.",
+  ],
+  "pa-IN": [
+    "ਵਧੀਆ ਵਿਸ਼ਾ ਹੈ। ਇੱਕ ਮਿੰਟ ਦੇ — ਇਸ ਦਾ ਪਲਾਨ ਤਿਆਰ ਹੋ ਰਿਹਾ ਹੈ।",
+    "ਕਦਮ ਦਰ ਕਦਮ ਸਮਝ ਆਵੇ, ਇਸ ਲਈ ਵਧੀਆ ਕ੍ਰਮ ਚੁਣ ਰਹੇ ਹਾਂ।",
+  ],
+  "od-IN": [
+    "ଭଲ ବିଷୟ। ଏକ ମିନିଟ୍ ଦିଅ — ଏହାର ଯୋଜନା ତିଆରି ହେଉଛି।",
+    "ପାଦ ପାଦ କରି ବୁଝିବା ପାଇଁ ସବୁଠାରୁ ଭଲ କ୍ରମ ବାଛୁଛି।",
+  ],
+};
+
+export function planningLines(code: string): readonly [string, string] {
+  return PLANNING_LINES[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
+/**
+ * Opens the spoken roadmap. Only a fallback: the planner writes its own `intro`
+ * in the student's language, and this covers the case where it omitted it.
+ */
+export const ROADMAP_INTROS: Record<LanguageCode, string> = {
+  en: "Here's how we'll learn this, step by step.",
+  "en-IN": "Chalo, ise aise padhenge — step by step.",
+  "hi-IN": "चलो, इसे ऐसे पढ़ेंगे — कदम दर कदम।",
+  "bn-IN": "চলো, এভাবে শিখব — ধাপে ধাপে।",
+  "ta-IN": "இதை இப்படிப் படிப்போம் — படிப்படியாக.",
+  "te-IN": "ఇలా నేర్చుకుందాం — అడుగు అడుగునా.",
+  "mr-IN": "चल, असं शिकू — टप्प्याटप्प्याने.",
+  "gu-IN": "ચાલો, આમ શીખીશું — પગલું પગલું.",
+  "kn-IN": "ಹೀಗೆ ಕಲಿಯೋಣ — ಹಂತ ಹಂತವಾಗಿ.",
+  "ml-IN": "ഇങ്ങനെ പഠിക്കാം — ഘട്ടം ഘട്ടമായി.",
+  "pa-IN": "ਆ, ਇਸ ਤਰ੍ਹਾਂ ਸਿੱਖਾਂਗੇ — ਕਦਮ ਦਰ ਕਦਮ।",
+  "od-IN": "ଚାଲ, ଏମିତି ଶିଖିବା — ପାଦ ପାଦ କରି।",
+};
+
+export function roadmapIntro(code: string): string {
+  return ROADMAP_INTROS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
+/**
+ * The handover back from a doubt to the lesson. The lesson is not re-planned or
+ * re-fetched on a resume — its beats were generated before the doubt and are
+ * still buffered — so this one line is all the student hears before teaching
+ * carries on from the sentence it was interrupted in. Spoken from the cache,
+ * like the planning filler.
+ */
+export const RESUME_LINES: Record<LanguageCode, string> = {
+  en: "Good. Let's carry on with the lesson from where we stopped.",
+  "en-IN": "Badhiya. Chalo, lesson wahin se continue karein jahan ruke the.",
+  "hi-IN": "बढ़िया। चलो, पाठ वहीं से आगे बढ़ाएँ जहाँ रुके थे।",
+  "bn-IN": "দারুণ। চলো, যেখানে থেমেছিলাম সেখান থেকেই পাঠ চালিয়ে যাই।",
+  "ta-IN": "நல்லது. நிறுத்திய இடத்திலிருந்தே பாடத்தைத் தொடரலாம்.",
+  "te-IN": "మంచిది. ఆపిన దగ్గర నుంచే పాఠాన్ని కొనసాగిద్దాం.",
+  "mr-IN": "छान. चल, जिथे थांबलो होतो तिथूनच धडा पुढे नेऊ.",
+  "gu-IN": "સરસ. ચાલો, જ્યાં અટક્યા હતા ત્યાંથી જ પાઠ આગળ વધારીએ.",
+  "kn-IN": "ಒಳ್ಳೆಯದು. ನಿಲ್ಲಿಸಿದ ಜಾಗದಿಂದಲೇ ಪಾಠವನ್ನು ಮುಂದುವರಿಸೋಣ.",
+  "ml-IN": "നല്ലത്. നിർത്തിയ ഇടത്തുനിന്നുതന്നെ പാഠം തുടരാം.",
+  "pa-IN": "ਵਧੀਆ। ਆ, ਜਿੱਥੇ ਰੁਕੇ ਸੀ ਉੱਥੋਂ ਹੀ ਪਾਠ ਅੱਗੇ ਵਧਾਈਏ।",
+  "od-IN": "ଭଲ। ଚାଲ, ଯେଉଁଠି ଅଟକି ଯାଇଥିଲୁ ସେଠାରୁ ହିଁ ପାଠ ଆଗେଇବା।",
+};
+
+export function resumeLine(code: string): string {
+  return RESUME_LINES[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
 export const ASK_PLACEHOLDERS: Record<LanguageCode, string> = {
   en: "Ask anything…",
   "en-IN": "Kuch bhi poocho…",
