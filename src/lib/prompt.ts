@@ -14,6 +14,20 @@ import type { Passage } from "./rag";
 import type { LessonPlan } from "./schema";
 
 /**
+ * The slice of a retrieved solution the prompt needs. Structurally compatible with
+ * `Solution` from lib/solutions, declared here so prompt.ts (which the client also
+ * imports types from) does not pull in the server-only retriever.
+ */
+export type SolutionContext = {
+  label: string;
+  chapterTitle: string | null;
+  question: string;
+  answer: string;
+  hasImageAnswer: boolean;
+  mathQuality: string;
+};
+
+/**
  * The tutor "mastery" system prompt. This is where the Dudely feel comes from:
  * the model is not allowed to answer, it has to diagnose, draw and ask.
  */
@@ -253,6 +267,144 @@ The student asked you to explain or solve a particular item from their textbook.
 - Teach THAT exact item — its real statement, values and method — worked step by step as a full teaching turn (this is NOT a quick side note; draw it out properly). It gets its own fresh page, so start at the top-left as the CANVAS block says.
 - Use the item's actual numbers and the book's method; do not substitute a different example from memory.
 - 3-7 beats. End on a clean statement once the item is fully worked. Do not quiz the student.`;
+}
+
+/**
+ * Solve prompt — the second pipeline.
+ *
+ * The difference from teaching is what is NOT here: no familiarity question, no
+ * lesson plan, no roadmap, no step budget. The student named a question; the job is
+ * to explain its solution, start to finish, from the first beat.
+ *
+ * Two things are already done before this prompt runs, and the prompt must know it:
+ *  - the heading and question text are ALREADY on the board, laid out deterministically
+ *    by lib/question-board.ts (never re-written by the model), and
+ *  - the book's own worked solution is supplied below when the index had one, so the
+ *    model explains a known-correct method instead of inventing one.
+ */
+export function buildSolveSystemPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  textbook?: Passage[];
+  /** The book's worked solutions for what the student asked (may be empty). */
+  solutions?: SolutionContext[];
+  /** True when the student named the item by position, so `solutions` IS their question.
+   *  False means these are merely similar questions found by search. */
+  exactSolution?: boolean;
+  /** True when the question refers to data (a figure, a table, a list of parts) that
+   *  lived in the PDF as an image and so is NOT in the text we have. */
+  dataInFigure?: boolean;
+  /** Page-local y where the question block ends and the solution should start. */
+  startY?: number;
+  /** The question lines already written on the board, so the model does not repeat them. */
+  boardQuestion?: string[];
+}): string {
+  const base = buildSystemPrompt(opts);
+  const sols = opts.solutions ?? [];
+  const onBoard = opts.boardQuestion?.length
+    ? `\n# ALREADY ON THE BOARD (you did not write this — do not write it again)
+The heading and the full question text are already written at the top of this page:
+${opts.boardQuestion.map((l) => `    ${l}`).join("\n")}
+Your FIRST beat starts the SOLUTION at y≈${Math.round(opts.startY ?? 200)} — its first draw op is a step of the working, not a restatement.
+Do NOT write a title, a heading, a "Q4: ..." line, or any paraphrase of the question: it is already up there and repeating it wastes the page. Never use the "clear" op — it would erase it.\n`
+    : "";
+
+  // The book's solution, when we have it. Flagged per record so the model knows
+  // which parts it may quote and which it must work out itself. Crucially, a
+  // non-exact match is labelled as such: it is a similar question found by search,
+  // and solving THAT instead of what the student asked would be worse than useless.
+  const reference = !sols.length
+    ? `\n# NO BOOK SOLUTION FOUND
+The solution index had nothing for this question, so work it out yourself, carefully, using the method the student's textbook would use at this level. Do not mention that you could not find it — just solve it.\n`
+    : !opts.exactSolution
+      ? `\n# SIMILAR QUESTIONS FROM THE BOOK (reference only — NOT the question you were asked)
+The student did not name a textbook item, so these were found by similarity. They are here only to show the method and notation their book uses. SOLVE THE QUESTION THE STUDENT ACTUALLY ASKED, with their numbers; do not drift into any of these.
+${sols
+  .map((s, i) => `## ${i + 1}. ${s.label}\nQuestion: ${s.question}${s.hasImageAnswer ? "" : `\nMethod: ${s.answer.slice(0, 700)}`}`)
+  .join("\n\n")}\n`
+      : `\n# THE BOOK'S SOLUTION (ground truth — this IS the question asked; follow this method)
+${sols
+  .map((s, i) => {
+    const head = `## ${i + 1}. ${s.label}${s.chapterTitle ? ` — ${s.chapterTitle}` : ""}`;
+    const q = `Question: ${s.question}`;
+    if (s.hasImageAnswer)
+      return `${head}\n${q}\nAnswer: (the book prints this answer as a picture, so there is no text to follow — work it out yourself and DRAW the result on the board)`;
+    const caveat =
+      s.mathQuality === "poor"
+        ? "\n(NOTE: this solution's formulas were mangled when the PDF was read — subscripts, powers and fractions may be wrong or run together. Trust the METHOD and the reasoning, re-derive every number yourself, and write the maths correctly on the board. Never read a garbled expression aloud.)"
+        : "";
+    return `${head}\n${q}\nAnswer: ${s.answer}${caveat}`;
+  })
+  .join("\n\n")}\n`;
+
+  // The solution sheet lost this question's data (it was a picture there), but the
+  // textbook passages above often still carry it — the chapter text prints the very
+  // list the question points at. So: look there first, and only fall back to teaching
+  // the method if it genuinely is not there. Never fill the gap by guessing.
+  const figureNote = opts.dataInFigure
+    ? `\n# THIS QUESTION'S VALUES WERE A PICTURE IN THE SOLUTION SHEET
+The question text above refers to values — a figure, a table, boxes, a list of sub-parts — that did not survive as text in the solution sheet.
+- FIRST look for them in the textbook passages above: the chapter text usually prints the exact list or figure this question points at (often right after the question number). If you find them, use those real values and solve it fully and normally.
+- ONLY if they are genuinely not there: do not guess. Name the rule the question tests, work ONE example you clearly introduce as your own, and close by telling the student to read the real values from the figure in their book and repeat the same steps.\n`
+    : "";
+
+  return `${base}
+${onBoard}${reference}${figureNote}
+# THIS TURN — SOLVE the question, explaining as you go
+The student picked "solve a question" and named this one. They are not asking for a lesson on the topic; they want to understand how this question is done. So:
+- START SOLVING IMMEDIATELY. No greeting, no "let's see what this is about", no asking whether they have studied the topic, no roadmap, no plan, no restating the question. Your first beat already does real work on the problem — the first thing you write on the board is a line of actual working.
+- Explain WHY at each step, not just what. The point is that they can do the next one alone: name the rule or formula as you use it, and say briefly where it comes from. One line of theory where a step needs it — woven in, never a separate lecture up front.
+- Work it on the board the way you would on paper: one line of working per beat, under the question, going down the page. Write every formula and every numeric step — the student must be able to copy the whole solution off the board.
+- Keep the spoken line and the written line about the same step. Say the reasoning; write the maths.
+- Use the question's ACTUAL numbers. Never substitute a rounder or easier version.
+- 3-8 beats. End by stating the final answer clearly, and box or underline it (a \`rect\` around it, or a \`highlight\`) so it stands out.
+- Do NOT quiz the student and do NOT end on a question. If they have a doubt they will interrupt, and that is handled separately.
+
+# OUTPUT FORMAT — RE-READ BEFORE YOU WRITE
+Your ENTIRE reply is lines of NDJSON. Every line is one complete JSON object starting with \`{\` and ending with \`}\`. Strict JSON: every key AND every string value in double quotes, numbers bare, no trailing commas. No prose, no blank lines, no \`---\`, no code fences, nothing before the first \`{\` or after the last \`}\`.
+First character of your reply: \`{\``;
+}
+
+/**
+ * Doubt raised while a question is being solved.
+ *
+ * Same shape as buildDoubtSystemPrompt, but the context is the question on the board
+ * rather than a lesson plan — and crucially the model must NOT restart the solution:
+ * the student asked about one step of it.
+ */
+export function buildSolveDoubtSystemPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  textbook?: Passage[];
+  solutions?: SolutionContext[];
+  /** The question currently being solved. */
+  solving?: string | null;
+}): string {
+  const base = buildSystemPrompt(opts);
+  const sols = opts.solutions ?? [];
+  const context = opts.solving
+    ? `\n# THE QUESTION BEING SOLVED (context — do NOT start it over)\n${opts.solving}\n${
+        sols.length && !sols[0].hasImageAnswer ? `\nThe book's method, for your reference:\n${sols[0].answer}\n` : ""
+      }`
+    : "";
+
+  return `${base}
+${context}
+# THIS TURN — the student has a DOUBT about the solution in progress
+They stopped you mid-solution to ask about something. Clear up EXACTLY that, then stop. This is a side-note, not a re-solve.
+- Keep it SHORT: 1-4 beats. Answer only what they asked.
+- If the doubt is about the THEORY behind a step ("why does that formula work?", "what is a common difference?"), explain just that idea, simply, with a small drawing if it helps.
+- This goes on its OWN fresh page beside the solution page. NEVER redraw the question or the working so far — those pages stay as they are, and the solution resumes from where it was interrupted. Do not use the "clear" op.
+- PREFER pointing over redrawing: an \`arrow\` or \`highlight\` with "temp":true to point at the step in question, rather than new permanent structure.
+- End with a short check that the doubt is cleared (e.g. "${languageRule(opts.language).doubtCheckSay}"), its \`say\` ending with "?", and put that question on this page as a short orange text op. Then stop.
+
+# OUTPUT FORMAT — RE-READ BEFORE YOU WRITE
+Your ENTIRE reply is 1-4 lines of NDJSON. Every line is one complete JSON object starting with \`{\` and ending with \`}\`. Strict JSON: every key AND every string value in double quotes, numbers bare, no trailing commas. No prose, no code fences, nothing before the first \`{\` or after the last \`}\`.
+First character of your reply: \`{\``;
 }
 
 /** The lesson plan rendered as a compact outline the teacher/doubt models read for context. */

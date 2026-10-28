@@ -48,6 +48,10 @@ next-env.d.ts
 # from them by rag/build_index.py. Keep both out of git.
 /rag/data/
 
+# Solution PDFs (Vedantu, ~785 MB) are third-party copyright for the same reason, and
+# rag/build_solutions.py + rag/embed_solutions.py regenerate everything derived from them.
+/rag/NCERT_Solutions/
+
 # python
 __pycache__/
 *.pyc

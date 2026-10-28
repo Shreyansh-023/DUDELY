@@ -233,6 +233,29 @@ export function isExplainRequest(text: string): boolean {
 }
 
 /**
+ * In the solve track, is this a NEW question to work rather than a doubt about the
+ * one just solved?
+ *
+ * The test is deliberately asymmetric. A doubt is the common case and the costlier
+ * thing to get wrong (restarting the board instead of answering), so only two kinds
+ * of message count as a new question: one that names a book item by position
+ * ("exercise 5.3 q2", "अभ्यास 5.3"), or a bare "next"-style nudge with no question
+ * word in it. Anything else — including anything with a question mark — is a doubt.
+ */
+export function isNextQuestion(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return false;
+  // Names a specific item by number: unambiguously a new thing to solve.
+  if (/(exercise|abhyaas|abhyas|prashnavali|प्रश्नावली|अभ्यास|question|prashn|sawaal|sawal|प्रश्न|सवाल|example|udaharan|उदाहरण|\bq\b)\s*[:#.\-]?\s*\d/i.test(t))
+    return true;
+  // A plain "do the next one" with nothing being asked about the current solution.
+  if (/[?？]/.test(t)) return false;
+  if (/(why|how|what|kyun|kyu|kaise|kya|क्यों|कैसे|क्या|samajh nahi|समझ नहीं|confus|doubt|explain|matlab|मतलब)/.test(t))
+    return false;
+  return /(next|aage|आगे|another|ek aur|एक और|agla|अगला|dusra|दूसरा|more|solve|karo|करो)/.test(t);
+}
+
+/**
  * During a doubt, decide whether the student's reply means "I'm satisfied, carry
  * on" (resume the lesson) rather than a further question. Anything with a question
  * mark, a question word, or a negation is treated as another doubt (returns false).

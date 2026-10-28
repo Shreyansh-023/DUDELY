@@ -10,13 +10,14 @@ import {
   familiarityQuestion,
   isDoubtCleared,
   isExplainRequest,
+  isNextQuestion,
   planningLines,
   resumeLine,
   roadmapIntro,
   voicePrompts,
 } from "@/lib/languages";
 import { blankPageCanvas, CONTENT_LEFT, CONTENT_TOP } from "@/lib/canvas/page";
-import type { Beat, HistoryMessage, LessonPlan, TutorEvent } from "@/lib/schema";
+import type { Beat, HistoryMessage, LessonPlan, TutorEvent, TutorTrack } from "@/lib/schema";
 import { AsyncQueue, uid } from "@/lib/utils";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
 import { LiveTranscriber, liveSttUnavailable, prewarmLiveStt, relayUrl } from "@/lib/voice/live-stt";
@@ -28,6 +29,7 @@ import Composer, { joinDictation } from "./Composer";
 import { LogoTile, Wordmark } from "./Logo";
 import LanguageMenu from "./LanguageMenu";
 import Transcript from "./Transcript";
+import TrackPicker from "./TrackPicker";
 import VoiceCapture from "./VoiceCapture";
 import VoiceReview from "./VoiceReview";
 import { useVoiceLoop } from "./useVoiceLoop";
@@ -413,6 +415,24 @@ export default function Tutor() {
     familiarity: "new" | "some" | "confident" | null;
   }>({ phase: "none", plan: null, step: 0, topic: "", familiarity: null });
   const [lessonPhase, setLessonPhase] = useState<LessonPhase>("none");
+  // Which pipeline the student picked before their first question. "learn" is the
+  // staged lesson (familiarity → plan → steps); "solve" goes straight to a worked
+  // solution with no plan stage. Null until they choose.
+  const [track, setTrack] = useState<TutorTrack | null>(null);
+  const trackRef = useRef<TutorTrack | null>(null);
+  useEffect(() => {
+    trackRef.current = track;
+  }, [track]);
+  // Solve-track state: the question currently on the board, so a mid-solution doubt
+  // can be answered in its context and "next" knows what was just solved.
+  const solveRef = useRef<{ question: string | null; label: string | null; solved: boolean }>({
+    question: null,
+    label: null,
+    solved: false,
+  });
+  // Mirrored for render (the composer's placeholder changes once something is on the
+  // board); the ref stays the source of truth for the async turn callbacks.
+  const [solveStarted, setSolveStarted] = useState(false);
   // The planner is thinking. Designing a lesson is the one genuinely slow call
   // in the app, so the wait gets a screen of its own — and `planOutline` fills
   // it with the real steps as the planner writes them, so the student is
@@ -620,7 +640,7 @@ export default function Tutor() {
   const runTurn = useCallback(
     async (spec: {
       text: string;
-      mode: "doubt" | "explain" | "ask";
+      mode: "doubt" | "explain" | "ask" | "solve" | "solvedoubt";
       /** Draw this turn on its own NEW page: a doubt, or an explain detour. Both
        *  are interruptions whose content stays off the teaching page and is
        *  skipped when teaching resumes. */
@@ -674,10 +694,20 @@ export default function Tutor() {
             mode: spec.mode,
             plan: lessonRef.current.plan ?? undefined,
             familiarity: lessonRef.current.familiarity ?? undefined,
+            track: trackRef.current ?? undefined,
+            // On a doubt mid-solution, what is being solved is the context the
+            // model needs in place of a lesson plan.
+            solving: spec.mode === "solvedoubt" ? (solveRef.current.question ?? undefined) : undefined,
           },
           ac.signal,
           (ev) => {
-            if (ev.type === "beat") {
+            if (ev.type === "question") {
+              // The server laid the question out itself (no LLM). Draw it at once,
+              // silently, so the board shows the problem while the model works.
+              solveRef.current.question = ev.question;
+              solveRef.current.label = ev.label;
+              queue.push({ beat: ev.beat, audio: null });
+            } else if (ev.type === "beat") {
               // Prefetch speech the moment a beat arrives so audio is ready when its turn comes.
               const audio =
                 cfg.tts === "sarvam"
@@ -1251,6 +1281,30 @@ export default function Tutor() {
       if (!text || !boardRef.current) return;
       const L = lessonRef.current;
 
+      // ---- SOLVE track: no familiarity question, no plan, no steps. ----
+      // The student named a question, so the first turn already solves it. A reply
+      // while a solution is on the board is either "next question" (solve it) or a
+      // doubt about the solution (answer it beside, without restarting).
+      if (trackRef.current === "solve") {
+        if (!solveRef.current.solved) {
+          solveRef.current.solved = true;
+          setSolveStarted(true);
+          setLesson("teaching"); // enables the Doubt affordances; there is no plan to run
+          await runTurn({ text, mode: "solve" });
+          return;
+        }
+        // A doubt about the solution just given.
+        if (!isNextQuestion(text)) {
+          await runTurn({ text, mode: "solvedoubt", interrupt: true });
+          return;
+        }
+        // "next"/"another one" with no question in it: nothing to solve yet.
+        solveRef.current.question = null;
+        solveRef.current.label = null;
+        await runTurn({ text, mode: "solve" });
+        return;
+      }
+
       if (L.phase === "none") {
         L.plan = null;
         L.step = 0;
@@ -1568,6 +1622,8 @@ export default function Tutor() {
     setMessages([]);
     setError(null);
     lessonRef.current = { phase: "none", plan: null, step: 0, topic: "", familiarity: null };
+    solveRef.current = { question: null, label: null, solved: false };
+    setSolveStarted(false);
     setPlanning(false);
     setPlanOutline([]);
     setLessonPhase("none");
@@ -1576,16 +1632,36 @@ export default function Tutor() {
     lastTeachRef.current = null;
   };
 
+  /** Choose (or change) the pipeline. Changing it mid-session starts clean: the
+   *  two tracks keep different state, and carrying a half-taught lesson into the
+   *  solve track (or vice versa) has no sensible meaning. */
+  const pickTrack = useCallback(
+    (next: TutorTrack) => {
+      if (next === trackRef.current) return;
+      trackRef.current = next;
+      newTopic();
+      setTrack(next);
+    },
+    // newTopic is a plain closure recreated each render by design; it only touches
+    // refs and setters, so capturing the latest one here is safe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
   const busy = status === "thinking" || status === "teaching";
   // In voice mode the chat is hidden until the hamburger reopens it.
   const showChat = !voiceMode || chatPanelOpen;
   // The composer invites the right kind of input for the current lesson stage.
   const composerPlaceholder =
-    lessonPhase === "awaitFamiliarity"
-      ? "Answer: have you learned this before, or is it new?"
-      : lessonPhase === "doubt"
-        ? "Ask your doubt… (say “got it” to continue the lesson)"
-        : askPlaceholder(language);
+    track === "solve"
+      ? solveStarted
+        ? "Ask about a step, or name the next question…"
+        : "Which question? e.g. “exercise 5.2 question 3”"
+      : lessonPhase === "awaitFamiliarity"
+        ? "Answer: have you learned this before, or is it new?"
+        : lessonPhase === "doubt"
+          ? "Ask your doubt… (say “got it” to continue the lesson)"
+          : askPlaceholder(language);
 
   // Voice-stage derived state. The student's words get their own box (see
   // showSpeechBox); the caption strip below it carries Indica's side — the
@@ -1672,6 +1748,29 @@ export default function Tutor() {
               writeLocal("guru.subject", next.subject ?? "");
             }}
           />
+          {/* Track toggle: switching restarts, since a lesson and a solved
+              question share no state. Hidden until a track is chosen. */}
+          {track !== null && (
+            <div className="flex overflow-hidden rounded-lg border border-amber-200/70 text-[12px]">
+              {(["learn", "solve"] as const).map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => pickTrack(t)}
+                  aria-pressed={track === t}
+                  title={t === "learn" ? "Understand a topic, step by step" : "Solve a question, with full working"}
+                  className={
+                    "px-2.5 py-1 font-medium transition " +
+                    (track === t
+                      ? "bg-amber-500 text-white"
+                      : "bg-white text-neutral-600 hover:bg-amber-50")
+                  }
+                >
+                  {t === "learn" ? "Learn" : "Solve"}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             type="button"
             onClick={newTopic}
@@ -1736,6 +1835,10 @@ export default function Tutor() {
         )}
         {/* The lesson is being designed — the board is still blank, so the wait
             owns the middle of it in both modes. */}
+        {/* First choice of the session: learn a topic, or solve a question. The
+            solve pipeline can only skip the familiarity question because this was
+            answered up front. */}
+        {track === null && <TrackPicker onPick={pickTrack} />}
         {planning && <PlanningCard steps={planOutline} />}
         {/* Page navigation, and the way back to the page Indica is writing on.
             Carries the name of Excalidraw's own "Scroll back to content"

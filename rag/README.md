@@ -212,6 +212,125 @@ index (which still works, just in English).
 
 ---
 
+## 7b. Solution sets (NCERT_Solutions)
+
+A second, separate corpus: Vedantu solution sheets for classes 1-10 (Maths, Science, EVS),
+one PDF per chapter or exercise. These are already question-and-answer shaped, so they are
+parsed into **one JSON record per Q/A pair** rather than chunked by size, which keeps a
+question and its answer together in retrieval.
+
+```bash
+# 1. parse the PDFs -> rag/data/solutions/solutions.json (the source of truth)
+python rag/build_solutions.py
+python rag/build_solutions.py --classes 9 10 --subjects MATHS   # subset
+
+# 2. embed that JSON -> rag/data/index/solutions/<book>/ (chunks.json + vectors.f32 + meta.json)
+python rag/embed_solutions.py
+python rag/embed_solutions.py --dry-run      # chunk + report, no API calls
+python rag/embed_solutions.py --force        # re-embed books already current
+```
+
+Step 2 skips any book whose index already matches its chunk count and embedding model, so an
+interrupted run resumes where it stopped; dropped connections are retried (the hosted NIM
+occasionally closes a response mid-body on a long run).
+
+Input PDFs live in `rag/NCERT_Solutions/Class_<n>/{MATHS,SCIENCE,EVS}/` and are git-ignored
+(third-party copyright, ~785 MB), as is everything derived from them.
+
+**Record fields** worth knowing when consuming the index:
+
+| Field | Meaning |
+| --- | --- |
+| `question` / `answer` | the pair; `answer` is `""` when the printed solution was a diagram |
+| `has_image_answer` | the answer was a picture — the model must solve it itself rather than quote |
+| `math_quality` | `clean` / `degraded` / `poor` — see below |
+| `chapter`, `chapter_title`, `section`, `exercise`, `number` | for positional lookups ("exercise 8.2 q3") |
+| `textbook_page` | NCERT page the question sits on, where the sheet states it |
+| `source_pdf` | provenance, relative to `rag/NCERT_Solutions/` |
+
+### Gotchas this pipeline already handles
+
+- **Extract with `sort=True`.** Without it the older MathType-rendered PDFs come out as a
+  column of 1-3 character fragments (Class 10 Maths: 78% such lines -> 11% with sorting).
+- **`math_quality`** flags what sorting cannot repair: absolute-positioned glyphs lose
+  sub/superscripts and fraction bars, so `a_4 = -2` arrives as `a 4 = -.2` and a row of
+  fractions flattens into a 2-D grid. Concentrated in Class 10 Maths. Do not quote a `poor`
+  record's formulas back to a student verbatim.
+- **Four question-label generations** coexist and all are parsed: `1.` + `Ans:`,
+  `Question 1.` + `Solution:`, `Question 1:` + `Solution 1:`, and `A.` / `B.` in classes 1-2.
+  Handling only the first two loses ~900 pairs and leaves 25 files empty.
+- **Multi-part questions** (`(i)`, `(ii)`, each with its own `Ans:`) are split into separate
+  records, numbered `3(ii)`.
+- **Filenames can lie.** "Statistics Exercise 13.1" actually contains Chapter 14 Probability,
+  so the chapter number comes from the heading printed inside the PDF; the title is taken from
+  whichever of the two sources is more complete (the in-document heading often wraps mid-title).
+- **Duplicate questions** across a chapter PDF and its exercise PDFs are deduped on prose words
+  only (the same equation renders differently in each file), preferring the copy whose maths
+  survived better. 17 fully-redundant Class 10 Maths exercise PDFs were deleted outright.
+- **Hindi editions are skipped**: their fonts extract as mojibake, so there is nothing to embed.
+- Classes 1-3 are ~50% diagram answers by design; they are kept with `has_image_answer: true`
+  so the tutor knows to work the answer out rather than read one off.
+
+---
+
+## 7c. The two pipelines (learn vs solve)
+
+The student picks one before their first question (`TrackPicker`, full-screen); the
+header keeps a Learn/Solve toggle for changing later. Switching restarts, because the
+two tracks share no state.
+
+| | **learn** (track `learn`) | **solve** (track `solve`) |
+| --- | --- | --- |
+| First turn | asks familiarity, then plans | **solves immediately** |
+| Stages | `plan` → `teach` ×N | `solve` (one turn, no plan) |
+| Doubts | `doubt` (+ `explain` detour) | `solvedoubt` |
+| Grounding | textbook index (`lib/rag`) | solutions index (`lib/solutions`) + textbook |
+| Question on board | model draws it | **written deterministically** |
+
+### Why solve has no plan stage
+A student who names a question wants that question worked, not a lesson on the topic.
+So `solve` skips the familiarity question *and* the planner: the book's method is
+already in the prompt, so thinking stays off and the first beat arrives fast.
+Theory is woven into the step that needs it rather than gated behind a question.
+
+### The question is NOT drawn by the LLM
+`lib/question-board.ts` lays out the heading + question text as draw ops, server-side,
+and the route streams them as a `question` event *before* the first beat. The text is
+already known exactly, so asking a model for it would only add latency and a chance of
+paraphrasing or re-numbering it. The prompt is told it is already on the board, with
+the y to start the solution at.
+
+Width is estimated, not measured (`measure.ts` needs a DOM canvas): the ratios in that
+file deliberately **err high**, so a line wraps early rather than running off the page.
+
+### Retrieval order is reversed from the textbook index
+Positional first — "exercise 5.2 question 3" is an exact lookup, needing no embedding
+call — and question-text search only as a fallback. Asking for question 3 returns its
+sub-parts too (`3`, `3(i)`, `3(ii)`…), in printed order, so a multi-part question is
+worked whole.
+
+### Gotchas worth knowing
+
+- **Only an EXACT reference may supply the board's question.** A semantic hit is a
+  *similar* question, not the one asked. Writing it on the board meant a student asking
+  their own sum watched a different textbook problem appear — caught in testing. Hence
+  `exactSolution`: false routes the student's own words to the board, labels the
+  retrieved records "reference only, NOT the question asked", and marks `sources`
+  `(similar)`.
+- **A `has_image_answer` question may still be solvable.** The solution sheet lost the
+  values (they were a picture), but the *textbook* index often prints the very list the
+  question points at — Ex 5.2 Q3's `(i) 2, □, 26` is in the chapter text. So
+  `referencesMissingData()` flags the case and the prompt says: look in the textbook
+  passages first, and only teach the method if the values genuinely are not there.
+  Never guess. This is also why solve mode takes 4 textbook passages, not 2.
+- **`math_quality: "poor"` records carry a caveat** telling the model to trust the
+  method but re-derive every number. Verified working: on Ex 5.1 Q4 it correctly
+  rebuilt fractions the PDF had mangled.
+- **A mid-solution doubt must not restart the solution.** `solvedoubt` gets its own
+  page beside the working and is told the question being solved as context.
+
+---
+
 ## 8. Config & environment
 
 | Var | Where | Default | Purpose |
@@ -222,6 +341,10 @@ index (which still works, just in English).
 | `RAG_TOP_K` | env | `3` | semantic passages per turn |
 | `RAG_EMBED_TIMEOUT_MS` | env | `2500` | query-embed timeout → falls back to BM25-only |
 | `NVIDIA_EMBED_URL` | env | `https://integrate.api.nvidia.com/v1/embeddings` | NIM endpoint |
+| `RAG_SOLUTIONS_DIR` | env | `<RAG_INDEX_DIR>/solutions` | where solve mode reads the solutions index |
+| `RAG_TOP_K_SOLVE` | env | `3` | solutions returned per solve turn |
+| `RAG_TOP_K_SOLVE_BOOK` | env | `4` | textbook passages on a solve turn (carries figure data) |
+| `RAG_TOP_K_SOLVEDOUBT` | env | `3` | textbook passages on a mid-solution doubt |
 
 Embeddings run **off Groq** (Groq has no embedding endpoint); generation stays 100% on Groq.
 At query time the only non-Groq call is one stateless embedding request for the question, and

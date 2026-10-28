@@ -297,11 +297,13 @@ export function getModelChain(mode: string): { model: LanguageModel; label: stri
       push(nvidiaModel(LESSON_MODEL, { thinking: true }));
       push(nvidiaModel(DOUBT_MODEL, { thinking: true }));
       push(nvidiaModel(OTHER_NVIDIA_MODEL));
-    } else if (mode === "teach" || mode === "explain") {
+    } else if (mode === "teach" || mode === "explain" || mode === "solve") {
+      // Solve sits with teach: the reasoning is already done (the book's method is
+      // in the prompt), so thinking stays off and the first beat arrives fast.
       push(nvidiaModel(LESSON_MODEL, { thinking: false }));
       push(nvidiaModel(DOUBT_MODEL, { thinking: false }));
       push(nvidiaModel(OTHER_NVIDIA_MODEL));
-    } else if (mode === "doubt") {
+    } else if (mode === "doubt" || mode === "solvedoubt") {
       push(nvidiaModel(LESSON_MODEL, { thinking: false }));
       push(nvidiaModel(DOUBT_MODEL, { thinking: false }));
       push(nvidiaModel(OTHER_NVIDIA_MODEL));

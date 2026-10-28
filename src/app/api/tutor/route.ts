@@ -11,11 +11,15 @@ import {
   buildDoubtSystemPrompt,
   buildExplainSystemPrompt,
   buildPlanPrompt,
+  buildSolveDoubtSystemPrompt,
+  buildSolveSystemPrompt,
   buildSystemPrompt,
   buildTeachSystemPrompt,
   buildUserTurn,
 } from "@/lib/prompt";
+import { questionBeat } from "@/lib/question-board";
 import { retrieveTextbookContext, type Passage } from "@/lib/rag";
+import { retrieveSolutions, type Solution } from "@/lib/solutions";
 import {
   BeatSchema,
   LessonPlanSchema,
@@ -46,7 +50,7 @@ export async function POST(req: Request) {
   if (!parsed.success) {
     return Response.json({ error: "Bad request", issues: parsed.error.issues }, { status: 400 });
   }
-  const { messages, canvas, language, profile, mode, step, familiarity } = parsed.data;
+  const { messages, canvas, language, profile, mode, step, familiarity, solving } = parsed.data;
   const grade = (parsed.data.grade ?? null) as Grade | null;
   const subject = (parsed.data.subject ?? null) as SubjectId | null;
   const plan: LessonPlan | null = parsed.data.plan ?? null;
@@ -74,13 +78,47 @@ export async function POST(req: Request) {
   const book = textbookKey(grade, subject);
   let edition = "";
   let passages: Passage[] = [];
+  // Solve turns also look up the book's own worked solution for the question named.
+  // Like textbook grounding this is additive: no index, no match or a failure all
+  // mean the model works the problem out itself.
+  let solutions: Solution[] = [];
+  /** True only when the student named the item by position, so the match is certain. */
+  let exactSolution = false;
+  const solveTurn = mode === "solve" || mode === "solvedoubt";
   if (book) {
     try {
       ({ edition, passages } = await retrieveTextbookContext(book, messages, { mode }));
     } catch (err) {
       console.warn(`[tutor] textbook retrieval failed for ${book}: ${errorMessage(err)}`);
     }
+    if (solveTurn) {
+      try {
+        ({ solutions, exactSolution } = await retrieveSolutions(book, messages));
+      } catch (err) {
+        console.warn(`[tutor] solution retrieval failed for ${book}: ${errorMessage(err)}`);
+      }
+    }
   }
+
+  // The question that goes on the board, and that the model is told not to re-write.
+  //
+  // Only an EXACT reference ("exercise 5.1 q4") may supply it. A semantic hit is a
+  // guess — asked to solve their own sum, the student would otherwise watch the board
+  // fill with a different, merely similar question from the book. Their own words are
+  // always right about what they asked.
+  const askedText = messages.filter((m) => m.role === "user").at(-1)?.text.trim() ?? "";
+  const boardQuestion = mode === "solve" ? (exactSolution ? solutions[0].question.trim() : askedText) : "";
+  const boardLabel = mode === "solve" && exactSolution ? (solutions[0]?.label ?? null) : null;
+  const written = mode === "solve" && boardQuestion
+    ? questionBeat({ question: boardQuestion, heading: boardLabel })
+    : null;
+  // Spot the questions whose own data was a picture: the book answered with a figure
+  // AND the question text does not carry the values it talks about. Without this the
+  // model fills the gap with invented numbers and presents them as the book's.
+  const dataInFigure =
+    exactSolution && solveTurn && solutions.length > 0 && solutions[0].hasImageAnswer
+      ? referencesMissingData(solutions[0].question)
+      : false;
 
   // System prompt per stage. Teaching and doubt reuse the shared board-rules prompt
   // (plus their framing); planning uses its own designer prompt.
@@ -94,7 +132,18 @@ export async function POST(req: Request) {
           ? buildDoubtSystemPrompt({ ...promptCtx, plan })
           : mode === "explain"
             ? buildExplainSystemPrompt({ ...promptCtx, plan })
-            : buildSystemPrompt(promptCtx);
+            : mode === "solve"
+              ? buildSolveSystemPrompt({
+                  ...promptCtx,
+                  solutions,
+                  exactSolution,
+                  dataInFigure,
+                  startY: written?.nextY,
+                  boardQuestion: written?.lines,
+                })
+              : mode === "solvedoubt"
+                ? buildSolveDoubtSystemPrompt({ ...promptCtx, solutions, solving: solving ?? null })
+                : buildSystemPrompt(promptCtx);
 
   const last = messages.length - 1;
   // With thinking off, a model can forget the NDJSON contract — and how much to
@@ -103,11 +152,13 @@ export async function POST(req: Request) {
   // length reminder most: left to itself a no-thinking teacher will answer a
   // whole lesson step in one short sentence.
   const formatNudge =
-    mode === "doubt"
+    mode === "doubt" || mode === "solvedoubt"
       ? "\n\n---\nReply with NDJSON beats only: 1-4 lines, each a complete JSON object. No prose."
       : mode === "teach" || mode === "explain"
         ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 3-6 beats, and draw on the board — one short sentence is not a step."
-        : "";
+        : mode === "solve"
+          ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. The question is already on the board: start at the first step of the solution, show every step of the working, and box the final answer."
+          : "";
   const rawMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
     return { role: "user", content: i === last ? buildUserTurn({ text: m.text, canvas }) + formatNudge : m.text };
@@ -118,7 +169,7 @@ export async function POST(req: Request) {
   // unusually large retrieval can never push it over the model's limit.
   let system = systemPrompt;
   let modelMessages = rawMessages;
-  if (mode === "doubt") {
+  if (mode === "doubt" || mode === "solvedoubt") {
     const fitted = fitDoubtContext(system, modelMessages);
     if (fitted.trimmed > 0) {
       console.warn(`[tutor] doubt context over budget; dropped ${fitted.trimmed} oldest message(s)`);
@@ -134,10 +185,21 @@ export async function POST(req: Request) {
       send({
         type: "meta",
         model: primary.label,
-        ...(passages.length > 0
-          ? { sources: passages.map((p) => `${book} ${edition}: ${p.label} (pdf p.${p.pages.join("-")})`) }
+        ...(passages.length > 0 || solutions.length > 0
+          ? {
+              sources: [
+                ...solutions.map((s) => `${book} solutions: ${s.label}${exactSolution ? "" : " (similar)"}`),
+                ...passages.map((p) => `${book} ${edition}: ${p.label} (pdf p.${p.pages.join("-")})`),
+              ],
+            }
           : {}),
       });
+      // The question goes up before the model has written a word: it is already
+      // known exactly, so laying it out here (rather than asking the LLM for it)
+      // costs nothing, cannot be paraphrased, and fills the board during the wait.
+      if (written) {
+        send({ type: "question", beat: written.beat, question: boardQuestion, label: boardLabel });
+      }
       try {
         if (mode === "plan") {
           await streamPlan({
@@ -156,11 +218,13 @@ export async function POST(req: Request) {
             signal: req.signal,
             send,
             // The doubt model is a small MoE; low temperature keeps it on the
-            // strict NDJSON beat format instead of drifting into prose.
-            temperature: mode === "doubt" ? 0.2 : 0.6,
+            // strict NDJSON beat format instead of drifting into prose. Solving is
+            // held low too: a worked solution should follow the book's method, not
+            // improvise around it.
+            temperature: mode === "doubt" || mode === "solvedoubt" ? 0.2 : mode === "solve" ? 0.3 : 0.6,
             // A doubt is a spoken side-note, so prose with no drawing is still a
             // usable answer — speak it rather than failing the student's question.
-            salvageProse: mode === "doubt",
+            salvageProse: mode === "doubt" || mode === "solvedoubt",
           });
         }
       } finally {
@@ -570,6 +634,28 @@ class StepScanner {
     const parsed = LessonStepSchema.safeParse(value);
     if (parsed.success && parsed.data.title.trim()) this.onStep(parsed.data, this.count++);
   }
+}
+
+/**
+ * Does this question point at data it does not actually contain?
+ *
+ * "In the following APs find the missing term in the blanks" names a list that the PDF
+ * printed as a picture: the text survives, the values do not. Contrast "Find the sum of
+ * the first 22 terms of an AP in which d = 7", which carries its own numbers. The test
+ * is deliberately conservative — it only fires on a phrase that explicitly defers to
+ * something else AND a question too sparse in numbers to stand alone — because a false
+ * positive turns a solvable question into a method lecture.
+ */
+function referencesMissingData(question: string): boolean {
+  const defers =
+    /\b(following|below|above|given (?:figure|table|diagram|graph)|in the (?:blanks?|boxes?|figure|table|diagram|graph)|shown|adjoining|these shapes?|each of the)\b/i.test(
+      question,
+    );
+  if (!defers) return false;
+  // Numbers the question supplies itself. A genuine self-contained question names
+  // several; a pointer to a figure names none or one (often just the question number).
+  const numbers = question.match(/-?\d+(?:\.\d+)?/g) ?? [];
+  return numbers.length <= 2;
 }
 
 function errorMessage(err: unknown): string {

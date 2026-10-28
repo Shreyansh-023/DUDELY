@@ -347,9 +347,25 @@ export type LessonPlan = z.infer<typeof LessonPlanSchema>;
  *   explain -> work a specific textbook item (example/exercise/theorem) the student
  *              named, as beats (Ultra), drawn on the MAIN canvas like normal teaching
  *   ask     -> legacy single-turn behaviour (no plan); the original tutor loop
+ *
+ * The SOLVE pipeline (track "solve") adds two more. It deliberately has no plan
+ * stage and no familiarity question — the student named a question, so the first
+ * turn already solves it:
+ *   solve      -> explain the solution to the question the student named, as beats,
+ *                 grounded on the solutions index. The question itself is written on
+ *                 the board deterministically (lib/question-board), not by the model.
+ *   solvedoubt -> a doubt raised mid-solution, on its own page, without restarting
  */
-export const TUTOR_MODES = ["plan", "teach", "doubt", "explain", "ask"] as const;
+export const TUTOR_MODES = ["plan", "teach", "doubt", "explain", "ask", "solve", "solvedoubt"] as const;
 export type TutorMode = (typeof TUTOR_MODES)[number];
+
+/**
+ * Which pipeline the student is in, chosen before their first question.
+ *   learn -> understand a topic: familiarity question, lesson plan, step-by-step teaching
+ *   solve -> solve a question: straight into the worked solution, no plan stage
+ */
+export const TUTOR_TRACKS = ["learn", "solve"] as const;
+export type TutorTrack = (typeof TUTOR_TRACKS)[number];
 
 export const TutorRequestSchema = z.object({
   messages: z.array(HistoryMessageSchema).min(1),
@@ -371,6 +387,14 @@ export const TutorRequestSchema = z.object({
   step: z.number().int().min(0).nullish(),
   /** The student's self-reported familiarity with the topic, fed into planning. */
   familiarity: z.enum(["new", "some", "confident"]).nullish(),
+  /** Which pipeline the student chose up front. Only "solve" changes behaviour. */
+  track: z.enum(TUTOR_TRACKS).nullish(),
+  /**
+   * Solve mode: the question text already written on the board by the client, so the
+   * server tells the model not to repeat it. Sent back on a solvedoubt turn too, as
+   * the context of what is being solved.
+   */
+  solving: z.string().nullish(),
 });
 export type TutorRequest = z.infer<typeof TutorRequestSchema>;
 
@@ -382,6 +406,11 @@ export type TutorEvent =
    *  authoritative plan still arrives as a single `plan` event at the end. */
   | { type: "planstep"; index: number; step: LessonStep }
   | { type: "plan"; plan: LessonPlan }
+  /** Solve mode: the question, laid out as draw ops by the server (no LLM involved),
+   *  sent before the first beat so the board shows what is being solved immediately.
+   *  `question` is the plain text, for the transcript and for threading back as
+   *  `solving` on a later doubt turn. */
+  | { type: "question"; beat: Beat; question: string; label: string | null }
   | { type: "beat"; beat: Beat }
   | { type: "done" }
   | { type: "error"; message: string };

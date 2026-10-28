@@ -54,6 +54,12 @@ const TOP_K_BY_MODE: Record<string, number> = {
   doubt: Number(process.env.RAG_TOP_K_DOUBT || 5),
   explain: Number(process.env.RAG_TOP_K_EXPLAIN || TOP_K),
   ask: Number(process.env.RAG_TOP_K_ASK || TOP_K),
+  // Solving is grounded mainly by the solutions index (lib/solutions), but the
+  // textbook passages matter more than "theory for a step": where a question's data
+  // was a figure the solution sheet lost, the chapter text is usually the only place
+  // the real values survive. Worth a few extra passages.
+  solve: Number(process.env.RAG_TOP_K_SOLVE_BOOK || 4),
+  solvedoubt: Number(process.env.RAG_TOP_K_SOLVEDOUBT || 3),
 };
 const CANDIDATES = 30;
 const RRF_K = 60;
