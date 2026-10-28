@@ -15,7 +15,9 @@ import type {
 import type { ExcalidrawImperativeAPI, NormalizedZoomValue } from "@excalidraw/excalidraw/types";
 import type { DrawOp } from "../schema";
 import { clamp, sleep } from "../utils";
+import { flattenMath, hasMathScript, normalizeScripts } from "./mathtext";
 import { isPermanentNote, opToSkeleton, type TutorMeta } from "./ops";
+import { expandMathText } from "./primitives/mathline";
 import {
   CLEARANCE,
   CONTENT_BOTTOM,
@@ -657,6 +659,9 @@ export class BoardPlayer {
    */
   async applyBeat(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
     this.currentTurn = turn;
+    // Rewrite any Unicode "x²"/"H₂O" the model slipped in into ^/_ notation, so
+    // it is laid out as real raised type instead of rendering as mojibake.
+    ops = ops.map(withNormalizedScripts);
     // erase/clear-only beats (and a beat with no draw ops at all) must not
     // allocate a page or move the camera, or an answer given in words alone
     // would leave a blank page behind.
@@ -699,7 +704,7 @@ export class BoardPlayer {
   private expand(op: DrawOp): Expanded {
     let e = this.expandCache.get(op as object);
     if (!e) {
-      e = PRIMITIVES[op.op](op);
+      e = PRIMITIVES[op.op] ? PRIMITIVES[op.op](op) : expandMathText(op);
       this.expandCache.set(op as object, e);
     }
     return e;
@@ -728,7 +733,7 @@ export class BoardPlayer {
     for (const op of ops) {
       if (op.temp === true) continue;
       if (op.op === "arrow" && op.temp !== false) continue; // a bare arrow is a pointing gesture
-      if (PRIMITIVES[op.op]) {
+      if (PRIMITIVES[op.op] || isMathText(op)) {
         const ex = this.expand(op);
         // The declared bbox carries padding the children do not report; the
         // children are exact where the bbox under-covers. Use both.
@@ -772,7 +777,9 @@ export class BoardPlayer {
     // Carry forward any shift collision avoidance made earlier in this turn.
     const carried = this.turnShift.turn === turn ? this.turnShift : { dx: 0, dy: 0 };
     // High-level primitives lay themselves out perfectly, then dodge as one unit.
-    if (PRIMITIVES[op.op]) return this.applyGroup(op, carried, turn, signal);
+    // A text op written with ^/_ notation joins them: it becomes several runs at
+    // different sizes and baselines, which must move together.
+    if (PRIMITIVES[op.op] || isMathText(op)) return this.applyGroup(op, carried, turn, signal);
 
     // A bare `arrow` op is a pointing gesture by default: it fades on its own
     // unless the model explicitly marks it permanent (temp:false). The model
@@ -907,6 +914,9 @@ export class BoardPlayer {
 
   /** Near-zero-area segments (thin lines/arrows) get this much effective thickness. */
   private static MIN_THICK = 6;
+  /** Slack when judging containment, so a hand-picked radius that lands a few
+   *  px proud of its neighbour still counts as nested rather than colliding. */
+  private static NEST_TOL = 8;
   /** A single nudge never moves an element farther than this, so nothing is flung away. */
   private static MAX_TRAVEL = 400;
 
@@ -935,6 +945,22 @@ export class BoardPlayer {
 
   private overlaps(el: ExcalidrawElement, b: { x1: number; y1: number; x2: number; y2: number }, gap: number): boolean {
     return el.x < b.x2 + gap && el.x + el.width > b.x1 - gap && el.y < b.y2 + gap && el.y + el.height > b.y1 - gap;
+  }
+
+  /** True when `el` sits entirely within `b` — the new shape nests inside an old one. */
+  private contains(b: { x1: number; y1: number; x2: number; y2: number }, el: ExcalidrawElement): boolean {
+    const t = BoardPlayer.NEST_TOL;
+    return (
+      el.x >= b.x1 - t && el.y >= b.y1 - t && el.x + el.width <= b.x2 + t && el.y + el.height <= b.y2 + t
+    );
+  }
+
+  /** True when `b` sits entirely within `el` — the new shape encloses an old one. */
+  private containedBy(el: ExcalidrawElement, b: { x1: number; y1: number; x2: number; y2: number }): boolean {
+    const t = BoardPlayer.NEST_TOL;
+    return (
+      b.x1 >= el.x - t && b.y1 >= el.y - t && b.x2 <= el.x + el.width + t && b.y2 <= el.y + el.height + t
+    );
   }
 
   /** Large penalty for a move that would push the element off its own page. */
@@ -980,6 +1006,13 @@ export class BoardPlayer {
     // Only move for a REAL overprint; a near-miss within the gap keeps the model's coords.
     const hit = boxes.filter((b) => this.overlaps(el, b, 0));
     if (!hit.length) return { dx: 0, dy: 0 };
+    // Nesting is deliberate, not a collision: a shape drawn wholly inside an
+    // existing one (concentric circles, a box inside a box, a shaded region in
+    // a figure) means the model placed it there on purpose. Pushing it "clear"
+    // is what made concentric circles impossible to draw by hand. Containment
+    // must hold against EVERY box it touches, so a shape straddling the edge of
+    // a neighbour is still dodged normally.
+    if (hit.every((b) => this.contains(b, el) || this.containedBy(el, b))) return { dx: 0, dy: 0 };
     const onlyThin = hit.every((b) => b.thin);
     const gap = onlyThin ? 7 : 16; // keep tick labels snug to their line
 
@@ -1182,6 +1215,37 @@ export class BoardPlayer {
     this.turnShift = { turn: 0, dx: 0, dy: 0 };
     this.resetPages();
   }
+}
+
+/**
+ * A copy of the op with Unicode script characters in its text rewritten to the
+ * `^`/`_` notation the layout understands. Only `text` ops get the full raised
+ * treatment; a shape or arrow LABEL is bound text that Excalidraw owns, which
+ * cannot hold runs of two sizes, so its scripts are flattened to ordinary
+ * characters ("x²" -> "x2") — plain, but readable, which mojibake is not.
+ */
+function withNormalizedScripts(op: DrawOp): DrawOp {
+  if (!op.text) return op;
+  if (op.op === "text") {
+    if (!HAS_UNICODE_SCRIPT.test(op.text)) return op;
+    return { ...op, text: normalizeScripts(op.text) };
+  }
+  // A label: flatten both notations so neither a stray caret nor a missing
+  // glyph is drawn literally inside the shape.
+  const flat = flattenMath(normalizeScripts(op.text));
+  return flat === op.text ? op : { ...op, text: flat };
+}
+
+const HAS_UNICODE_SCRIPT = /[²³¹⁰-₟ⁱ]/;
+
+/**
+ * True for a `text` op that needs superscript/subscript layout. Such an op is
+ * drawn as a GROUP of differently-sized runs rather than one element, so it
+ * takes the same path as the diagram primitives: laid out by code, moved as one
+ * unit by collision avoidance, erased by its single id.
+ */
+function isMathText(op: DrawOp): boolean {
+  return op.op === "text" && hasMathScript(op.text);
 }
 
 /** A copy of the op moved by (dx, dy) — start and end points alike. */

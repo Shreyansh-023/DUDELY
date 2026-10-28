@@ -30,6 +30,7 @@ export const OPS = [
   "angle",
   "vector",
   "table",
+  "circles",
   "circuit",
   "optics",
   "molecule",
@@ -87,6 +88,10 @@ export const DrawOpSchema = z.object({
   // .catch keeps an op alive when the model picks a word outside the enum
   // (e.g. "yellow", "small"): it falls back to null and the consumer defaults it.
   size: z.enum(SIZES).nullish().catch(null).describe("Text size: sm=16px, md=24px (default), lg=36px."),
+  // Internal: set by the superscript/subscript expander, which needs the exact
+  // reduced size of an exponent rather than one of the three named sizes. The
+  // model never sets this; `size` stays the only text-size control it has.
+  px: z.number().nullish().catch(null).optional(),
   color: z.enum(COLORS).nullish().catch(null).describe("Stroke/text colour. Default black."),
   temp: z
     .boolean()
@@ -145,6 +150,32 @@ export const DrawOpSchema = z.object({
     .nullish()
     .catch(null)
     .describe("bars: the bars [{label?, value, color?}]."),
+  // --- circles op (concentric) ---
+  radii: z
+    .array(z.number())
+    .nullish()
+    .catch(null)
+    .describe("circles: radius of each circle in px, sharing one centre (e.g. [140, 90, 45])."),
+  labels: z
+    .array(z.string())
+    .nullish()
+    .catch(null)
+    .describe("circles: label for each radius, in the same order as `radii`."),
+  colors: z
+    .array(z.enum(COLORS))
+    .nullish()
+    .catch(null)
+    .describe("circles: colour for each circle, in the same order as `radii`."),
+  radii_lines: z
+    .boolean()
+    .nullish()
+    .catch(null)
+    .describe("circles: draw a radius line from the centre to each circle (default false)."),
+  centre: z
+    .boolean()
+    .nullish()
+    .catch(null)
+    .describe("circles: draw the centre dot (default true)."),
   // --- fraction op ---
   parts: z.number().nullish().catch(null).describe("fraction: how many equal parts (denominator)."),
   shaded: z.number().nullish().catch(null).describe("fraction: how many parts are filled (numerator)."),

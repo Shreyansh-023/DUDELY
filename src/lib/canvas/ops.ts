@@ -50,8 +50,14 @@ const FONT_MATH = 2;
  *
  * Symbols the hand-drawn font CAN draw are deliberately left out so ordinary
  * text keeps its hand-drawn feel: × ÷ · − ± ° π θ Σ µ λ α β ½ ¼ ¾ – — …
- * Covered here: √∛ superscripts(² ³ ¹ ⁰ ⁴⁵⁶⁷⁸⁹ ⁿ) subscripts(₀–₉) Δ Ω
- * ≤ ≥ ≠ ≈ ≡ ∝ ∞ → ← ↔ ⇒ ∫ ∏ ∂ ∇ ∈∉ ∠ ∥ ∩∪ ⊂⊃ ∅ ∴ ∵ △ ′ ″.
+ * Covered here: √∛ Δ Ω ≤ ≥ ≠ ≈ ≡ ∝ ∞ → ← ↔ ⇒ ∫ ∏ ∂ ∇ ∈∉ ∠ ∥ ∩∪ ⊂⊃ ∅ ∴ ∵ △ ′ ″.
+ *
+ * NOT covered, because no bundled font has them: superscripts beyond ¹ ² ³ ⁿ,
+ * and subscripts at ALL (checked every shipped woff2 cmap — Excalifont 0/10,
+ * Virgil 0/10, ComicShanns 0/10, Nunito 0/10, LiberationSans 0/10). Raised and
+ * lowered type is therefore produced geometrically instead: see mathtext.ts,
+ * which lays "x^2" out as two separate text elements. `normalizeScripts` below
+ * rewrites any Unicode script character into that notation before it is drawn.
  */
 const MATH_GLYPHS_NEEDING_FALLBACK =
   /[²³¹⁰-₟√-∜ΔΩ∂∇∏∈-∍∠∥∩∪⊂⊃∅∫-∮∴∵≈≠≡≤≥∝∞←-⇿′″△]/;
@@ -133,7 +139,9 @@ export function opToSkeleton(
         x: op.x ?? 0,
         y: op.y ?? 0,
         text: op.text,
-        fontSize: FONT_PX[op.size ?? "md"],
+        // `px` is the exact size a superscript/subscript run was laid out at;
+        // everything else uses one of the three named sizes.
+        fontSize: op.px ?? FONT_PX[op.size ?? "md"],
         fontFamily: boardFontFamily(op.text),
         strokeColor: stroke,
         textAlign: "left",
@@ -216,6 +224,7 @@ export function opToSkeleton(
     case "angle":
     case "vector":
     case "table":
+    case "circles":
     case "circuit":
     case "optics":
     case "molecule":
