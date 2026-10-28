@@ -22,8 +22,22 @@ export const CONTENT_BOTTOM = 660;
 export const MD_PITCH = 50;
 /** Clearance left below existing content when suggesting an origin. */
 export const CLEARANCE = 40;
+/**
+ * Vertical break between two lesson STEPS that share a page. Wider than
+ * CLEARANCE (which separates beats inside one step) so that two subtopics on
+ * one page still read as two subtopics.
+ */
+export const STEP_GAP = 72;
 /** A teaching turn needs at least this much room to continue an existing page. */
 export const MIN_TURN_ROOM = 200;
+/**
+ * Room a NEW LESSON STEP needs before it will share a page with the step above
+ * it. A step is a whole subtopic — a title plus several lines, sometimes a
+ * diagram — so it wants more than a single turn does (MIN_TURN_ROOM), but far
+ * less than a whole page: demanding a whole page is what left steps sitting
+ * alone on a mostly-empty sheet. Roughly a title plus four md lines.
+ */
+export const MIN_STEP_ROOM = 300;
 /** Below this much room the page is reported FULL. */
 export const PAGE_FULL_ROOM = MD_PITCH + CLEARANCE; // 90
 /** How many md text lines a blank page holds. */

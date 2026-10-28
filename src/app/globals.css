@@ -77,6 +77,15 @@ body {
   display: none !important;
 }
 
+/* Excalidraw's welcome screen ("Ask Indica anything — type or talk") invites the
+   student to ask something. While the lesson is being PLANNED they already have,
+   and the planning card sits over this same empty canvas — so the invitation read
+   straight through the card. Hidden for the duration; it comes back if planning
+   fails and the board is genuinely empty and waiting again. */
+[data-planning="true"] .excalidraw .welcome-screen-center {
+  display: none !important;
+}
+
 /* Slim, quiet scrollbars (chat panel, captions). */
 * {
   scrollbar-width: thin;

@@ -124,7 +124,7 @@ Coordinates are page-local pixels: x grows to the right, y grows downward, (0,0)
   clear     {}                                    wipe the whole board. Only when starting a new topic and the student agreed.
 
 High-level DIAGRAM ops (STRONGLY PREFERRED — the renderer lays these out with guaranteed no overlap; the model gives intent only, never pixel positions for the inner parts):
-  numberline {id, x, y, w, min, max, step?, text?, marks?}  a number line. x,y = left end; w = pixel length; min/max = range; step optional (auto); text = heading; marks = [{at, label?, color?}] dots on the line.
+  numberline {id, x, y, w, min, max, step?, denominator?, text?, marks?}  a number line. x,y = left end; w = pixel length; min/max = range; step optional (auto); text = heading; marks = [{at, label?, color?}] dots on the line. Teaching FRACTIONS on it? pass denominator (3 for thirds) so ticks land on 1/3, 2/3 and are labelled as fractions — the default scale is decimal (0.1…0.9) and thirds fall between its ticks.
   axes       {id, x, y, w, h, xmin, xmax, ymin, ymax, xstep?, ystep?, text?, xlabel?, ylabel?, points?}  a Cartesian coordinate plane. x,y = TOP-LEFT of the plot box; points = [{x, y, label?, color?}] to plot.
   bars       {id, x, y, w, h, text?, data}        a bar chart. x,y = TOP-LEFT; data = [{label?, value, color?}]. Bars, axis and labels are placed for you.
   fraction   {id, x, y, w?, parts, shaded, text?, color?}  a bar split into "parts" equal cells with "shaded" of them filled, and a "shaded/parts" caption.
@@ -158,7 +158,8 @@ High-level DIAGRAM ops (STRONGLY PREFERRED — the renderer lays these out with 
 - Layout (keep the board uncluttered; never let two things overlap):
   - Text goes in a left column starting at the top-left (around x=80). Each new text line sits BELOW the previous one on its own row: advance y by at least 50px for an md line, 60px for an lg line. Never give two text elements the same y.
   - Rendered text is WIDE: budget ~13px per character at md, ~20px at lg. A 40-character md line is ~520px wide. If a line will not fit beside a diagram, break it with \\n or put the diagram BELOW the text instead.
-  - Diagrams (shapes, arrows) go on the right, x at least 600px right of the text column, so they never sit under the text.
+  - Diagrams (shapes, arrows) go to the RIGHT of the text column so they never sit under it — far enough right to clear your longest line (~13px per character at md), which is usually x=600-700 for a full-width line. But do not shove a diagram to the far right of an otherwise empty page: on a step with only 2-3 short lines of notes, keep the diagram close to them (x=450-600) and vertically near the text, so the step reads as ONE group instead of a title alone in one corner and a figure alone in another. A page with two lines at the top-left and a diagram in the far right is a badly laid out page even though nothing overlaps.
+  - A short step does NOT have to fill the page, but what it does draw should sit together in the upper-left two-thirds rather than being spread to the corners.
   - Leave at least 40px of empty space between any two elements. The only things allowed on top of existing content are a highlight or an arrow that is deliberately pointing at it.
   - Diagram labels: keep each to 1-3 words and keep them clear of each other. Two labels that would sit close together (e.g. "incident ray" and "reflected ray") must be separated by at least 60px, or moved into the left-column notes instead of onto the diagram. Make arrows long enough that a midpoint label does not touch a neighbouring label.
   - Number lines: ALWAYS use ONE \`numberline\` op — never hand-build a number line from separate line and text ops (that is what causes labels to overlap the line). Give it the range and any points to mark; the renderer spaces everything. Example: {"op":"numberline","id":"nl1","x":680,"y":320,"w":520,"min":-5,"max":5,"step":1,"text":"Number line","marks":[{"at":-2,"label":"A","color":"red"},{"at":3,"label":"B","color":"green"}]}.
@@ -422,6 +423,37 @@ function planOutline(plan: LessonPlan): string {
  * adds the plan + which step to teach, so the model teaches exactly that step as
  * beats and nothing more.
  */
+/**
+ * The handful of diagram ops this subject actually reaches for, named right where
+ * the model decides what to draw.
+ *
+ * The full op list is 35 entries deep in a long prompt, and the observed result was
+ * boards that were 98% plain `text` — a lesson on a curve with no parabola on it,
+ * a lesson on cutting a roti into quarters with no circle, and a model hand-building
+ * circles out of ellipse+line+line when `pie` and `fraction` were right there. The
+ * ops were not missing and the rule against hand-building was not missing either;
+ * both were just too far from the point of use. This is the same instruction, close
+ * enough to the decision to be acted on.
+ */
+function primitiveShortlist(subject: SubjectId | null | undefined): string {
+  const common = "table (any data in rows), tree (factor/probability trees), graph (concept maps, cycles), timeline";
+  const list =
+    subject === "science"
+      ? `optics (ANY mirror/lens/ray question — regular vs diffuse reflection included), circuit, apparatus (lab setups), molecule, reaction, solid, wave, vector (forces), labeled (label a figure you drew), punnett, ${common}`
+      : subject === "maths"
+        ? `fraction (a part-of-a-whole bar — use it the moment you say "parts of"), pie (shares of a circle: a roti, a pizza), numberline (pass denominator for fractions), axes (ANY curve or plotted relation — a parabola belongs here, not in prose), polygon (triangles, quadrilaterals, Pythagoras), angle, circles (concentric), venn, bars, net, solid, ${common}`
+        : `fraction, pie, numberline, axes, polygon, angle, optics, circuit, molecule, table, ${common}`;
+  return `# DRAW WITH THESE (before you write a line of prose)
+Your board is a BLACKBOARD, not a transcript. Before each beat, ask: is there a diagram op for what I am about to say? For ${
+    subject === "science" ? "Science" : subject === "maths" ? "Maths" : "this subject"
+  } that usually means:
+  ${list}
+Rules that matter more than any other board rule:
+- If an op exists for the thing you are saying, USE IT. Never hand-build a shape from separate line/text/rect/ellipse ops — that is what makes diagrams overlap and duplicate.
+- Teaching something VISUAL (a curve, a shape, a share of a whole, a ray, a circuit) with only text ops is a failure, even if the words are correct.
+- One good diagram beats five lines of prose. A step with no diagram at all should be rare.`;
+}
+
 export function buildTeachSystemPrompt(opts: {
   language: string;
   profile: string;
@@ -438,10 +470,22 @@ export function buildTeachSystemPrompt(opts: {
   const stepBlock = current
     ? `You are now teaching STEP ${step + 1} of ${plan.steps.length}: "${current.title}".
 What to explain: ${current.teach || current.title}
-What the board should show: ${current.draw || "draw whatever best visualises this step"}`
+What the board should show: ${current.draw || "draw whatever best visualises this step"}
+  ^ Pick the diagram op that draws THAT, from the shortlist above, before you write any prose.`
     : `Teach the next sensible step for this topic.`;
 
   return `${base}
+
+${primitiveShortlist(opts.subject)}
+
+# WHAT GOES ON THE BOARD VS WHAT YOU SAY
+The board is NOTES, not a script. The student reads it while listening to you, so writing
+one thing and saying another splits their attention — the exact problem beats exist to avoid.
+- Board text = labels, formulas, key terms, numbers, the steps of a working. Short fragments.
+- Full sentences belong in \`say\`, not in a text op. If a line reads like something you would
+  speak aloud, either speak it instead or cut it down to the phrase worth keeping.
+- Never write more on the board in a beat than you say in it. A beat whose \`say\` is one short
+  sentence must not drop five lines of prose on the page.
 
 # LESSON PLAN (you designed this earlier — follow it; do not restart the topic)
 Topic: ${plan.topic || "(as discussed)"}${plan.level ? `\nPitch: ${plan.level}` : ""}

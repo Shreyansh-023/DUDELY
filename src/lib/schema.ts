@@ -106,6 +106,13 @@ export const DrawOpSchema = z.object({
   min: z.number().nullish().catch(null).describe("numberline: smallest value on the line."),
   max: z.number().nullish().catch(null).describe("numberline: largest value on the line."),
   step: z.number().nullish().catch(null).describe("numberline: spacing between ticks (optional; auto-picked if omitted)."),
+  denominator: z
+    .number()
+    .nullish()
+    .catch(null)
+    .describe(
+      "numberline: teaching fractions? give the denominator (3 for thirds) and ticks land ON the fractions, labelled 1/3, 2/3 — instead of the default decimal 0.1…0.9 scale.",
+    ),
   marks: z
     .array(
       z.object({
@@ -339,12 +346,43 @@ export const HistoryMessageSchema = z.object({
 export type HistoryMessage = z.infer<typeof HistoryMessageSchema>;
 
 /**
+ * Drop the second half of a bilingual step title.
+ *
+ * Asked for a title in the student's language, the planner sometimes supplies both
+ * languages joined by a slash — "Real-life hook / Quadratic Equations in daily life",
+ * and in the degenerate case "Standard form / Standard form". That reaches the board
+ * verbatim and reads as a bug to the student, so the first half is kept.
+ *
+ * Deliberately conservative: it fires only on a slash with spaces around it and only
+ * when both halves read as titles (several words, no further slashes). A real title
+ * with a slash in it — "and/or", "cm/s", "Regular vs diffuse / scattered" — keeps it.
+ */
+function stripTranslationPair(title: string): string {
+  const t = title.trim();
+  const parts = t.split(/\s+\/\s+/);
+  if (parts.length !== 2) return t;
+  const [first, second] = parts.map((p) => p.trim());
+  if (!first || !second) return t;
+  // The giveaway of a translation pair: both sides stand alone as a step title. A
+  // one-word tail ("Regular / diffuse") is a real title listing two things, not a
+  // translation — keep the whole thing.
+  const words = (s: string) => s.split(/\s+/).length;
+  if (words(second) < 2 && words(first) < 2) return t;
+  return first;
+}
+
+/**
  * A single step of a lesson plan, designed up front by the planner model
  * (Nemotron Ultra). The teaching model later turns one step into spoken beats +
  * board drawings. `draw` is a hint about what the board should show for the step.
  */
 export const LessonStepSchema = z.object({
-  title: z.string().describe("Short title of this step, e.g. 'Opening analogy' or 'Derive the quadratic formula'."),
+  title: z
+    .string()
+    .transform(stripTranslationPair)
+    .describe(
+      "Short title of this step, in the student's language and ONE language only, e.g. 'Opening analogy' or 'Derive the quadratic formula'. Never give the same title twice separated by '/' — write it once.",
+    ),
   teach: z.string().default("").describe("What to explain in this step, in a sentence or two."),
   draw: z.string().default("").describe("What the board should show for this step (a hint, not literal ops)."),
   roadmap: z

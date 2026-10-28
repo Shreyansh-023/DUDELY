@@ -11,7 +11,9 @@ import {
   isDoubtCleared,
   isExplainRequest,
   isNextQuestion,
+  planningHolds,
   planningLines,
+  planningStepLead,
   resumeLine,
   roadmapIntro,
   voicePrompts,
@@ -49,7 +51,7 @@ const Avatar = dynamic(() => import("./Avatar"), {
   loading: () => <div className="grid h-full w-full place-items-center text-[11px] text-white/70">Loading Indica…</div>,
 });
 
-export type Status = "idle" | "listening" | "transcribing" | "thinking" | "teaching";
+export type Status = "idle" | "listening" | "transcribing" | "thinking" | "teaching" | "asking";
 // Only real student text and Indica's replies live here. The lesson's internal
 // "next step" nudges are never messages: they exist in the request history the
 // lesson pipeline keeps, which runs ahead of the transcript by design.
@@ -151,6 +153,21 @@ const STATUS_LABEL: Record<Status, string> = {
   transcribing: "Transcribing…",
   thinking: "Indica is thinking…",
   teaching: "Indica is teaching…",
+  asking: "Indica is asking you something…",
+};
+
+/**
+ * Whether Esc means anything right now. It interrupts a lesson in flow; it has
+ * nothing to interrupt while Indica is putting a question TO the student and
+ * waiting on the answer, and offering it there told them to cancel their own turn.
+ */
+const INTERRUPTIBLE: Record<Status, boolean> = {
+  idle: false,
+  listening: false,
+  transcribing: false,
+  thinking: true,
+  teaching: true,
+  asking: false,
 };
 
 function readLocal(key: string, fallback: string): string {
@@ -439,6 +456,9 @@ export default function Tutor() {
   // watching progress rather than a spinner.
   const [planning, setPlanning] = useState(false);
   const [planOutline, setPlanOutline] = useState<string[]>([]);
+  // Same titles, readable from the async filler loop without waiting for a render:
+  // the filler reads them out once the written lines run out (see `speakLines`).
+  const planOutlineRef = useRef<string[]>([]);
   // True from the first teaching turn until the topic is dropped. Distinct from
   // phase "teaching", which is already set while the plan is being designed —
   // there is nothing on the board to have a doubt about until a step runs.
@@ -602,16 +622,24 @@ export default function Tutor() {
     }
   }, []);
 
-  /** Consumer: plays beats in order, drawing and speaking each one concurrently. */
+  /** Consumer: plays beats in order, drawing and speaking each one concurrently.
+   *  `speaking` is the status to show while it runs: teaching by default, but
+   *  "asking" for a turn that puts a question to the student and then waits. */
   const playQueue = useCallback(
-    async (queue: AsyncQueue<QueuedBeat>, turn: number, assistantId: string, signal: AbortSignal) => {
+    async (
+      queue: AsyncQueue<QueuedBeat>,
+      turn: number,
+      assistantId: string,
+      signal: AbortSignal,
+      speaking: Status = "teaching",
+    ) => {
       const player = boardRef.current?.player;
       if (!player) return;
       let first = true;
       for await (const { beat, audio } of queue) {
         if (signal.aborted) break;
         if (first) {
-          setStatus("teaching");
+          setStatus(speaking);
           first = false;
         }
         setMessages((m) =>
@@ -776,7 +804,9 @@ export default function Tutor() {
       setStatus("thinking");
 
       const queue = new AsyncQueue<QueuedBeat>();
-      const playing = playQueue(queue, turn, assistantId, ac.signal);
+      // This turn exists to ASK the student (the familiarity question) and then
+      // wait for them, so the status chip must not claim to be teaching.
+      const playing = playQueue(queue, turn, assistantId, ac.signal, "asking");
       for (const beat of beats) {
         const audio =
           cfg.tts === "sarvam"
@@ -805,23 +835,45 @@ export default function Tutor() {
   );
 
   /**
-   * Speaks a few local lines one after another, stopping early (between lines,
-   * never mid-sentence) once `until` settles. This is what covers the planner's
+   * Speaks local lines one after another, stopping early (between lines, never
+   * mid-sentence) once `until` settles. This is what covers the planner's
    * thinking time: Indica says what it is doing instead of going silent.
+   *
+   * The written lines are not sized to the worst wait and cannot be — a plan can
+   * take two minutes, and no fixed script is honest for that long in twelve
+   * languages. So when they run out, `more()` is asked for another line: the
+   * planner publishes step titles as it writes them, and reading those out is
+   * real lesson content, in the student's language, that grows as the wait does.
+   * Only if there is nothing new to say at all does it fall silent — by then the
+   * student has heard the whole outline, which is a reasonable place to pause.
    */
   const speakLines = useCallback(
-    async (lines: readonly string[], signal: AbortSignal, until?: Promise<unknown>) => {
+    async (
+      lines: readonly string[],
+      signal: AbortSignal,
+      until?: Promise<unknown>,
+      more?: () => string | null,
+    ) => {
       let ready = false;
       const mark = () => {
         ready = true;
       };
       void until?.then(mark, mark);
-      for (const line of lines) {
-        if (signal.aborted || ready) return;
-        const cfg = configRef.current ?? FALLBACK_CONFIG;
+      const cfgFor = () => configRef.current ?? FALLBACK_CONFIG;
+      const say = async (line: string) => {
+        const cfg = cfgFor();
         const lang = languageRef.current;
         const audio = cfg.tts === "sarvam" ? fetchFixedSpeech(line, lang, cfg.ttsPace) : null;
         await speakBeat({ say: line, lang, draw: [] }, audio, signal);
+      };
+      for (const line of lines) {
+        if (signal.aborted || ready) return;
+        await say(line);
+      }
+      while (!signal.aborted && !ready) {
+        const line = more?.();
+        if (!line) return;
+        await say(line);
       }
     },
     [speakBeat],
@@ -853,6 +905,7 @@ export default function Tutor() {
               setPlanOutline((s) => {
                 const next = [...s];
                 next[ev.index] = ev.step.title;
+                planOutlineRef.current = next;
                 return next;
               });
             } else if (ev.type === "plan") {
@@ -918,7 +971,10 @@ export default function Tutor() {
             lastTeachRef.current = { turn: q.turn, step: q.step };
           }
           setStatus("teaching");
-          player.beginTeachTurn({ newPage: true }); // one page per step
+          // A step is a new subtopic, so it takes a fresh page only when the
+          // current one lacks the room to hold one; otherwise it carries on
+          // down the page the previous step left room on.
+          player.beginTeachTurn({ newStep: true });
           run.bubble = uid("a");
           const id = run.bubble;
           run.ownIds.add(id);
@@ -1013,14 +1069,16 @@ export default function Tutor() {
           }
         };
         catchUp();
-        // Each step takes the next page down the teaching column and nothing
-        // else writes that column during a run, so the page a step will own is
-        // known before it is generated — which is the whole reason a step can be
-        // generated while the previous one is still being drawn. (The page
-        // NUMBER is a prediction, and only ever reaches the model as "Page 4 of
-        // 4" in the canvas header; the page it actually draws on is chosen at
-        // playback time.) The roadmap takes a page of its own first, so the
-        // steps start after it.
+        // A step is generated while the PREVIOUS step is still being drawn, so
+        // how much room that step will leave behind cannot be known here. The
+        // step is therefore always described a blank page and writes from its
+        // top-left; at playback `beginTeachTurn({ newStep: true })` decides
+        // whether it shares the page above it, and `applyBeat` measures each
+        // beat, pushes it clear of what is already there and spills it onto a
+        // fresh page if it does not fit. The page NUMBER here is only the
+        // header's "Page 4 of 4" and is an upper bound — steps that end up
+        // sharing a page make the real book shorter. The roadmap takes the
+        // first page, so the steps start after it.
         const basePage = b.player.nextTeachPage() + (agenda ? 1 : 0);
 
         for (let i = from; i < plan.steps.length; i++) {
@@ -1228,6 +1286,7 @@ export default function Tutor() {
       setStatus("thinking");
       setPlanning(true);
       setPlanOutline([]);
+      planOutlineRef.current = [];
 
       // A fresh lesson: nothing of it has been drawn, so there is no interrupted
       // step to wipe. Left over from the previous lesson, this would make the
@@ -1244,7 +1303,24 @@ export default function Tutor() {
         history.map((m) => ({ role: m.role, text: m.text })),
         ac.signal,
       );
-      await speakLines(planningLines(languageRef.current), ac.signal, planned);
+      // Once the written filler runs out, read out the step titles the planner has
+      // published so far — each one only ever once, in order. When those run out
+      // too (a plan can take two minutes; the titles only start arriving when the
+      // planner stops reasoning and starts writing), fall back to short hold lines
+      // that bear repeating, so the wait never goes silent however long it runs.
+      let spokenSteps = 0;
+      let holds = 0;
+      const nextStepLine = (): string | null => {
+        const outline = planOutlineRef.current;
+        while (spokenSteps < outline.length) {
+          const title = outline[spokenSteps]?.trim();
+          spokenSteps++;
+          if (title) return planningStepLead(languageRef.current, spokenSteps, title);
+        }
+        const pool = planningHolds(languageRef.current);
+        return pool.length > 0 ? pool[holds++ % pool.length] : null;
+      };
+      await speakLines(planningLines(languageRef.current), ac.signal, planned, nextStepLine);
       const plan = await planned;
       setPlanning(false);
       if (ac.signal.aborted) return;
@@ -1648,7 +1724,7 @@ export default function Tutor() {
     [],
   );
 
-  const busy = status === "thinking" || status === "teaching";
+  const busy = status === "thinking" || status === "teaching" || status === "asking";
   // In voice mode the chat is hidden until the hamburger reopens it.
   const showChat = !voiceMode || chatPanelOpen;
   // The composer invites the right kind of input for the current lesson stage.
@@ -1826,11 +1902,12 @@ export default function Tutor() {
             so Excalidraw's own framing (recenter / fit) can never place drawing
             under the subtitles. The decorative surface still fills the gap. */}
         <div className={"absolute inset-0" + (voiceMode && !chatPanelOpen ? " bottom-10" : "")}>
-          <Whiteboard onReady={onReady} />
+          <Whiteboard onReady={onReady} planning={planning} />
         </div>
         {busy && !voiceMode && (
           <div className="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-full bg-neutral-900/85 px-3 py-1 text-xs font-medium text-white shadow">
-            {STATUS_LABEL[status]} <span className="opacity-60">· Esc to interrupt</span>
+            {STATUS_LABEL[status]}
+            {INTERRUPTIBLE[status] && <span className="opacity-60"> · Esc to interrupt</span>}
           </div>
         )}
         {/* The lesson is being designed — the board is still blank, so the wait

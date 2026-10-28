@@ -20,7 +20,15 @@ export type Board = {
   summarizeScene: typeof summarizeScene;
 };
 
-export default function Whiteboard({ onReady }: { onReady: (board: Board) => void }) {
+export default function Whiteboard({
+  onReady,
+  /** The lesson is being designed: the planning card covers this canvas, so
+   *  Excalidraw's "ask me anything" welcome screen must not show through it. */
+  planning = false,
+}: {
+  onReady: (board: Board) => void;
+  planning?: boolean;
+}) {
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<BoardPlayer | null>(null);
 
@@ -48,7 +56,7 @@ export default function Whiteboard({ onReady }: { onReady: (board: Board) => voi
   // background properties panel stay hidden and never cover the canvas. The
   // imperative API still works in view mode, so Guru draws normally.
   return (
-    <div ref={hostRef} className="h-full w-full">
+    <div ref={hostRef} className="h-full w-full" data-planning={planning ? "true" : undefined}>
     <Excalidraw
       viewModeEnabled
       excalidrawAPI={(api) => {

@@ -78,10 +78,40 @@ const COMPLEX_SCRIPT = /[؀-ۿऀ-෿]/;
  * a short label like "√2" renders wholly in Helvetica — clean, and far better
  * than the "Ã2" mojibake the hand-drawn font produced.
  */
-export function boardFontFamily(text: string | null | undefined): typeof FONT_HANDDRAWN | typeof FONT_MATH {
-  if (!text || !MATH_GLYPHS_NEEDING_FALLBACK.test(text)) return FONT_HANDDRAWN;
+export function boardFontFamily(
+  text: string | null | undefined,
+  /** True once something else on this page has already switched: the rest of the
+   *  page follows so one board does not mix two typefaces (see Page.mathFont).
+   *  Text carrying a complex script still stays hand-drawn — the fallback font
+   *  has no Devanagari and would drop the letters entirely. */
+  pageUsesMathFont = false,
+): typeof FONT_HANDDRAWN | typeof FONT_MATH {
+  if (!text) return FONT_HANDDRAWN;
   if (COMPLEX_SCRIPT.test(text)) return FONT_HANDDRAWN;
-  return FONT_MATH;
+  if (pageUsesMathFont) return FONT_MATH;
+  return MATH_GLYPHS_NEEDING_FALLBACK.test(text) ? FONT_MATH : FONT_HANDDRAWN;
+}
+
+/**
+ * Whether this text is what MAKES a page switch to the math font — it carries a
+ * glyph the hand-drawn font cannot render and no script that the fallback lacks.
+ * The player asks this to latch `Page.mathFont`.
+ */
+export function needsMathFont(text: string | null | undefined): boolean {
+  return !!text && MATH_GLYPHS_NEEDING_FALLBACK.test(text) && !COMPLEX_SCRIPT.test(text);
+}
+
+/** The fallback family id, for the player's retroactive restyle. */
+export const MATH_FONT_FAMILY = FONT_MATH;
+
+/**
+ * Whether text already committed to a latched page may be moved to the math
+ * font. Anything in a complex script must stay hand-drawn (the fallback has no
+ * Devanagari); everything else on that page follows, glyph or not, because the
+ * point is that the board reads as one typeface.
+ */
+export function needsHandToMathSwitch(text: string | null | undefined): boolean {
+  return !!text && !COMPLEX_SCRIPT.test(text);
 }
 
 export type TutorMeta = {
@@ -126,6 +156,8 @@ export function opToSkeleton(
   turn: number,
   elementId: string,
   page?: number,
+  /** The page this op lands on has already fallen back to the math font. */
+  pageUsesMathFont = false,
 ): ExcalidrawElementSkeleton | null {
   const color = op.color ?? "black";
   const stroke = STROKE[color];
@@ -142,7 +174,7 @@ export function opToSkeleton(
         // `px` is the exact size a superscript/subscript run was laid out at;
         // everything else uses one of the three named sizes.
         fontSize: op.px ?? FONT_PX[op.size ?? "md"],
-        fontFamily: boardFontFamily(op.text),
+        fontFamily: boardFontFamily(op.text, pageUsesMathFont),
         strokeColor: stroke,
         textAlign: "left",
         customData: meta(turn, op.id, op.temp, page),
@@ -167,7 +199,7 @@ export function opToSkeleton(
         roughness: 1,
         roundness: type === "rectangle" ? { type: 3 } : null,
         customData: meta(turn, op.id, op.temp, page),
-        ...(op.text ? { label: { text: op.text, fontSize: 20, fontFamily: boardFontFamily(op.text) } } : {}),
+        ...(op.text ? { label: { text: op.text, fontSize: 20, fontFamily: boardFontFamily(op.text, pageUsesMathFont) } } : {}),
       };
     }
     case "arrow":
@@ -194,7 +226,7 @@ export function opToSkeleton(
         endArrowhead: op.op === "arrow" ? "arrow" : null,
         startArrowhead: null,
         customData: meta(turn, op.id, op.temp, page),
-        ...(op.text ? { label: { text: op.text, fontSize: 16, fontFamily: boardFontFamily(op.text) } } : {}),
+        ...(op.text ? { label: { text: op.text, fontSize: 16, fontFamily: boardFontFamily(op.text, pageUsesMathFont) } } : {}),
       } as ExcalidrawElementSkeleton;
     }
     case "highlight": {

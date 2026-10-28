@@ -32,10 +32,15 @@ const HEADING_FONT = 24;
 
 export function expandPolygon(op: DrawOp): Expanded {
   const pid = (op.id || "poly").replace(/[^a-zA-Z0-9_-]/g, "_");
-  const pts: Pt[] = (op.points ?? [])
-    .filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y))
-    .map((p) => ({ x: p.x, y: p.y }));
-  const srcPoints = (op.points ?? []).filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+  // A closed shape is closed by `closed`, not by repeating its first vertex. Models
+  // routinely send the first point again as the last ("a square" as 5 points), which
+  // would otherwise draw a zero-length edge and ask for a duplicate corner label.
+  const valid = (op.points ?? []).filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+  const srcPoints =
+    valid.length > 2 && valid[0].x === valid[valid.length - 1].x && valid[0].y === valid[valid.length - 1].y
+      ? valid.slice(0, -1)
+      : valid;
+  const pts: Pt[] = srcPoints.map((p) => ({ x: p.x, y: p.y }));
   const col = op.color ?? "black";
   if (pts.length < 2) {
     return { ops: [], bbox: { x: op.x ?? 0, y: op.y ?? 0, w: 1, h: 1 }, label: "polygon (empty)" };
@@ -89,8 +94,18 @@ export function expandPolygon(op: DrawOp): Expanded {
   const vertexText: string[] = [];
   const requests: LabelRequest[] = [];
 
+  // Every labelled corner carrying the SAME word is not four corners called that —
+  // it is one shape called that, and the model had no other way to say so (a polygon
+  // has no "name this region" field). Printing it per vertex put "surface" four times
+  // around one box. Collapse it to a single label in the middle of the shape.
+  const labelled = srcPoints.map((p) => (p.label ?? "").trim()).filter(Boolean);
+  const wholeShapeName =
+    labelled.length > 1 && new Set(labelled).size === 1 && (!heading || heading === labelled[0])
+      ? labelled[0]
+      : "";
+
   for (let i = 0; i < n; i++) {
-    const t = (srcPoints[i].label ?? "").trim();
+    const t = wholeShapeName ? "" : (srcPoints[i].label ?? "").trim();
     vertexText[i] = t;
     if (!t) continue;
     const b = textBox(t, FONT);
@@ -128,6 +143,23 @@ export function expandPolygon(op: DrawOp): Expanded {
     }
     ops.push({ op: "text", id, x: p.x, y: p.y, text, size: "sm", color });
     boxes.push({ x: p.x, y: p.y, w: p.w, h: p.h });
+  }
+
+  // The one name the whole shape had, centred inside it.
+  if (wholeShapeName) {
+    const b = textBox(wholeShapeName, FONT);
+    const x = bounds.x + (bounds.w - b.w) / 2;
+    const y = bounds.y + (bounds.h - b.h) / 2;
+    ops.push({
+      op: "text",
+      id: `${pid}.name`,
+      x,
+      y,
+      text: wholeShapeName,
+      size: "sm",
+      color: srcPoints.find((p) => (p.label ?? "").trim())?.color ?? "black",
+    });
+    boxes.push({ x, y, w: b.w, h: b.h });
   }
 
   // The heading goes on LAST, above everything already placed. Reserving a

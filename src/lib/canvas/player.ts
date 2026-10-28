@@ -15,17 +15,27 @@ import type {
 import type { ExcalidrawImperativeAPI, NormalizedZoomValue } from "@excalidraw/excalidraw/types";
 import type { DrawOp } from "../schema";
 import { clamp, sleep } from "../utils";
+import { fontsReady } from "./measure";
 import { flattenMath, hasMathScript, normalizeScripts } from "./mathtext";
-import { isPermanentNote, opToSkeleton, type TutorMeta } from "./ops";
+import {
+  isPermanentNote,
+  MATH_FONT_FAMILY,
+  needsHandToMathSwitch,
+  needsMathFont,
+  opToSkeleton,
+  type TutorMeta,
+} from "./ops";
 import { expandMathText } from "./primitives/mathline";
 import {
   CLEARANCE,
   CONTENT_BOTTOM,
   CONTENT_TOP,
   FIT_MARGIN,
+  MIN_STEP_ROOM,
   MIN_TURN_ROOM,
   PAGE_H,
   PAGE_W,
+  STEP_GAP,
   TWEEN_MS,
   cellAtScene,
   cellRect,
@@ -55,6 +65,11 @@ type Page = Rect &
     rev: number;
     /** turn -> every element id it created here, so dropTurn can wipe a turn. */
     turnIds: Map<number, Set<string>>;
+    /** Set once any text on this page has had to fall back to the math font, so
+     *  the REST of the page follows it. A board where `x = [5 ± √49] / 4` is
+     *  Helvetica and the line under it is hand-drawn reads as a glitch; the
+     *  mixture is what looks wrong, not either font. See `boardFontFamily`. */
+    mathFont: boolean;
   };
 
 export type PageInfo = Cell & { index: number; kind: PageKind; used: boolean; rev: number };
@@ -144,13 +159,19 @@ export class BoardPlayer {
    * column and never into a doubt's page beside it.
    * `stayOnPage` keeps the reply beside work the student just drew.
    *
-   * `newPage` forces a fresh page even when the current one has room. The staged
-   * lesson uses it to give every plan step a page of its own: one page, one idea,
-   * and — the reason it exists — a step's page state no longer depends on what
-   * the previous step drew, so the next step can be generated while this one is
-   * still being drawn without being told the wrong amount of room.
+   * `newStep` begins a new lesson step. A step is a new subtopic, so it starts a
+   * fresh page when the current one is too full to hold one — but it SHARES the
+   * page when there is real room left, which is what stops a three-line step
+   * from burning a whole sheet. The threshold is MIN_STEP_ROOM rather than a
+   * turn's MIN_TURN_ROOM because a step carries a title and several lines.
+   *
+   * Sharing is safe even though the step was generated against a blank-page
+   * description: `applyBeat` measures each beat, collision-pushes it below what
+   * is already on the page, and spills it onto a fresh page when it genuinely
+   * does not fit. The page a step lands on is therefore decided here at
+   * playback time, never at generation time.
    */
-  beginTeachTurn(opts?: { stayOnPage?: boolean; newPage?: boolean }) {
+  beginTeachTurn(opts?: { stayOnPage?: boolean; newStep?: boolean }) {
     this.doubtMode = false;
     this.plannedKind = "teach";
     this.pageAnchorDy = 0;
@@ -160,15 +181,17 @@ export class BoardPlayer {
       this.emit();
       return;
     }
-    if (opts?.newPage) {
-      this.planAt(this.freshTeachSlot());
-      this.emit();
-      return;
-    }
+    const need = opts?.newStep ? MIN_STEP_ROOM : MIN_TURN_ROOM;
     const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
-    this.planAt(
-      cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_TURN_ROOM ? cur : this.freshTeachSlot(),
-    );
+    const share = Boolean(cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= need);
+    // A step that shares a page was written as if the page were blank, so its
+    // first beat starts around CONTENT_TOP. Drop the whole step to just below
+    // what is already there, with a wider gap than the CLEARANCE used between
+    // beats of one step — that gap is what makes two subtopics on one page read
+    // as two subtopics instead of one run-on block. Collision avoidance still
+    // runs underneath and corrects anything this estimate gets wrong.
+    this.pageAnchorDy = share && cur && cur.used ? Math.max(0, cur.bottom + STEP_GAP - CONTENT_TOP) : 0;
+    this.planAt(share && cur ? cur : this.freshTeachSlot());
     this.emit();
   }
 
@@ -291,11 +314,16 @@ export class BoardPlayer {
   }
 
   /**
-   * The page `beginTeachTurn({ newPage: true })` would start on. The staged
-   * lesson reads it to describe the page a step will own while that step is
-   * still being generated. See `freshTeachSlot` for the reuse rule.
+   * The page `beginTeachTurn({ newStep: true })` would start on RIGHT NOW. The
+   * staged lesson reads it only to number the page in the canvas header a step
+   * is generated against; the page it truly lands on is chosen at playback
+   * time, by which point the step above it may have left room to share. So this
+   * is a prediction, and deliberately matches the sharing rule rather than
+   * always reporting a fresh page.
    */
   nextTeachPage(): number {
+    const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
+    if (cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_STEP_ROOM) return cur.index;
     return this.freshTeachSlot().index;
   }
 
@@ -347,6 +375,7 @@ export class BoardPlayer {
         bottom: CONTENT_TOP,
         rev: 0,
         turnIds: new Map(),
+        mathFont: false,
       };
       this.pages.push(p);
       this.plannedIndex = p.index;
@@ -601,6 +630,32 @@ export class BoardPlayer {
   }
 
   /**
+   * Bring text ALREADY on `pageIndex` over to the math font, called the moment
+   * the page latches (see Page.mathFont).
+   *
+   * The glyph that forces the fallback usually turns up in the middle of a
+   * working — "x = [5 ± √49] / 4" on line three — so latching only the lines
+   * after it would still leave the board in two typefaces, which is the actual
+   * complaint. Lines carrying a complex script are left alone: the fallback font
+   * has no Devanagari and switching would drop the letters.
+   *
+   * Width/height are kept as measured, so re-styling can never move anything:
+   * the two fonts differ in metrics and re-flowing committed text would shift a
+   * board the collision logic has already placed around.
+   */
+  private adoptMathFont(pageIndex: number) {
+    let changed = false;
+    const elements = this.all().map((e) => {
+      if (e.type !== "text" || e.isDeleted) return e;
+      if ((e.customData as TutorMeta | undefined)?.page !== pageIndex) return e;
+      if (e.fontFamily === MATH_FONT_FAMILY || !needsHandToMathSwitch(e.text)) return e;
+      changed = true;
+      return { ...e, fontFamily: MATH_FONT_FAMILY, versionNonce: e.versionNonce + 1 };
+    });
+    if (changed) this.commit(elements as readonly ExcalidrawElement[]);
+  }
+
+  /**
    * A scene id for the model's own id, unique against EVERY id the board has
    * ever held.
    *
@@ -659,6 +714,11 @@ export class BoardPlayer {
    */
   async applyBeat(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
     this.currentTurn = turn;
+    // Lay nothing out until the board font can be measured: on a cold page
+    // Excalifont is still loading, and widths measured against a substitute
+    // put superscripts and diagram labels in the wrong place.
+    await fontsReady();
+    if (signal.aborted) return [];
     // Rewrite any Unicode "x²"/"H₂O" the model slipped in into ^/_ notation, so
     // it is laid out as real raised type instead of rendering as mojibake.
     ops = ops.map(withNormalizedScripts);
@@ -669,15 +729,24 @@ export class BoardPlayer {
     if (drawing.length) {
       const page = this.ensurePage();
       const carried = this.turnShift.turn === turn ? this.turnShift : { dx: 0, dy: 0 };
-      const box = this.measureBeat(drawing, carried);
+      const raw = this.measureBeat(drawing, carried);
+      // Measure where this beat will REALLY sit: ops are drawn at
+      // `pageAnchorDy`, so a step sharing a page is already offset below the
+      // step above it. Testing the unoffset box would under-report the bottom
+      // and let a beat run off the page it was supposed to spill from.
+      const box = raw && { ...raw, y1: raw.y1 + this.pageAnchorDy, y2: raw.y2 + this.pageAnchorDy };
       if (box && page.used) {
         // Collision avoidance will push this beat below what is already here;
         // model that push, or the beat spills one page later than it should.
+        // The anchor already clears `page.bottom` for a shared step's first
+        // beat, so `push` correctly comes out as 0 there rather than doubling.
         const push = Math.max(0, page.bottom + CLEARANCE - box.y1);
         if (box.y2 + push + FIT_MARGIN > CONTENT_BOTTOM) {
           this.appendPage(page.kind);
           this.turnShift = { turn, dx: 0, dy: 0 }; // stays page-local
-          this.pageAnchorDy = CONTENT_TOP - box.y1;
+          // Re-anchor at the fresh page's top, measured from the UNOFFSET box:
+          // the old page's step gap must not travel to the new page.
+          this.pageAnchorDy = CONTENT_TOP - (raw ? raw.y1 : CONTENT_TOP);
         }
       }
       const target = this.pages[this.activeIndex];
@@ -797,7 +866,13 @@ export class BoardPlayer {
     const ox = page.x;
     const oy = page.y + this.pageAnchorDy;
     const elementId = this.resolveId(op.id);
-    const skeleton = opToSkeleton(shiftOp(op, carried.dx + ox, carried.dy + oy), turn, elementId, page.index);
+    // Latch the page onto the math font BEFORE converting, so the op that forces
+    // the switch is itself drawn in it along with everything that follows.
+    if (!page.mathFont && needsMathFont(op.text)) {
+      page.mathFont = true;
+      this.adoptMathFont(page.index); // bring the lines already written over too
+    }
+    const skeleton = opToSkeleton(shiftOp(op, carried.dx + ox, carried.dy + oy), turn, elementId, page.index, page.mathFont);
     if (!skeleton) return [];
 
     const converted = convertToExcalidrawElements([skeleton], { regenerateIds: false });
@@ -881,10 +956,17 @@ export class BoardPlayer {
     const placed = tx || ty ? children.map((c) => shiftOp(c, tx, ty)) : children;
 
     const groupId = this.resolveId(op.id); // one stable id for the whole group
+    // A primitive is one figure: if ANY of its labels needs the math font, the
+    // whole figure (and the rest of the page) uses it, so a diagram's own labels
+    // never disagree with each other.
+    if (!page.mathFont && placed.some((c) => needsMathFont(c.text))) {
+      page.mathFont = true;
+      this.adoptMathFont(page.index);
+    }
     const created: ExcalidrawElement[] = [];
     for (const child of placed) {
       if (signal.aborted) break;
-      const base = opToSkeleton(child, turn, this.resolveId(child.id), page.index);
+      const base = opToSkeleton(child, turn, this.resolveId(child.id), page.index, page.mathFont);
       if (!base) continue;
       // Tag children so the summary collapses the group and erase can target it.
       const skel = { ...base, customData: { ...(base.customData as object), group: groupId, groupLabel: label } };

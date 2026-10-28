@@ -85,9 +85,17 @@ export async function POST(req: Request) {
   /** True only when the student named the item by position, so the match is certain. */
   let exactSolution = false;
   const solveTurn = mode === "solve" || mode === "solvedoubt";
+  // What the lesson is about, for retrieval. A teach turn's last "student" message is
+  // a nudge the client wrote ("Continue to the next step."), so the history alone
+  // carries no topic and search would match the nudge; the plan is what knows the
+  // topic and the step. Doubt/explain pass the topic too, so a two-word doubt
+  // ("why minus?") still searches inside the right chapter.
+  const lesson = plan
+    ? { topic: plan.topic, step: mode === "teach" ? (plan.steps[step ?? 0] ?? null) : null }
+    : null;
   if (book) {
     try {
-      ({ edition, passages } = await retrieveTextbookContext(book, messages, { mode }));
+      ({ edition, passages } = await retrieveTextbookContext(book, messages, { mode, lesson }));
     } catch (err) {
       console.warn(`[tutor] textbook retrieval failed for ${book}: ${errorMessage(err)}`);
     }

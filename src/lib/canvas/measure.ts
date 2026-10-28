@@ -46,6 +46,37 @@ function excalifontLoaded(): boolean {
   return fontReady;
 }
 
+/**
+ * Resolves once the board font can be measured. Excalifont loads lazily, and on
+ * a cold page it is still loading when the first beat arrives — measuring then
+ * silently returns a substitute font's widths, which spaces superscript runs
+ * wrongly. The player awaits this before drawing, so every width is measured
+ * against the font actually used. Resolves immediately once warm, and is capped
+ * so a font that never arrives cannot block the board.
+ */
+let readyPromise: Promise<void> | null = null;
+export function fontsReady(): Promise<void> {
+  if (fontReady) return Promise.resolve();
+  if (readyPromise) return readyPromise;
+  readyPromise = (async () => {
+    try {
+      // Ask for the face explicitly: `document.fonts.ready` alone can settle
+      // before a lazily-used font has been requested at all.
+      await Promise.race([
+        (async () => {
+          await document.fonts.load('16px Excalifont');
+          await document.fonts.ready;
+        })(),
+        new Promise<void>((r) => setTimeout(r, 3000)),
+      ]);
+    } catch {
+      /* fall through to the estimate */
+    }
+    excalifontLoaded();
+  })();
+  return readyPromise;
+}
+
 /** Approximate rendered width (px) of `text` at the given font size. */
 export function measureText(text: string, fontPx: number): number {
   if (!text) return 0;

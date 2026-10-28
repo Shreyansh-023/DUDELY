@@ -2,8 +2,10 @@
 
 import { useEffect, useRef } from "react";
 
+import type { Status } from "./Tutor";
+
 type Props = {
-  status: "idle" | "listening" | "transcribing" | "thinking" | "teaching";
+  status: Status;
   /** What's in the box, owned by Tutor so dictation can write into it. */
   draft: string;
   onDraftChange: (text: string) => void;
@@ -40,7 +42,7 @@ export default function Composer({
 }: Props) {
   const taRef = useRef<HTMLTextAreaElement>(null);
   const listening = status === "listening";
-  const busy = status === "thinking" || status === "teaching";
+  const busy = status === "thinking" || status === "teaching" || status === "asking";
   const dictating = interim.length > 0;
   // What the student actually sees: typed text with the live speech running on
   // the end of it, the way ChatGPT's dictation fills its composer as you talk.

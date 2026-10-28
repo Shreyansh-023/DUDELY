@@ -281,19 +281,39 @@ export function isDoubtCleared(text: string): boolean {
  * reads as broken — so Indica says what it is doing instead. Spoken one line at
  * a time and cut short the moment the plan lands, so a fast plan never has to
  * sit through all of it. Deliberately gender-neutral: Indica has no gender.
+ *
+ * Sized to the real wait, not the median one: measured plan latency runs 27-127s
+ * (p90 well past a minute), while a line is ~5s of speech at TTS_PACE 0.8. Two
+ * lines covered ten seconds of a two-minute wait and the student then sat in
+ * silence, so each language carries as many lines as it has. Where a language
+ * has fewer, `planningLines` tops it up with the step titles the planner has
+ * already streamed (see `designPlan`) and then rotates — real lesson content in
+ * the student's own language beats invented filler in it.
  */
-export const PLANNING_LINES: Record<LanguageCode, readonly [string, string]> = {
+export const PLANNING_LINES: Record<LanguageCode, readonly string[]> = {
   en: [
     "Good choice. Give me a moment — I'm planning how to teach you this.",
     "Working out the best order to build this up, step by step.",
+    "I'm checking your textbook chapter so we follow the same path your class does.",
+    "Thinking about where students usually get stuck here, so we slow down at that part.",
+    "Almost there — just deciding what to draw on the board for you.",
+    "Thanks for waiting. A good plan now means this will make much more sense in a minute.",
   ],
   "en-IN": [
     "Achha topic hai. Ek minute do — iska plan ban raha hai.",
     "Sabse achha order dhoondh rahe hain, taaki step by step samajh aaye.",
+    "Tumhari textbook ka chapter dekh rahe hain, taaki school jaisa hi padhein.",
+    "Soch rahe hain ki is topic mein bachche kahan atakte hain — wahan dheere chalenge.",
+    "Bas ho gaya — ye decide kar rahe hain ki board par kya banayenge.",
+    "Thoda rukne ke liye thanks. Plan achha hoga to samajhna bahut aasaan ho jayega.",
   ],
   "hi-IN": [
     "अच्छा विषय है। एक मिनट दो — इसका प्लान बन रहा है।",
     "सबसे अच्छा क्रम चुन रहे हैं, ताकि कदम दर कदम समझ आए।",
+    "तुम्हारी किताब का अध्याय देख रहे हैं, ताकि स्कूल जैसा ही पढ़ें।",
+    "सोच रहे हैं कि इस विषय में बच्चे कहाँ अटकते हैं — वहाँ धीरे चलेंगे।",
+    "बस हो गया — यह तय कर रहे हैं कि बोर्ड पर क्या बनाएँगे।",
+    "रुकने के लिए धन्यवाद। अच्छा प्लान होगा तो समझना बहुत आसान हो जाएगा।",
   ],
   "bn-IN": [
     "ভালো বিষয় বেছেছ। এক মিনিট দাও — এর পরিকল্পনা তৈরি হচ্ছে।",
@@ -333,8 +353,64 @@ export const PLANNING_LINES: Record<LanguageCode, readonly [string, string]> = {
   ],
 };
 
-export function planningLines(code: string): readonly [string, string] {
+export function planningLines(code: string): readonly string[] {
   return PLANNING_LINES[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
+/**
+ * Spoken to fill the wait once the written filler has run out: "Step 3 — <title>",
+ * one per plan step the planner has published so far, in the student's language.
+ *
+ * It is the one thing that scales with the wait for free. A long plan is exactly
+ * the plan that takes long to design, so the slower the planner is, the more real
+ * content there is to talk about while it finishes — and the student hears the
+ * lesson taking shape instead of a stall.
+ */
+export const PLANNING_STEP_LEADS: Record<LanguageCode, (n: number, title: string) => string> = {
+  en: (n, t) => `Step ${n}: ${t}.`,
+  "en-IN": (n, t) => `Step ${n} — ${t}.`,
+  "hi-IN": (n, t) => `चरण ${n} — ${t}।`,
+  "bn-IN": (n, t) => `ধাপ ${n} — ${t}।`,
+  "ta-IN": (n, t) => `படி ${n} — ${t}.`,
+  "te-IN": (n, t) => `అడుగు ${n} — ${t}.`,
+  "mr-IN": (n, t) => `टप्पा ${n} — ${t}।`,
+  "gu-IN": (n, t) => `પગલું ${n} — ${t}.`,
+  "kn-IN": (n, t) => `ಹಂತ ${n} — ${t}.`,
+  "ml-IN": (n, t) => `ഘട്ടം ${n} — ${t}.`,
+  "pa-IN": (n, t) => `ਕਦਮ ${n} — ${t}।`,
+  "od-IN": (n, t) => `ପାଦ ${n} — ${t}।`,
+};
+
+/**
+ * The last resort of the planning filler: a short line that can be said again
+ * without sounding broken, for the tail of a wait that has outlasted both the
+ * written lines and every step title the planner has published.
+ *
+ * Measured plan latency reaches 127s. Six written lines and a handful of step
+ * titles cover about a minute of that, and the rest used to be silence — so this
+ * keeps the room alive until the plan lands, varied enough to bear repeating.
+ */
+export const PLANNING_HOLDS: Record<LanguageCode, readonly string[]> = {
+  en: ["Still working on it — nearly there.", "One moment more.", "Just putting the last piece in place."],
+  "en-IN": ["Bas thoda aur — ho hi gaya.", "Ek minute aur.", "Last hissa set kar rahe hain."],
+  "hi-IN": ["बस थोड़ा और — लगभग हो गया।", "एक पल और।", "आख़िरी हिस्सा जमा रहे हैं।"],
+  "bn-IN": ["আর একটু — প্রায় হয়ে গেছে।", "আরও এক মুহূর্ত।"],
+  "ta-IN": ["இன்னும் கொஞ்சம் — கிட்டத்தட்ட முடிந்தது.", "ஒரு நிமிடம் கூட."],
+  "te-IN": ["ఇంకా కొంచెం — దాదాపు అయిపోయింది.", "ఒక్క క్షణం మరి."],
+  "mr-IN": ["आणखी थोडं — जवळपास झालं.", "एक क्षण अजून."],
+  "gu-IN": ["હજી થોડું — લગભગ થઈ ગયું.", "એક ક્ષણ વધુ."],
+  "kn-IN": ["ಇನ್ನೂ ಸ್ವಲ್ಪ — ಬಹುತೇಕ ಆಯಿತು.", "ಒಂದು ಕ್ಷಣ ಇನ್ನೂ."],
+  "ml-IN": ["ഇനിയും കുറച്ച് — ഏതാണ്ട് കഴിഞ്ഞു.", "ഒരു നിമിഷം കൂടി."],
+  "pa-IN": ["ਹੋਰ ਥੋੜ੍ਹਾ — ਲਗਭਗ ਹੋ ਗਿਆ।", "ਇੱਕ ਪਲ ਹੋਰ।"],
+  "od-IN": ["ଆଉ ଟିକେ — ପ୍ରାୟ ହୋଇଗଲା।", "ଆଉ ଏକ ମୁହୂର୍ତ୍ତ।"],
+};
+
+export function planningHolds(code: string): readonly string[] {
+  return PLANNING_HOLDS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
+export function planningStepLead(code: string, n: number, title: string): string {
+  return PLANNING_STEP_LEADS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE](n, title);
 }
 
 /**
