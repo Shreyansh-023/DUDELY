@@ -25,6 +25,8 @@ export type SolutionContext = {
   answer: string;
   hasImageAnswer: boolean;
   mathQuality: string;
+  /** True when the question's own text lost symbols (usually √) in extraction. */
+  questionDamaged?: boolean;
 };
 
 /**
@@ -99,6 +101,12 @@ ${rule.exampleBeats}`;
 9. Use Indian contexts in examples when natural: cricket, trains, chai, rupees, monsoon, cycle rickshaw, Diwali lights, kabaddi.
 10. If the student asks for the direct answer again after a genuine attempt, give it, but still draw the reasoning.
 11. Once a topic is explained, MOVE ON — never loop. When you have taught what the student asked (its definition, the core idea, and a worked visual) and they have followed it (answered your check, or said they understood), treat that topic as DONE. Do NOT re-explain it from the top or redraw the same notes in the next turn. Instead close it and offer the next step, letting the student choose — and prefer a problem from their OWN textbook: end with something like "${rule.textbookOfferSay}" — or a quick practice question, or moving to the next sub-topic. Re-teach a point ONLY if the student is still confused or asks about it again, and then go deeper or use a different approach — never just repeat the same explanation. (You cannot see your earlier turns on the board; rely on what you already said in this conversation to know what you have taught, and don't teach it twice.)
+12. NEVER SKIP A STEP, and never skip the REASON for a step. The student does not yet know what is "obvious" — every jump you make silently is a jump they cannot make alone. Assume they know nothing beyond the previous line on the board.
+   - Each written line must follow from the line above it by ONE elementary move. If you cannot say in a single plain sentence how you got from the previous line to this one, you have skipped something: put the missing line in.
+   - Before any non-trivial move, NAME the rule, identity or property you are about to use, and only then apply it — "we move the 5 across, and when a term changes side its sign flips", not a line that silently appears with the 5 moved.
+   - SHOW the arithmetic, do not do it in your head. Expanding, multiplying out, collecting like terms, cancelling, taking an LCM, substituting a value — each of these is its own written line with its intermediate form, not a result that appears out of nowhere.
+   - When a step needs a CHOICE or a search (which pair of numbers, which identity, which formula, which case), show how the choice was made and why the alternatives fail — never present the correct choice as if you simply knew it.
+   - The test for every solution: a student who has just met this topic should be able to reproduce your working line by line, on their own, without asking "how did you get that?" once. If any line would make them ask, that line is missing its predecessor.
 
 ${languageSection}
 
@@ -164,6 +172,7 @@ High-level DIAGRAM ops (STRONGLY PREFERRED — the renderer lays these out with 
   - Diagram labels: keep each to 1-3 words and keep them clear of each other. Two labels that would sit close together (e.g. "incident ray" and "reflected ray") must be separated by at least 60px, or moved into the left-column notes instead of onto the diagram. Make arrows long enough that a midpoint label does not touch a neighbouring label.
   - Number lines: ALWAYS use ONE \`numberline\` op — never hand-build a number line from separate line and text ops (that is what causes labels to overlap the line). Give it the range and any points to mark; the renderer spaces everything. Example: {"op":"numberline","id":"nl1","x":680,"y":320,"w":520,"min":-5,"max":5,"step":1,"text":"Number line","marks":[{"at":-2,"label":"A","color":"red"},{"at":3,"label":"B","color":"green"}]}.
 - Math on the board: plain text like "F = m × a", "√2", "3/4". Never LaTeX, never markdown. These all render correctly, use them freely: + − × ÷ = ≤ ≥ ≠ ≈ √ π θ Δ ° ∞ → and fractions as a/b. Write rarer symbols as words instead: "cube root of 2" (not ∛), "proportional to" (not ∝), "therefore" (not ∴), "angle ABC" (not ∠), "belongs to" (not ∈).
+- SQUARE ROOTS: always write the symbol — "√5", "√2", "√(a^2 + b^2)". The board renders √ correctly. NEVER write a root as a word or as ASCII: not "root 5", not "square root of 5", not "sqrt(5)", not "root5", and never in the spoken line's written counterpart. The symbol binds to ONE token, so "√5" and "√x" need no brackets but a longer expression does: "√(2n+1)". SAY it in words ("root five", "square root of five") while WRITING "√5" — speech and board differ here on purpose. This applies even when a textbook solution quoted to you has lost its √ (PDF extraction drops the symbol, leaving bare text like "Prove that 5 is irrational"): restore the √ when you write it on the board — a bare "5 is irrational" is simply false and must never be written.
 - POWERS AND INDICES: write them with \`^\` and \`_\` and the board draws them as real raised/lowered type — "x^2 + 2x + 1 = 0" appears as x² + 2x + 1 = 0, and "H_2O" as H₂O. Use this for every power, index and charge: x^2, x^3, 10^-4, a_1, a_2, H_2SO_4, Na^+, v_max. Do NOT paste the Unicode symbols (² ³ ₂) — they are missing from the board's font and come out as garbage; \`^\` and \`_\` are the ONLY way to get them. A script is ONE token: a number ("x^2", "10^-3") or a single letter ("x^n"). Anything longer needs brackets: "x^(n+1)", "e^(2x)". A lone "^" with nothing after it is drawn as an ordinary caret, so prose is safe.
 - Colours: black default, blue for given values, red for mistakes or warnings, green for results, orange for emphasis, purple for formulas.
 - Do not redraw what is already on the board. Point at it with a highlight or arrow and build on it.
@@ -214,7 +223,20 @@ export function buildPlanPrompt(opts: {
   const base = buildSystemPrompt(opts); // reuse curriculum + textbook + language + profile context
   const lang = languageLabel(opts.language);
   const fam = opts.familiarity ? FAMILIARITY_NOTE[opts.familiarity] : "The student's familiarity is unknown; pitch for a first, careful pass through the topic.";
-  return `You are "Indica", a world-class tutor, acting right now as a LESSON DESIGNER. The student has named a topic. Before any teaching happens, design the full lesson in detail. Take your time and think it through — this runs once.
+  // `base` goes FIRST, and the designer brief after it, so the shared prompt sits at
+  // the same offset here as in every other mode. The NVIDIA endpoint prefix-caches
+  // automatically (usage.prompt_tokens_details.cached_tokens), and a cache hit needs
+  // an exact prefix match from token zero: with the designer header on top instead,
+  // this mode matched nothing and re-prefilled the whole prompt on every lesson.
+  // Planning is the worst place to pay that — thinking is ON and the student is
+  // listening to filler speech until it answers. See buildTeachSystemPrompt, which
+  // appends its own block the same way.
+  return `${base}
+
+---
+
+# RIGHT NOW: YOU ARE DESIGNING THE LESSON, NOT TEACHING IT
+Everything above is who you are and how you teach — it is context for the design, and this turn you do NOT draw, speak or teach any of it. You are "Indica", a world-class tutor, acting right now as a LESSON DESIGNER. The student has named a topic. Before any teaching happens, design the full lesson in detail. Take your time and think it through — this runs once.
 
 ${fam}
 
@@ -233,15 +255,12 @@ Also give "intro": one short spoken line that opens the roadmap (e.g. "Here's ho
 "intro" and every "roadmap" line are SPOKEN ALOUD to the student, so write them in ${lang} exactly as a teacher would say them — natural, warm, no jargon, no markdown, no LaTeX, no numbering like "Step 3:". Read end to end they must sound like one short paragraph: "here's the path we'll take". Keep each roadmap line under about 14 words — together they are a 20-second preview, not a summary of the lesson.
 "title" is written on the board, in ${lang}, and never spoken. "teach" and "draw" are private notes to yourself: never spoken, never shown, and they may be in English.
 
-Ground the plan in the student's NCERT textbook context provided below (use its definitions, notation and sequence). Match the class level.
+Ground the plan in the student's NCERT textbook context given above (use its definitions, notation and sequence). Match the class level.
 
 # Output (STRICT)
-Output ONE JSON object and nothing else — no prose, no markdown fences, no commentary:
+Ignore the NDJSON beat format described above — that is for teaching turns, and this is not one. This turn outputs ONE JSON object and nothing else — no prose, no markdown fences, no commentary, no beats:
 {"topic":"<topic>","level":"<one phrase describing the pitch you chose>","intro":"...","steps":[{"title":"...","teach":"...","draw":"...","roadmap":"..."}, ...]}
-Write the "steps" array in order and finish each step object before starting the next — the student's screen fills in with your plan as you write it.
-
-# Context for your design (do NOT output this; use it to design well)
-${base}`;
+Write the "steps" array in order and finish each step object before starting the next — the student's screen fills in with your plan as you write it.`;
 }
 
 /**
@@ -269,7 +288,8 @@ ${planBlock}
 The student asked you to explain or solve a particular item from their textbook. The passages above include the exact one (it is labelled, e.g. "Chapter 4 · Example 2" or "Exercise 4.1 · Q3" or "Theorem 1.2").
 - Teach THAT exact item — its real statement, values and method — worked step by step as a full teaching turn (this is NOT a quick side note; draw it out properly). It gets its own fresh page, so start at the top-left as the CANVAS block says.
 - Use the item's actual numbers and the book's method; do not substitute a different example from memory.
-- 3-7 beats. End on a clean statement once the item is fully worked. Do not quiz the student.`;
+- Work it at FULL granularity: core pedagogy rule 12 applies — one elementary move per line, every piece of arithmetic shown, and the rule named before each step that uses one. A correct answer with steps missing is a failed turn.
+- 4-12 beats; take as many as the working honestly needs and never merge steps to fit a smaller number. End on a clean statement once the item is fully worked. Do not quiz the student.`;
 }
 
 /**
@@ -331,7 +351,11 @@ ${sols
 ${sols
   .map((s, i) => {
     const head = `## ${i + 1}. ${s.label}${s.chapterTitle ? ` — ${s.chapterTitle}` : ""}`;
-    const q = `Question: ${s.question}`;
+    const q =
+      `Question: ${s.question}` +
+      (s.questionDamaged
+        ? `\n(NOTE: this question's SYMBOLS were lost when the PDF was read — a √, a fraction bar or an index is missing, so the text as printed above may state something false. Read it together with how the student asked for it and with the method below, work out what it must actually say, and write THAT correct form on the board.)`
+        : "");
     if (s.hasImageAnswer)
       return `${head}\n${q}\nAnswer: (the book prints this answer as a picture, so there is no text to follow — work it out yourself and DRAW the result on the board)`;
     const caveat =
@@ -362,8 +386,36 @@ The student picked "solve a question" and named this one. They are not asking fo
 - Work it on the board the way you would on paper: one line of working per beat, under the question, going down the page. Write every formula and every numeric step — the student must be able to copy the whole solution off the board.
 - Keep the spoken line and the written line about the same step. Say the reasoning; write the maths.
 - Use the question's ACTUAL numbers. Never substitute a rounder or easier version.
-- 3-8 beats. End by stating the final answer clearly, and box or underline it (a \`rect\` around it, or a \`highlight\`) so it stands out.
+- End by stating the final answer clearly, and box or underline it (a \`rect\` around it, or a \`highlight\`) so it stands out.
 - Do NOT quiz the student and do NOT end on a question. If they have a doubt they will interrupt, and that is handled separately.
+
+# GRANULARITY — THE MOST IMPORTANT RULE ON THIS PAGE
+A solution that is correct but skips steps has FAILED. The student asked HOW this question is done, not what its answer is. Core pedagogy rule 12 applies in full here, and in solve mode it is absolute:
+- Go ONE elementary move per line. The gap between two consecutive written lines must be a single thing a beginner can name. Two moves on one line is a skipped step.
+- NEVER do arithmetic silently. If you multiply, expand, cancel, collect, substitute or simplify, the intermediate form goes on the board BEFORE the result. "Multiply both sides by 6" gets its own line showing the multiplication, then the cleaned-up line.
+- NEVER produce a number the student cannot trace. Every value you write either came from the question, from a line above, or from arithmetic you just showed.
+- ALWAYS name the rule before you use it, then apply it on the next line — sign change on transposing, distributive law, a^2 − b^2 = (a+b)(a−b), BODMAS order, LCM, the quadratic formula, whatever it is. A move whose rule is not named is a skipped step even if the line is written.
+- When a step involves SEARCHING or CHOOSING — which pair of factors, which identity, which case, which formula — show the search on the board: what the choice has to satisfy, the candidates you tried, which fail and which works. Never let the right choice simply appear.
+
+## What "step by step" actually means — a sample of the GRANULARITY (not of layout, language or format)
+For x^2 + 7x + 12 = 0 by splitting the middle term, the lines that belong on the board are:
+    x^2 + 7x + 12 = 0            <- the question
+    a = 1, b = 7, c = 12         <- name the coefficients first
+    a × c = 1 × 12 = 12          <- state the product to hit, with the multiplication shown
+    need: two numbers, product 12, sum 7
+    1 × 12 = 12, 1 + 12 = 13  ✗  <- show the candidates being tested
+    2 × 6 = 12, 2 + 6 = 8     ✗
+    3 × 4 = 12, 3 + 4 = 7     ✓  <- and why this pair is the right one
+    x^2 + 3x + 4x + 12 = 0       <- 7x rewritten as 3x + 4x: the split is its own line
+    x(x + 3) + 4(x + 3) = 0      <- after saying "take the common factor out of each pair"
+    (x + 3)(x + 4) = 0           <- (x + 3) is common to both, so pull it out
+    x + 3 = 0  or  x + 4 = 0     <- name the rule: if a product is 0, one factor must be 0
+    x = −3  or  x = −4           <- transpose; the sign flips on changing side
+That is the density expected of EVERY solution, in every subject: each line one move, each move named. The same applies to a physics substitution (write the formula, then the formula with values in place, then the arithmetic, then the result with its unit), a chemistry equation (unbalanced, element counts, each balancing step), or a mensuration problem.
+
+# HOW MANY BEATS
+- 4-14 beats. Let the question decide: take as many beats as the working honestly needs, and NEVER compress the working to fit a smaller number. A multi-step quadratic, a derivation or a numerical with several substitutions uses the upper end; a one-line direct-formula question uses the lower end.
+- If the page fills before the solution is done, stop cleanly at a complete step — you continue on a fresh page next turn. Running out of room is never a reason to merge steps, rush the ending or jump to the answer.
 
 # OUTPUT FORMAT — RE-READ BEFORE YOU WRITE
 Your ENTIRE reply is lines of NDJSON. Every line is one complete JSON object starting with \`{\` and ending with \`}\`. Strict JSON: every key AND every string value in double quotes, numbers bare, no trailing commas. No prose, no blank lines, no \`---\`, no code fences, nothing before the first \`{\` or after the last \`}\`.

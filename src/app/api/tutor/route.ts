@@ -114,8 +114,15 @@ export async function POST(req: Request) {
   // guess — asked to solve their own sum, the student would otherwise watch the board
   // fill with a different, merely similar question from the book. Their own words are
   // always right about what they asked.
+  //
+  // A question whose own text did not survive the PDF is treated like a non-exact
+  // match for board purposes: writing "Prove that 5 is irrational" (the √ having
+  // been dropped in extraction) puts a false statement up as the student's question.
+  // The reference is still correct, so the label stays and the model still receives
+  // the book's method — only the transcription falls back to the student's words.
   const askedText = messages.filter((m) => m.role === "user").at(-1)?.text.trim() ?? "";
-  const boardQuestion = mode === "solve" ? (exactSolution ? solutions[0].question.trim() : askedText) : "";
+  const quotable = exactSolution && solutions.length > 0 && !solutions[0].questionDamaged;
+  const boardQuestion = mode === "solve" ? (quotable ? solutions[0].question.trim() : askedText) : "";
   const boardLabel = mode === "solve" && exactSolution ? (solutions[0]?.label ?? null) : null;
   const written = mode === "solve" && boardQuestion
     ? questionBeat({ question: boardQuestion, heading: boardLabel })
@@ -162,11 +169,13 @@ export async function POST(req: Request) {
   const formatNudge =
     mode === "doubt" || mode === "solvedoubt"
       ? "\n\n---\nReply with NDJSON beats only: 1-4 lines, each a complete JSON object. No prose."
-      : mode === "teach" || mode === "explain"
+      : mode === "teach"
         ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 3-6 beats, and draw on the board — one short sentence is not a step."
-        : mode === "solve"
-          ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. The question is already on the board: start at the first step of the solution, show every step of the working, and box the final answer."
-          : "";
+        : mode === "explain"
+          ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Work the item at full granularity: one elementary move per line, every bit of arithmetic written out, and the rule named before you use it. Never skip a step because it looks obvious."
+          : mode === "solve"
+            ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. The question is already on the board: start at the first step of the solution and box the final answer. SHOW EVERY STEP — one elementary move per line, the arithmetic written out rather than done in your head, the rule named before each step that uses one, and any choice of numbers (such as a factor pair) searched out on the board. A line the student cannot derive from the line above it means you skipped a step."
+            : "";
   const rawMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
     return { role: "user", content: i === last ? buildUserTurn({ text: m.text, canvas }) + formatNudge : m.text };
@@ -217,6 +226,7 @@ export async function POST(req: Request) {
             signal: req.signal,
             send,
             fallbackTopic: messages[last]?.text ?? "",
+            mode,
           });
         } else {
           await streamBeats({
@@ -233,6 +243,7 @@ export async function POST(req: Request) {
             // A doubt is a spoken side-note, so prose with no drawing is still a
             // usable answer — speak it rather than failing the student's question.
             salvageProse: mode === "doubt" || mode === "solvedoubt",
+            mode,
           });
         }
       } finally {
@@ -260,6 +271,8 @@ type StreamArgs = {
   send: (ev: TutorEvent) => void;
   temperature?: number;
   salvageProse?: boolean;
+  /** The request's stage, for the cache/usage log line only. */
+  mode: string;
 };
 
 /**
@@ -282,6 +295,48 @@ type StreamArgs = {
 const FIRST_BEAT_TIMEOUT_MS = 15_000;
 
 /**
+ * Logs what the provider's prefix cache did with this request.
+ *
+ * The NVIDIA endpoint prefix-caches automatically — no parameter to set — and
+ * reports the hit as `cached_tokens`, which the AI SDK surfaces as
+ * `usage.inputTokenDetails.cacheReadTokens`. A hit needs an exact prefix match
+ * from token zero, so this line is how a prompt edit that silently moves the
+ * shared prefix (and so stops matching) becomes visible instead of just slow.
+ *
+ * Two things to know when reading the output:
+ *  - `cached=n/a` is NOT a miss. Some models — Nemotron Ultra among them — omit
+ *    the field entirely rather than reporting zero, so absent and zero mean
+ *    different things and must not be collapsed.
+ *  - The hit is capped at a fixed block size (measured: 4336 tokens on the Super
+ *    tier), so a long prompt plateaus at a partial percentage however identical
+ *    it is. A number well below that cap on a repeated call is the real warning
+ *    sign; one at the cap is as good as it gets.
+ *
+ * Never throws and never blocks the stream: usage resolves after the body is
+ * done, so this is attached as a floating `.then` and a failure is swallowed.
+ */
+function logCacheUsage(usage: PromiseLike<unknown>, label: string, mode: string) {
+  // `usage` is only PromiseLike, so wrap it before attaching a rejection handler:
+  // without one, a failed usage promise becomes an unhandled rejection and can
+  // take the server process down over a log line.
+  void Promise.resolve(usage)
+    .then((u) => {
+      const { inputTokens, inputTokenDetails } = (u ?? {}) as {
+        inputTokens?: number;
+        inputTokenDetails?: { cacheReadTokens?: number };
+      };
+      const cached = inputTokenDetails?.cacheReadTokens;
+      const pct = cached != null && inputTokens ? ` (${Math.round((100 * cached) / inputTokens)}%)` : "";
+      console.info(
+        `[tutor] ${mode} via ${label}: prompt=${inputTokens ?? "?"} cached=${cached ?? "n/a"}${pct}`,
+      );
+    })
+    .catch(() => {
+      /* usage is diagnostics only — never let it affect the turn */
+    });
+}
+
+/**
  * Teach/doubt/ask: the model emits beats as NDJSON. We extract each complete
  * top-level JSON object from the text stream (tolerant of arrays, commas, code
  * fences and pretty-printing) and validate it ourselves — no provider-side
@@ -297,6 +352,7 @@ async function streamBeats({
   send,
   temperature = 0.6,
   salvageProse = false,
+  mode,
 }: StreamArgs) {
   let lastErr: string | null = null;
   for (let mi = 0; mi < models.length; mi++) {
@@ -316,13 +372,17 @@ async function streamBeats({
           system,
           messages,
           temperature,
-          maxOutputTokens: 3000,
+          // Every beat mode works at full granularity (one elementary move per
+          // line, arithmetic shown), so a turn can legitimately run long — give
+          // it the room or the stream truncates mid-explanation.
+          maxOutputTokens: 6000,
           maxRetries: 1,
           abortSignal: AbortSignal.any([signal, watchdog.signal]),
           onError: ({ error }) => {
             errMsg ??= errorMessage(error);
           },
         });
+        logCacheUsage(result.usage, label, mode);
         const scanner = new BeatScanner((beat) => {
           beatCount++;
           clearTimeout(timer); // it is answering; let it finish at its own pace
@@ -409,6 +469,7 @@ async function streamPlan({
   signal,
   send,
   fallbackTopic,
+  mode,
 }: StreamArgs & { fallbackTopic: string }) {
   let lastErr: string | null = null;
   for (let mi = 0; mi < models.length; mi++) {
@@ -432,6 +493,7 @@ async function streamPlan({
             errMsg ??= errorMessage(error);
           },
         });
+        logCacheUsage(result.usage, label, mode);
         const steps = new StepScanner((step, index) => send({ type: "planstep", index, step }));
         for await (const delta of result.textStream) {
           if (signal.aborted) return;

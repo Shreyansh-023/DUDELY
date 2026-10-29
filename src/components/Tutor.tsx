@@ -697,7 +697,11 @@ export default function Tutor() {
       // it is actually going to draw on. An interruption gets a page of its own;
       // teaching continues the current page while it has room.
       if (spec.interrupt) b.player.beginDoubtTurn();
-      else b.player.beginTeachTurn({ stayOnPage: changed.length > 0 });
+      // A solve turn always takes a clean sheet. Its question block is laid out
+      // server-side at fixed coordinates from the top of the page, so it cannot
+      // be pushed below whatever the previous question left behind — share a
+      // page and the new heading prints straight over the old one.
+      else b.player.beginTeachTurn({ stayOnPage: changed.length > 0, freshPage: spec.mode === "solve" });
       const canvas = b.summarizeScene(elements, new Set(changed.map((e) => e.id)), b.player.pageFrame());
 
       const userMsg: ChatMessage = { id: uid("u"), role: "user", text: spec.text };

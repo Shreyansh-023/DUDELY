@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { rerank } from "./rerank";
 import type { HistoryMessage } from "./schema";
 
 /**
@@ -36,6 +37,13 @@ export type Solution = {
   hasImageAnswer: boolean;
   /** "clean" | "degraded" | "poor" — how much of the maths survived PDF extraction. */
   mathQuality: string;
+  /**
+   * True when this question's own text is still mangled after repair, so it must
+   * NOT be written on the board as the student's question — what would appear is a
+   * different statement from the one in their book. The caller writes the student's
+   * own words instead and lets the model reconstruct the maths.
+   */
+  questionDamaged: boolean;
   textbookPage: number | null;
 };
 
@@ -85,7 +93,15 @@ function loadIndex(book: string): Promise<Index | null> {
     const dir = path.join(SOLUTIONS_DIR, book);
     try {
       const meta = JSON.parse(await readFile(path.join(dir, "meta.json"), "utf8")) as Meta;
-      const chunks = JSON.parse(await readFile(path.join(dir, "chunks.json"), "utf8")) as Chunk[];
+      const raw = JSON.parse(await readFile(path.join(dir, "chunks.json"), "utf8")) as Chunk[];
+      // Decode the Symbol-font glyphs once, here, so EVERY consumer sees real maths:
+      // BM25 tokenising, the cross-encoder reranker, the prompt and the board. Doing
+      // it per-result instead would leave the search ranking on mojibake.
+      const chunks = raw.map((c) => ({
+        ...c,
+        question: repairMath(c.question),
+        answer: repairMath(c.answer),
+      }));
       // vectors.f32 is optional: without it (or without an API key) search is BM25-only,
       // and positional lookup — the common case here — does not need vectors at all.
       const vectors = await readFile(path.join(dir, "vectors.f32"))
@@ -185,24 +201,67 @@ export type SolveRef = {
   example: string | null; // "2"
 };
 
-const SEP = "[\\s:#.\\-]*";
-const kw = (...alts: string[]) => `(?<![a-z\\u0900-\\u097f])(?:${alts.join("|")})`;
+// These are regex SOURCE fragments spliced into `new RegExp`, so every backslash
+// must survive the string literal intact — hence String.raw. Written as plain
+// quoted strings, `\s` and `\\s` BOTH collapse to a bare "s" (and `\\d` to "d"),
+// which is what silently reduced SEP to `[s:#.-]*` and the captures to `(d+)`. The
+// patterns then matched nothing, so every "exercise 1.2 question 1" missed its exact
+// record and fell through to semantic search. Keep String.raw on anything spliced in.
+const SEP = String.raw`[\s:#.\-]*`;
+const kw = (...alts: string[]) =>
+  String.raw`(?<![a-z\u0900-\u097f])` + `(?:${alts.join("|")})`;
 const K_CHAPTER = kw("chapters?", "chap", "adhyaay", "adhyay", "अध्याय", "चैप्टर");
 const K_EXERCISE = kw("exercises?", "prashnaavali", "prashnavali", "abhyaas", "abhyas", "प्रश्नावली", "अभ्यास");
 const K_QUESTION = kw("questions?", "ques", "prashn", "sawaal", "sawal", "problem", "sum", "q", "प्रश्न", "सवाल");
-const K_EXAMPLE = kw("examples?", "udaharan\\w*", "udhaaran\\w*", "उदाहरण");
-const NUM = "(?:no\\.?\\s*|number\\s*|sankhya\\s*|संख्या\\s*)?";
+const K_EXAMPLE = kw("examples?", String.raw`udaharan\w*`, String.raw`udhaaran\w*`, "उदाहरण");
+const NUM = String.raw`(?:no\.?\s*|number\s*|sankhya\s*|संख्या\s*)?`;
 
 function normalizeDigits(s: string): string {
   return s.replace(/[०-९]/g, (d) => String(d.charCodeAt(0) - 0x0966));
 }
 
+/**
+ * Students type "question one of exercise 1.2" as readily as "question 1". Only the
+ * low words are listed, and only where they directly follow a keyword (see
+ * `normalizeWordNumbers`): question numbers in these books do not run high, and
+ * matching bare words anywhere would turn "one of the roots" into a reference.
+ */
+const WORD_NUMBERS: Record<string, string> = {
+  one: "1", first: "1", ek: "1", pehla: "1", pehli: "1", एक: "1", पहला: "1",
+  two: "2", second: "2", do: "2", dusra: "2", doosra: "2", दो: "2", दूसरा: "2",
+  three: "3", third: "3", teen: "3", tisra: "3", teesra: "3", तीन: "3", तीसरा: "3",
+  four: "4", fourth: "4", char: "4", chautha: "4", चार: "4", चौथा: "4",
+  five: "5", fifth: "5", panch: "5", paanch: "5", पांच: "5", पाँच: "5", पांचवा: "5",
+  six: "6", sixth: "6", chah: "6", chhah: "6", छह: "6", छठा: "6",
+  seven: "7", seventh: "7", saat: "7", सात: "7", सातवां: "7",
+  eight: "8", eighth: "8", aath: "8", आठ: "8", आठवां: "8",
+  nine: "9", ninth: "9", nau: "9", नौ: "9", नौवां: "9",
+  ten: "10", tenth: "10", das: "10", दस: "10", दसवां: "10",
+};
+
+/**
+ * Rewrite "question one" -> "question 1", but ONLY the word immediately after a
+ * positional keyword. Scoping it this way is what keeps "one of the following" and
+ * "two numbers are co-prime" from being read as question numbers.
+ */
+function normalizeWordNumbers(q: string): string {
+  const words = Object.keys(WORD_NUMBERS).join("|");
+  const keyword = `(${K_QUESTION}|${K_EXAMPLE}|${K_CHAPTER})(${SEP}${NUM})`;
+  // `\b` is Latin-only, so a Devanagari numeral word needs an explicit
+  // "not followed by more Devanagari" guard instead.
+  return q.replace(
+    new RegExp(`${keyword}(${words})(?![a-z0-9\\u0900-\\u097f])`, "gi"),
+    (_m, kwPart: string, sep: string, word: string) =>
+      `${kwPart}${sep}${WORD_NUMBERS[word.toLowerCase()] ?? word}`,
+  );
+}
+
 export function parseSolveRef(query: string): SolveRef {
-  const q = normalizeDigits(query.toLowerCase());
-  const exercise = q.match(new RegExp(`${K_EXERCISE}${SEP}(\\d+\\.\\d+)`, "i"))?.[1] ?? null;
-  const chapterRaw = q.match(new RegExp(`${K_CHAPTER}${SEP}${NUM}(\\d+)`, "i"))?.[1];
-  const question = q.match(new RegExp(`${K_QUESTION}${SEP}${NUM}(\\d+)`, "i"))?.[1] ?? null;
-  const example = q.match(new RegExp(`${K_EXAMPLE}${SEP}${NUM}(\\d+)`, "i"))?.[1] ?? null;
+  const q = normalizeWordNumbers(normalizeDigits(query.toLowerCase()));
+  const exercise = q.match(new RegExp(`${K_EXERCISE}${SEP}` + String.raw`(\d+\.\d+)`, "i"))?.[1] ?? null;
+  const chapterRaw = q.match(new RegExp(`${K_CHAPTER}${SEP}${NUM}` + String.raw`(\d+)`, "i"))?.[1];
+  const question = q.match(new RegExp(`${K_QUESTION}${SEP}${NUM}` + String.raw`(\d+)`, "i"))?.[1] ?? null;
+  const example = q.match(new RegExp(`${K_EXAMPLE}${SEP}${NUM}` + String.raw`(\d+)`, "i"))?.[1] ?? null;
   return {
     exercise,
     // "exercise 5.2" already carries its chapter; only trust a bare "chapter N" otherwise.
@@ -289,10 +348,113 @@ async function search(index: Index, query: string, k: number): Promise<Chunk[]> 
   }
   add(topIndices(bm25.scores(tokenize(query)), CANDIDATES, (s) => s > 0), q ? BM25_WEIGHT : 1.0);
 
-  return [...fused.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, k)
-    .map(([i]) => chunks[i]);
+  const byHybrid = [...fused.entries()].sort((a, b) => b[1] - a[1]).map(([i]) => i);
+  // Reranked before the slice, so a solution hybrid scoring put at k+1 can still be
+  // chosen. It earns its latency most here: these candidates are whole questions, and
+  // the one that merely shares a topic with what the student asked reads very like the
+  // one that IS it — a distinction a cross-encoder makes far better than two
+  // separately-embedded vectors. The caller still flags the result as inexact
+  // (`exactSolution: false`), so a better order never becomes a claim of certainty.
+  const ranked =
+    (await rerank(query, byHybrid, (i) => `${label(chunks[i])}\n${chunks[i].question}`)) ?? byHybrid;
+
+  return ranked.slice(0, k).map((i) => chunks[i]);
+}
+
+// ------------------------------------------------------------- math repair
+
+/**
+ * Decode the Symbol-font glyphs that PDF extraction left as Private Use Area
+ * characters.
+ *
+ * WHY THIS EXISTS: these solution PDFs were typeset with MathType, which sets every
+ * operator in the Adobe *Symbol* font. Symbol has no Unicode cmap, so a text
+ * extractor emits each glyph at U+F000 + its font charcode instead of the character
+ * it draws. The maths therefore arrives not merely ugly but WRONG:
+ *
+ *   "Prove that 3  2 5 is irrational."   really "Prove that 3 + 2 root5 is irrational."
+ *   "225  135  1  90"           really "225 = 135 x 1 + 90"
+ *
+ * The board was writing that first string onto the page verbatim as the student's
+ * question. Dropping a "+" changes what is being asked; the student copies down a
+ * statement that is not in their book.
+ *
+ * The mapping is pure Adobe Symbol encoding, so it is exact rather than heuristic:
+ * low codes are ASCII-identical (U+F02B is charcode 0x2B, "+"), and the high ones
+ * are Symbol's own operators and Greek. 17,635 of these across 658 chunks, all
+ * decoded here on the way out of the index rather than in the (slow, offline)
+ * corpus build, so an existing index is repaired without a rebuild.
+ */
+const SYMBOL_FONT: Record<number, string> = {
+  // ASCII-identical range: charcode == the character it draws.
+  0x20: " ", 0x22: '"', 0x28: "(", 0x29: ")", 0x2b: "+", 0x2d: "−", 0x30: "0",
+  0x31: "1", 0x32: "2", 0x3c: "<", 0x3d: "=", 0x3e: ">", 0x40: "≅", 0x5b: "[",
+  0x5d: "]", 0x5e: "⊥",
+  // Greek: Symbol maps the Latin letter position to the Greek letter.
+  0x44: "Δ", 0x57: "Ω", 0x61: "α", 0x62: "β", 0x64: "δ",
+  0x6c: "λ", 0x6d: "μ", 0x70: "π", 0x71: "θ", 0x72: "ρ",
+  // Operators and relations.
+  0x5c: "∴", 0xa2: "′", 0xa3: "≤", 0xad: "↑", 0xae: "→",
+  0xaf: "↓", 0xb0: "°", 0xb1: "±", 0xb4: "×", 0xb5: "∝",
+  0xb8: "÷", 0xb9: "≠", 0xbb: "≈", 0xbc: "…", 0xce: "∈",
+  0xd0: "∠", 0xd7: "⊗", 0xde: "⇒", 0xe5: "∑",
+  // Multi-part brackets: MathType builds a tall ( or ) from stacked pieces. Each
+  // piece decodes to the plain bracket, and the duplicates collapse below.
+  0xe6: "(", 0xe7: "(", 0xe8: "(", 0xe9: "(", 0xea: "(", 0xeb: "(", 0xec: "(",
+  0xed: "(", 0xee: "(",
+  0xf6: ")", 0xf7: ")", 0xf8: ")", 0xf9: ")", 0xfa: ")", 0xfb: ")", 0xfc: ")",
+  0xfd: ")", 0xfe: ")",
+};
+
+/** True if the corpus still carries undecoded Symbol glyphs. */
+const PUA = /[-]/;
+
+function decodeSymbolFont(text: string): string {
+  if (!PUA.test(text)) return text;
+  let out = text.replace(/[-]/g, (ch) => {
+    const mapped = SYMBOL_FONT[ch.charCodeAt(0) & 0xff];
+    // An unmapped glyph becomes a space, not a question mark: a stray box in the
+    // middle of an equation reads as a symbol the student should look for, while a
+    // space reads as the gap it actually is.
+    return mapped ?? " ";
+  });
+  // A tall bracket made of stacked pieces decodes to a run of identical brackets.
+  out = out.replace(/\((?:\s*\()+/g, "(").replace(/\)(?:\s*\))+/g, ")");
+  return out.replace(/[ 	]{2,}/g, " ");
+}
+
+/**
+ * Restore the square-root signs that extraction dropped entirely.
+ *
+ * Unlike the operators above, the radical is DRAWN by MathType (a rule over the
+ * radicand) rather than set as a glyph, so there is nothing in the text to decode:
+ * "root5" simply arrives as "5". Only the unambiguous case is repaired - a bare
+ * integer asserted to be irrational, which is false for every integer, so the root
+ * is the only possible reading. Anything less certain is left alone and reported
+ * through `questionDamaged` instead.
+ */
+function restoreRoots(text: string): string {
+  return text.replace(
+    /(^|[^\d√.])(\d+)(\s+(?:is|are)\s+(?:an?\s+)?irrational)/gi,
+    (_m, pre: string, num: string, tail: string) => `${pre}√${num}${tail}`,
+  );
+}
+
+/**
+ * Does this question's text still look mangled after decoding and repair?
+ *
+ * A damaged question must NOT be written on the board as the student's question:
+ * what appears would be a different (often false) statement from the one in their
+ * book. The caller falls back to the student's own words, which are never wrong
+ * about what they asked, and lets the model reconstruct the maths from the method.
+ */
+function questionLooksDamaged(text: string, mathQuality: string): boolean {
+  // An undecoded Symbol glyph is damage by definition.
+  if (PUA.test(text)) return true;
+  if (mathQuality === "clean") return false;
+  // Bare integers separated only by space, with no operator between them: an
+  // expression whose radicals or fraction bars did not survive ("3 2 5").
+  return /\d\s+\d/.test(text);
 }
 
 // ------------------------------------------------------------------ public API
@@ -308,18 +470,28 @@ function label(c: Chunk): string {
   return c.number ? `${where} · Q${c.number}` : where;
 }
 
+/** Decode Symbol glyphs, then restore dropped radicals. Order matters: decoding
+ *  reinstates the operators that tell "3 + 2√5" apart from an unreadable "3 2 5". */
+function repairMath(text: string): string {
+  return restoreRoots(decodeSymbolFont(text));
+}
+
 function toSolution(c: Chunk): Solution {
+  // `c` is already repaired — loadIndex decodes every chunk on the way in — so this
+  // only truncates and judges.
   const answer = c.answer.length > MAX_ANSWER_CHARS ? `${c.answer.slice(0, MAX_ANSWER_CHARS)} …` : c.answer;
+  const question = c.question;
   return {
     label: label(c),
     chapter: c.chapter,
     chapterTitle: c.chapterTitle,
     exercise: c.exercise,
     number: c.number,
-    question: c.question,
+    question,
     answer,
     hasImageAnswer: c.hasImageAnswer,
     mathQuality: c.mathQuality,
+    questionDamaged: questionLooksDamaged(question, c.mathQuality),
     textbookPage: c.textbookPage,
   };
 }

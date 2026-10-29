@@ -170,12 +170,27 @@ export class BoardPlayer {
    * is already on the page, and spills it onto a fresh page when it genuinely
    * does not fit. The page a step lands on is therefore decided here at
    * playback time, never at generation time.
+   *
+   * `freshPage` opts out of sharing entirely: the turn gets a clean sheet even
+   * if the current page has room. A solved question needs this. Its first beat
+   * is laid out SERVER-side (question-board.ts) at fixed page-local coordinates
+   * from CONTENT_TOP, so unlike a model-written step it cannot be re-anchored
+   * below existing content — sharing a page would print the new question's
+   * heading straight over the previous one's.
    */
-  beginTeachTurn(opts?: { stayOnPage?: boolean; newStep?: boolean }) {
+  beginTeachTurn(opts?: { stayOnPage?: boolean; newStep?: boolean; freshPage?: boolean }) {
     this.doubtMode = false;
     this.plannedKind = "teach";
     this.pageAnchorDy = 0;
     this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
+    // `freshPage` is checked FIRST, so it also overrides `stayOnPage`: a fixed
+    // server-laid question block can no more dodge the student's own sketch than
+    // it can dodge the previous question.
+    if (opts?.freshPage) {
+      this.planAt(this.freshTeachSlot());
+      this.emit();
+      return;
+    }
     if (opts?.stayOnPage && this.activeIndex >= 0) {
       this.planAt(this.pages[this.activeIndex]);
       this.emit();

@@ -78,12 +78,48 @@ function wrap(text: string, fontPx: number, maxWidth: number): string[] {
 
 /** Collapse the whitespace a PDF extraction leaves behind, without touching content. */
 function tidy(text: string): string {
-  return text
-    .replace(/ /g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/ *\n */g, "\n")
-    .replace(/\n{2,}/g, "\n")
-    .trim();
+  return mathSymbols(
+    text
+      .replace(/ /g, " ")
+      .replace(/[ \t]+/g, " ")
+      .replace(/ *\n */g, "\n")
+      .replace(/\n{2,}/g, "\n")
+      .trim(),
+  );
+}
+
+/**
+ * Write the maths the way the board should show it, not the way it was typed.
+ *
+ * A student types "root 5" or "sqrt(5)" because that is what a keyboard gives them;
+ * the board can draw √, so leaving the words there makes their own question look
+ * unlike the one in their book. Only unambiguous spellings are converted, and only
+ * where a number or a single variable follows, so ordinary prose ("the roots of the
+ * equation", "cube root") is left alone.
+ */
+function mathSymbols(text: string): string {
+  // "cube root" has no board glyph (∛ is not in the font), so it stays in words.
+  // The keyword must not run on into another WORD: "roots", "rooted" and "rooting"
+  // are ordinary English, not a radical sign. A digit or "(" may follow directly,
+  // because "root5" and "sqrt(5)" are how a hurried student writes "√5".
+  const LEAD = String.raw`(?<!cube )(?:square\s+root|sqrt|root)(?![a-z])`;
+  const OF = String.raw`(?:\s+of)?`;
+  // A single letter that is plainly English, so "square root of a number" is not
+  // read as the radical of a variable called "a".
+  const ARTICLE = /^[ai]$/i;
+  return (
+    text
+      // Bracketed radicand: "sqrt(2n+1)" -> "√(2n+1)". A single token inside the
+      // brackets does not need them, so "sqrt(5)" comes out as "√5".
+      .replace(new RegExp(LEAD + OF + String.raw`\s*\(([^()]{1,24})\)`, "gi"), (_m, body: string) =>
+        /^[\w.]+$/.test(body) ? `√${body}` : `√(${body})`,
+      )
+      // "root 5", "square root of 5", "sqrt5" -> "√5". The radicand must be ONE
+      // token: a number, or a single letter that is not an English article.
+      .replace(new RegExp(LEAD + OF + String.raw`\s*(\d+(?:\.\d+)?|[a-z])(?![\w(])`, "gi"), (m: string, body: string) =>
+        ARTICLE.test(body) ? m : `√${body}`,
+      )
+  );
 }
 
 export type QuestionBoard = {
