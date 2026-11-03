@@ -480,3 +480,399 @@ export const ASK_PLACEHOLDERS: Record<LanguageCode, string> = {
 export function askPlaceholder(code: string): string {
   return ASK_PLACEHOLDERS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint lines (spoken only, never written on the board).
+//
+// After each lesson step Indica stops and asks whether anything needs clearing
+// up before moving on. That one question is what turns a 6-minute monologue
+// into a real class: the student gets a held-open door at every subtopic
+// boundary instead of having to barge in.
+//
+// All three sets are fixed templates per language — no LLM call — so they are
+// instant and their speech caches across every lesson and every step, exactly
+// like FAMILIARITY_PROMPTS and RESUME_LINES. They are spoken with `draw: []`:
+// a checkpoint is conversation, not notes, and writing "any doubts?" on the
+// board would leave a question mark stranded on the page under the step's
+// working after the lesson has moved on.
+//
+// Each language carries SIX variants of the two handovers, picked at random,
+// because these fire after every single step: the one fixed resume line that
+// was fine for an occasional doubt turns into a tic when it is heard eight
+// times in one lesson. The question itself is deliberately NOT randomised — it
+// is the lesson's metronome, and the student should recognise it instantly as
+// "this is my cue to speak".
+// ---------------------------------------------------------------------------
+
+/** The checkpoint question itself, asked after every step. */
+export const CHECKPOINT_PROMPTS: Record<LanguageCode, string> = {
+  en: "That's this part done. Any doubt here, or shall we move ahead?",
+  "en-IN": "Yeh part ho gaya. Koi doubt hai isme, ya aage badhein?",
+  "hi-IN": "यह हिस्सा हो गया। इसमें कोई शंका है, या आगे बढ़ें?",
+  "bn-IN": "এই অংশটা শেষ। এখানে কোনো সন্দেহ আছে, নাকি এগিয়ে যাব?",
+  "ta-IN": "இந்தப் பகுதி முடிந்தது. இதில் ஏதாவது சந்தேகம் இருக்கிறதா, அல்லது அடுத்ததற்குப் போகலாமா?",
+  "te-IN": "ఈ భాగం పూర్తయింది. ఇందులో ఏదైనా సందేహం ఉందా, లేక ముందుకు వెళ్దామా?",
+  "mr-IN": "हा भाग झाला. यात काही शंका आहे, की पुढे जाऊ?",
+  "gu-IN": "આ ભાગ પૂરો થયો. આમાં કોઈ શંકા છે, કે આગળ વધીએ?",
+  "kn-IN": "ಈ ಭಾಗ ಮುಗಿಯಿತು. ಇದರಲ್ಲಿ ಏನಾದರೂ ಸಂದೇಹ ಇದೆಯಾ, ಅಥವಾ ಮುಂದೆ ಹೋಗೋಣವಾ?",
+  "ml-IN": "ഈ ഭാഗം കഴിഞ്ഞു. ഇതിൽ എന്തെങ്കിലും സംശയം ഉണ്ടോ, അതോ മുന്നോട്ട് പോകാമോ?",
+  "pa-IN": "ਇਹ ਹਿੱਸਾ ਹੋ ਗਿਆ। ਇਸ ਵਿੱਚ ਕੋਈ ਸ਼ੰਕਾ ਹੈ, ਜਾਂ ਅੱਗੇ ਵਧੀਏ?",
+  "od-IN": "ଏହି ଅଂଶ ହୋଇଗଲା। ଏଥିରେ କିଛି ସନ୍ଦେହ ଅଛି କି, ନା ଆଗକୁ ଯିବା?",
+};
+
+export function checkpointQuestion(code: string): string {
+  return CHECKPOINT_PROMPTS[isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE];
+}
+
+/** Handover when the student had NO doubt: acknowledge, then carry on. */
+export const CHECKPOINT_CLEAR_LINES: Record<LanguageCode, readonly string[]> = {
+  en: [
+    "Great, let's go ahead.",
+    "Perfect. On to the next part.",
+    "Good. Let's keep going.",
+    "Lovely — moving on.",
+    "Excellent. Next up.",
+    "Nice. Let's carry on.",
+  ],
+  "en-IN": [
+    "Badhiya, chalo aage badhein.",
+    "Perfect. Agle part par chalein.",
+    "Accha. Chalo, aage chalte hain.",
+    "Shabaash — aage badhte hain.",
+    "Bahut accha. Ab agla hissa.",
+    "Theek hai. Chalo continue karein.",
+  ],
+  "hi-IN": [
+    "बढ़िया, चलो आगे बढ़ें।",
+    "शाबाश। अब अगले हिस्से पर चलें।",
+    "अच्छा। चलो, आगे चलते हैं।",
+    "बहुत अच्छा — आगे बढ़ते हैं।",
+    "उत्तम। अब अगला भाग।",
+    "ठीक है। चलो जारी रखें।",
+  ],
+  "bn-IN": [
+    "দারুণ, চলো এগিয়ে যাই।",
+    "খুব ভালো। এবার পরের অংশে।",
+    "আচ্ছা। চলো, এগিয়ে চলি।",
+    "বাহ — এগিয়ে যাচ্ছি।",
+    "চমৎকার। এবার পরেরটা।",
+    "ঠিক আছে। চলো চালিয়ে যাই।",
+  ],
+  "ta-IN": [
+    "நல்லது, அடுத்ததற்குப் போகலாம்.",
+    "அருமை. இப்போது அடுத்த பகுதி.",
+    "சரி. தொடர்ந்து போகலாம்.",
+    "பலே — முன்னேறுகிறோம்.",
+    "மிகச் சிறப்பு. அடுத்தது.",
+    "சரி. தொடரலாம்.",
+  ],
+  "te-IN": [
+    "మంచిది, ముందుకు వెళ్దాం.",
+    "చాలా బాగుంది. ఇప్పుడు తరువాతి భాగం.",
+    "సరే. కొనసాగిద్దాం.",
+    "భలే — ముందుకు సాగుతున్నాం.",
+    "అద్భుతం. తరువాతిది.",
+    "సరే. కొనసాగిద్దాం మరి.",
+  ],
+  "mr-IN": [
+    "छान, चल पुढे जाऊ.",
+    "मस्त. आता पुढचा भाग.",
+    "बरं. चल, पुढे चालू.",
+    "वाह — पुढे सरकतो आहोत.",
+    "उत्तम. आता पुढचं.",
+    "ठीक आहे. चल सुरू ठेवू.",
+  ],
+  "gu-IN": [
+    "સરસ, ચાલો આગળ વધીએ.",
+    "બહુ સારું. હવે આગળનો ભાગ.",
+    "સારું. ચાલો, આગળ ચાલીએ.",
+    "વાહ — આગળ વધી રહ્યા છીએ.",
+    "ઉત્તમ. હવે આગળનું.",
+    "ઠીક છે. ચાલો ચાલુ રાખીએ.",
+  ],
+  "kn-IN": [
+    "ಒಳ್ಳೆಯದು, ಮುಂದೆ ಹೋಗೋಣ.",
+    "ತುಂಬಾ ಚೆನ್ನಾಗಿದೆ. ಈಗ ಮುಂದಿನ ಭಾಗ.",
+    "ಸರಿ. ಮುಂದುವರಿಸೋಣ.",
+    "ಭೇಷ್ — ಮುಂದೆ ಸಾಗುತ್ತಿದ್ದೇವೆ.",
+    "ಅತ್ಯುತ್ತಮ. ಈಗ ಮುಂದಿನದು.",
+    "ಆಯ್ತು. ಮುಂದುವರಿಯೋಣ.",
+  ],
+  "ml-IN": [
+    "നല്ലത്, നമുക്ക് മുന്നോട്ട് പോകാം.",
+    "വളരെ നല്ലത്. ഇനി അടുത്ത ഭാഗം.",
+    "ശരി. തുടരാം.",
+    "കൊള്ളാം — മുന്നോട്ട് നീങ്ങുന്നു.",
+    "മികച്ചത്. ഇനി അടുത്തത്.",
+    "ശരി. നമുക്ക് തുടരാം.",
+  ],
+  "pa-IN": [
+    "ਵਧੀਆ, ਆ ਅੱਗੇ ਵਧੀਏ।",
+    "ਬਹੁਤ ਵਧੀਆ। ਹੁਣ ਅਗਲਾ ਹਿੱਸਾ।",
+    "ਚੰਗਾ। ਆ, ਅੱਗੇ ਚੱਲੀਏ।",
+    "ਸ਼ਾਬਾਸ਼ — ਅੱਗੇ ਵਧ ਰਹੇ ਹਾਂ।",
+    "ਉੱਤਮ। ਹੁਣ ਅਗਲਾ।",
+    "ਠੀਕ ਹੈ। ਆ ਜਾਰੀ ਰੱਖੀਏ।",
+  ],
+  "od-IN": [
+    "ଭଲ, ଚାଲ ଆଗକୁ ଯିବା।",
+    "ବହୁତ ଭଲ। ଏବେ ପରବର୍ତ୍ତୀ ଅଂଶ।",
+    "ଆଚ୍ଛା। ଚାଲ, ଆଗକୁ ଚାଲିବା।",
+    "ବାହା — ଆଗକୁ ବଢ଼ୁଛୁ।",
+    "ଉତ୍ତମ। ଏବେ ପରବର୍ତ୍ତୀଟି।",
+    "ଠିକ ଅଛି। ଚାଲ ଜାରି ରଖିବା।",
+  ],
+};
+
+/** Handover after a doubt WAS answered: back to where the lesson stopped. */
+export const CHECKPOINT_RESUME_LINES: Record<LanguageCode, readonly string[]> = {
+  en: [
+    "Good. Let's continue from where we left off.",
+    "Right, back to the lesson where we stopped.",
+    "Now that that's clear, let's pick up where we were.",
+    "Good. Let's get back on track.",
+    "Let's carry on from that point, then.",
+    "Clear? Good — back to where we paused.",
+  ],
+  "en-IN": [
+    "Badhiya. Chalo wahin se continue karein jahan ruke the.",
+    "Theek, chalo lesson par wapas chalein jahan ruke the.",
+    "Yeh clear ho gaya, to chalo wahin se shuru karein.",
+    "Accha. Chalo wapas track par aayein.",
+    "Chalo phir us point se aage badhein.",
+    "Clear? Badhiya — wapas wahin chalein jahan ruke the.",
+  ],
+  "hi-IN": [
+    "बढ़िया। चलो वहीं से आगे बढ़ें जहाँ रुके थे।",
+    "ठीक, चलो पाठ पर वापस चलें जहाँ रुके थे।",
+    "यह साफ़ हो गया, तो चलो वहीं से शुरू करें।",
+    "अच्छा। चलो वापस पटरी पर आएँ।",
+    "चलो फिर उसी जगह से आगे बढ़ें।",
+    "समझ आया? बढ़िया — वापस वहीं चलें जहाँ रुके थे।",
+  ],
+  "bn-IN": [
+    "দারুণ। চলো যেখানে থেমেছিলাম সেখান থেকেই এগিয়ে যাই।",
+    "ঠিক আছে, চলো পাঠে ফিরে যাই যেখানে থেমেছিলাম।",
+    "এটা পরিষ্কার হয়ে গেল, তাহলে চলো সেখান থেকেই শুরু করি।",
+    "আচ্ছা। চলো আবার লাইনে ফিরি।",
+    "চলো তাহলে সেই জায়গা থেকেই এগোই।",
+    "বুঝলে? দারুণ — আবার সেখানেই ফিরি।",
+  ],
+  "ta-IN": [
+    "நல்லது. நிறுத்திய இடத்திலிருந்தே தொடரலாம்.",
+    "சரி, நின்ற இடத்திற்கே பாடத்திற்குத் திரும்பலாம்.",
+    "இது தெளிவாகிவிட்டது, அந்த இடத்திலிருந்தே தொடங்கலாம்.",
+    "சரி. மீண்டும் பாதைக்கு வருவோம்.",
+    "அந்த இடத்திலிருந்தே முன்னேறலாம்.",
+    "தெளிவா? நல்லது — நின்ற இடத்திற்கே திரும்புவோம்.",
+  ],
+  "te-IN": [
+    "మంచిది. ఆపిన దగ్గర నుంచే కొనసాగిద్దాం.",
+    "సరే, ఆగిన చోటికే పాఠానికి తిరిగి వెళ్దాం.",
+    "ఇది స్పష్టమైంది, ఆ చోటి నుంచే మొదలుపెడ్దాం.",
+    "సరే. తిరిగి దారిలోకి వచ్చేద్దాం.",
+    "ఆ దగ్గర నుంచే ముందుకు సాగుదాం మరి.",
+    "అర్థమైందా? మంచిది — ఆపిన చోటికే తిరిగి వెళ్దాం.",
+  ],
+  "mr-IN": [
+    "छान. चल जिथे थांबलो होतो तिथूनच पुढे जाऊ.",
+    "ठीक, चल धड्यावर परत जाऊ जिथे थांबलो होतो.",
+    "हे स्पष्ट झालं, तर चल तिथूनच सुरू करू.",
+    "बरं. चल परत रुळावर येऊ.",
+    "चल मग त्या ठिकाणापासून पुढे जाऊ.",
+    "समजलं? छान — परत तिथेच जाऊ.",
+  ],
+  "gu-IN": [
+    "સરસ. ચાલો જ્યાં અટક્યા હતા ત્યાંથી આગળ વધીએ.",
+    "ઠીક, ચાલો પાઠ પર પાછા જઈએ જ્યાં અટક્યા હતા.",
+    "આ સ્પષ્ટ થઈ ગયું, તો ચાલો ત્યાંથી જ શરૂ કરીએ.",
+    "સારું. ચાલો ફરી પાટા પર આવીએ.",
+    "ચાલો તો એ જગ્યાએથી આગળ વધીએ.",
+    "સમજાયું? સરસ — ફરી ત્યાં જ જઈએ.",
+  ],
+  "kn-IN": [
+    "ಒಳ್ಳೆಯದು. ನಿಲ್ಲಿಸಿದ ಜಾಗದಿಂದಲೇ ಮುಂದುವರಿಸೋಣ.",
+    "ಸರಿ, ನಿಂತ ಜಾಗಕ್ಕೇ ಪಾಠಕ್ಕೆ ಹಿಂತಿರುಗೋಣ.",
+    "ಇದು ಸ್ಪಷ್ಟವಾಯಿತು, ಹಾಗಾದರೆ ಆ ಜಾಗದಿಂದಲೇ ಶುರು ಮಾಡೋಣ.",
+    "ಆಯ್ತು. ಮತ್ತೆ ಹಾದಿಗೆ ಬರೋಣ.",
+    "ಹಾಗಾದರೆ ಆ ಜಾಗದಿಂದಲೇ ಮುಂದೆ ಸಾಗೋಣ.",
+    "ಅರ್ಥವಾಯಿತಾ? ಒಳ್ಳೆಯದು — ಮತ್ತೆ ಅಲ್ಲಿಗೇ ಹೋಗೋಣ.",
+  ],
+  "ml-IN": [
+    "നല്ലത്. നിർത്തിയ ഇടത്തുനിന്നുതന്നെ തുടരാം.",
+    "ശരി, നിന്ന ഇടത്തേക്കുതന്നെ പാഠത്തിലേക്ക് മടങ്ങാം.",
+    "ഇത് വ്യക്തമായി, എന്നാൽ ആ ഇടത്തുനിന്നുതന്നെ തുടങ്ങാം.",
+    "ശരി. വീണ്ടും വഴിയിലേക്ക് വരാം.",
+    "എന്നാൽ ആ ഇടത്തുനിന്നുതന്നെ മുന്നോട്ട് പോകാം.",
+    "മനസ്സിലായോ? നല്ലത് — വീണ്ടും അവിടേക്കുതന്നെ.",
+  ],
+  "pa-IN": [
+    "ਵਧੀਆ। ਆ ਜਿੱਥੇ ਰੁਕੇ ਸੀ ਉੱਥੋਂ ਹੀ ਅੱਗੇ ਵਧੀਏ।",
+    "ਠੀਕ, ਆ ਪਾਠ ਉੱਤੇ ਵਾਪਸ ਚੱਲੀਏ ਜਿੱਥੇ ਰੁਕੇ ਸੀ।",
+    "ਇਹ ਸਾਫ਼ ਹੋ ਗਿਆ, ਤਾਂ ਆ ਉੱਥੋਂ ਹੀ ਸ਼ੁਰੂ ਕਰੀਏ।",
+    "ਚੰਗਾ। ਆ ਵਾਪਸ ਲੀਹ ਉੱਤੇ ਆਈਏ।",
+    "ਆ ਫਿਰ ਉਸ ਥਾਂ ਤੋਂ ਅੱਗੇ ਵਧੀਏ।",
+    "ਸਮਝ ਆਇਆ? ਵਧੀਆ — ਵਾਪਸ ਉੱਥੇ ਹੀ ਚੱਲੀਏ।",
+  ],
+  "od-IN": [
+    "ଭଲ। ଚାଲ ଯେଉଁଠି ଅଟକି ଯାଇଥିଲୁ ସେଠାରୁ ହିଁ ଆଗେଇବା।",
+    "ଠିକ, ଚାଲ ପାଠକୁ ଫେରିବା ଯେଉଁଠି ଅଟକି ଯାଇଥିଲୁ।",
+    "ଏହା ସ୍ପଷ୍ଟ ହୋଇଗଲା, ତେବେ ଚାଲ ସେଠାରୁ ହିଁ ଆରମ୍ଭ କରିବା।",
+    "ଆଚ୍ଛା। ଚାଲ ପୁଣି ବାଟକୁ ଆସିବା।",
+    "ଚାଲ ତେବେ ସେହି ଜାଗାରୁ ଆଗେଇବା।",
+    "ବୁଝିଲ? ଭଲ — ପୁଣି ସେଇଠିକୁ ଯିବା।",
+  ],
+};
+
+/**
+ * One checkpoint handover, picked at random from the language's six.
+ *
+ * `cleared` tells the two sets apart: true after a doubt was answered ("let's
+ * continue from where we left off"), false when the student had none in the
+ * first place ("great, let's go ahead") — saying the former when nothing was
+ * ever interrupted is the giveaway that nobody is listening.
+ */
+export function checkpointHandover(code: string, cleared: boolean): string {
+  const lang = isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE;
+  const lines = cleared ? CHECKPOINT_RESUME_LINES[lang] : CHECKPOINT_CLEAR_LINES[lang];
+  return lines[Math.floor(Math.random() * lines.length)];
+}
+
+/**
+ * Is the student's checkpoint answer a "no doubt, carry on"?
+ *
+ * The checkpoint asks a yes/no question ("any doubt, or shall we move ahead?"),
+ * which `isDoubtCleared` was never written for: it is tuned for the end of a
+ * doubt, where "yes" means "yes, I understood" and carries on. Here a bare
+ * "yes"/"haan" is the opposite — "yes, I have a doubt" — and advancing on it
+ * would walk past the very question that was asked. So "yes" alone is NOT a
+ * clear here, and anything that reads as having something to ask falls through
+ * to the doubt model.
+ *
+ * Nothing recognised either way is treated as a doubt: sending a sentence we
+ * did not understand to the doubt model costs one answer the student can wave
+ * off, while mis-reading a real question as "no doubt" loses it silently.
+ */
+export function isCheckpointClear(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return false;
+  // Asking something outright — the question mark settles it.
+  if (/[?？]/.test(t)) return false;
+  // "no doubt" / "koi doubt nahi" / "koi shankaa nahi": a NEGATED doubt is the
+  // plainest "carry on" there is, and it has to be read before the doubt
+  // keywords below — they would otherwise match the word "doubt" inside it and
+  // send the lesson off to answer a doubt the student just said they don't have.
+  if (/(^|\s)(no|not any|nope|koi|kuch)\s+(doubt|doubts|question|questions|confusion|shankaa|shanka|prashn|sawaal|sawal)\b/.test(t))
+    return true;
+  if (/(doubt|shankaa|shanka|prashn|sawaal|sawal|confusion)\s*(nahi|nahin|nhi|na)\b|नहीं\s*(है)?$/.test(t) && /(doubt|शंका|प्रश्न|सवाल|सन्देह|संदेह)/.test(t))
+    return true;
+  // "yes, I have a doubt" / "ek doubt hai" / "samajh nahi aaya": a doubt, even
+  // though some of these also contain a "no" ("nahi samajh aaya").
+  if (
+    /(doubt|confus|question|prashn|sawaal|sawal|प्रश्न|सवाल|शंका|সন্দেহ|samajh nahi|samjh nahi|nahi samajh|समझ नहीं|नहीं समझ|not clear|unclear|repeat|phir se|फिर से|dobara|दोबारा|again|wait|ruk|रुक|explain|samjhao|समझाओ|bata|बता|kyun|kyu|क्यों|kaise|कैसे|\bwhy\b|\bhow\b|\bwhat\b|kya |क्या )/.test(
+      t,
+    )
+  )
+    return false;
+  // A plain "no" is the cleanest "no doubt" there is — and the most common.
+  //
+  // The boundaries are punctuation-aware, not whitespace-only. They used to be
+  // `(^|\s)...(\s|$)`, and a real student saying "no, we can move forward" was
+  // sent to the doubt model because of the COMMA: "no," is not "no" followed by
+  // whitespace. The same sentence without the comma worked, which is the kind of
+  // difference no student will ever predict. The gate's Yes/No buttons are the
+  // real fix (nothing to parse at all); this keeps the spoken and typed paths
+  // from tripping over the same thing.
+  if (/(^|[\s,;.!—-])(no|nope|nahi|nahin|nhi|na)([\s,;.!?—-]|$)|नहीं|ନା|இல்ல|లేదు|ಇಲ್ಲ|ഇല്ല|নেই|নাই|નહીં|नाही/.test(t))
+    return true;
+  // Otherwise: an explicit "understood / all clear / move on".
+  return /(got it|understood|understand|clear|cleared|makes sense|all good|\bok\b|okay|\bdone\b|next|continue|carry on|aage|आगे|move on|go ahead|chalo|चलो|thanks|thank you|samajh gaya|samajh gayi|samjh gaya|समझ गया|समझ गयी|समझ आया|theek|thik|ठीक|accha|अच्छा|great|perfect|fine|yes aage|haan aage)/.test(
+    t,
+  );
+}
+
+/**
+ * The student was asked a real question and said something back. Is that
+ * something a DODGE — "I don't know", or a question of their own — rather than
+ * an attempt at an answer?
+ *
+ * Deliberately narrow, and it has to be: an attempt is the common case and the
+ * grader is far better than a regex at judging one. So this only catches the two
+ * things that are plainly not attempts, and everything else goes to the grader.
+ *
+ * "I don't know" is included on purpose even though the grader would mark it
+ * wrong: the honest answer to it is to teach the thing again, which is the doubt
+ * path, not a verdict and a tick in the wrong column.
+ */
+export function isAnswerDodge(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return true;
+  // "I don't know" / "no idea" / "pata nahi" / "nahi aata" / "bhool gaya".
+  if (
+    /(don'?t know|dont know|do not know|no idea|not sure|pata nahi|pata nhi|nahi pata|nhi pata|पता नहीं|नहीं पता|nahi aata|nahi aata|नहीं आता|bhool gaya|bhul gaya|भूल गया|forgot|can'?t remember|yaad nahi|याद नहीं|skip|chhodo|छोड़ो)/.test(
+      t,
+    )
+  )
+    return true;
+  // Asking back rather than answering: "can you explain again?", "repeat?",
+  // "what do you mean?". A bare "?" counts; a question mark alongside a real
+  // attempt ("is it 4?") does not, which is why an attempt has to be excluded
+  // first — a hedged answer is still an answer.
+  if (/[?？]/.test(t)) {
+    if (/(what do you mean|kya matlab|क्या मतलब|matlab kya|repeat|phir se|फिर से|dobara|दोबारा|samjhao|समझाओ|explain|kaunsa|which one|wait|ruk)/.test(t))
+      return true;
+    return false;
+  }
+  return /(samajh nahi|samjh nahi|समझ नहीं|confus|explain again|teach again|phir se batao|फिर से बताओ)/.test(t);
+}
+
+/**
+ * A step title with any leading number the planner wrote into it removed.
+ *
+ * The client numbers step titles itself, in two places — the roadmap contents
+ * page and the heading at the top of each step's page — so a title that arrives
+ * as "1. Kya hai quadratic equation?" renders as "1. 1. Kya hai quadratic
+ * equation?". Observed live: the planner prompt asks for a title that "reads
+ * sensibly after its number", which is enough to make some models helpfully
+ * supply the number too.
+ *
+ * Tightening the prompt would not be enough on its own: the numbering is the
+ * client's job, so the client has to be the thing that guarantees it. Strips a
+ * leading "1." / "2)" / "3 -" / "४." and nothing else — a title that genuinely
+ * opens with a number ("2x + 3 ka matlab") keeps it, because the pattern
+ * requires the separator.
+ */
+export function stripStepNumber(title: string): string {
+  return title.trim().replace(/^[0-9\u0966-\u096F\u0AE6-\u0AEF\u0BE6-\u0BEF\u0C66-\u0C6F\u0CE6-\u0CEF\u0D66-\u0D6F\u0A66-\u0A6F\u09E6-\u09EF]{1,2}\s*[.)\-:]\s+/, "").trim() || title.trim();
+}
+
+/**
+ * What Indica says when a QUESTION SESSION opens.
+ *
+ * `VOICE_PROMPTS.greeting` asks what we should learn today, which is right for
+ * study mode and wrong here: the solve track wants the name of a question, and
+ * a student asked "what should we learn?" answers with a topic — which then has
+ * to be turned away. Asking for the thing you actually want is cheaper than
+ * recovering from the thing you asked for.
+ */
+export const SOLVE_GREETINGS: Record<LanguageCode, string> = {
+  en: "Hello! Which question shall we solve? Name the exercise or example.",
+  "en-IN": "Hello! Kaunsa question solve karein? Exercise ya example ka naam batao.",
+  "hi-IN": "नमस्ते! कौन सा प्रश्न हल करें? अभ्यास या उदाहरण का नाम बताओ।",
+  "bn-IN": "নমস্কার! কোন প্রশ্নটি সমাধান করব? অনুশীলনী বা উদাহরণের নাম বলো।",
+  "ta-IN": "வணக்கம்! எந்தக் கேள்வியைத் தீர்க்கலாம்? பயிற்சி அல்லது எடுத்துக்காட்டின் பெயரைச் சொல்.",
+  "te-IN": "నమస్కారం! ఏ ప్రశ్నను పరిష్కరిద్దాం? అభ్యాసం లేదా ఉదాహరణ పేరు చెప్పు.",
+  "mr-IN": "नमस्कार! कोणता प्रश्न सोडवू? स्वाध्याय किंवा उदाहरणाचं नाव सांग.",
+  "gu-IN": "નમસ્તે! કયો પ્રશ્ન ઉકેલીએ? સ્વાધ્યાય કે ઉદાહરણનું નામ કહે.",
+  "kn-IN": "ನಮಸ್ಕಾರ! ಯಾವ ಪ್ರಶ್ನೆಯನ್ನು ಬಿಡಿಸೋಣ? ಅಭ್ಯಾಸ ಅಥವಾ ಉದಾಹರಣೆಯ ಹೆಸರು ಹೇಳು.",
+  "ml-IN": "നമസ്കാരം! ഏത് ചോദ്യം ചെയ്യാം? അഭ്യാസത്തിന്റെയോ ഉദാഹരണത്തിന്റെയോ പേര് പറയൂ.",
+  "pa-IN": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ! ਕਿਹੜਾ ਸਵਾਲ ਹੱਲ ਕਰੀਏ? ਅਭਿਆਸ ਜਾਂ ਉਦਾਹਰਣ ਦਾ ਨਾਂ ਦੱਸ।",
+  "od-IN": "ନମସ୍କାର! କେଉଁ ପ୍ରଶ୍ନ ସମାଧାନ କରିବା? ଅଭ୍ୟାସ କିମ୍ବା ଉଦାହରଣର ନାମ କୁହ।",
+};
+
+/** The opening line for a track: study mode asks for a topic, question mode for
+ *  a question. */
+export function trackGreeting(code: string, track: "learn" | "solve"): string {
+  const lang = isSupportedLanguage(code) ? code : DEFAULT_LANGUAGE;
+  return track === "solve" ? SOLVE_GREETINGS[lang] : VOICE_PROMPTS[lang].greeting;
+}

@@ -28,16 +28,16 @@ export const CLEARANCE = 40;
  * one page still read as two subtopics.
  */
 export const STEP_GAP = 72;
+/**
+ * Air between a step's heading rule and the first line of its working.
+ *
+ * Wider than CLEARANCE (the gap between beats) on purpose: the rule is a
+ * divider, and content that crowds it reads as part of the title rather than as
+ * the body under it.
+ */
+export const HEADING_GAP = 34;
 /** A teaching turn needs at least this much room to continue an existing page. */
 export const MIN_TURN_ROOM = 200;
-/**
- * Room a NEW LESSON STEP needs before it will share a page with the step above
- * it. A step is a whole subtopic — a title plus several lines, sometimes a
- * diagram — so it wants more than a single turn does (MIN_TURN_ROOM), but far
- * less than a whole page: demanding a whole page is what left steps sitting
- * alone on a mostly-empty sheet. Roughly a title plus four md lines.
- */
-export const MIN_STEP_ROOM = 300;
 /** Below this much room the page is reported FULL. */
 export const PAGE_FULL_ROOM = MD_PITCH + CLEARANCE; // 90
 /** How many md text lines a blank page holds. */

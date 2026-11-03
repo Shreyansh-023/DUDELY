@@ -8,9 +8,12 @@ import {
 } from "@/lib/llm";
 import { mockLesson } from "@/lib/mock-lesson";
 import {
+  buildCheckpointPrompt,
   buildDoubtSystemPrompt,
   buildExplainSystemPrompt,
+  buildGradePrompt,
   buildPlanPrompt,
+  nextDifficulty,
   buildSolveDoubtSystemPrompt,
   buildSolveSystemPrompt,
   buildSystemPrompt,
@@ -21,7 +24,9 @@ import { questionBeat } from "@/lib/question-board";
 import { retrieveTextbookContext, type Passage } from "@/lib/rag";
 import { retrieveSolutions, type Solution } from "@/lib/solutions";
 import {
+  AnswerGradeSchema,
   BeatSchema,
+  CheckpointPlanSchema,
   LessonPlanSchema,
   LessonStepSchema,
   TutorRequestSchema,
@@ -51,6 +56,12 @@ export async function POST(req: Request) {
     return Response.json({ error: "Bad request", issues: parsed.error.issues }, { status: 400 });
   }
   const { messages, canvas, language, profile, mode, step, familiarity, solving } = parsed.data;
+  // Checkpoint/grade only: the running record of how the student has been
+  // answering, and (for grade) the question put to them with what they said.
+  const record = parsed.data.record ?? null;
+  const askedQuestion = parsed.data.question ?? "";
+  const expectedAnswer = parsed.data.expected ?? "";
+  const studentAnswer = parsed.data.answer ?? "";
   const grade = (parsed.data.grade ?? null) as Grade | null;
   const subject = (parsed.data.subject ?? null) as SubjectId | null;
   const plan: LessonPlan | null = parsed.data.plan ?? null;
@@ -158,7 +169,24 @@ export async function POST(req: Request) {
                 })
               : mode === "solvedoubt"
                 ? buildSolveDoubtSystemPrompt({ ...promptCtx, solutions, solving: solving ?? null })
-                : buildSystemPrompt(promptCtx);
+                : mode === "checkpoint"
+                  ? buildCheckpointPrompt({
+                      ...promptCtx,
+                      plan: plan ?? LessonPlanSchema.parse({}),
+                      step: step ?? 0,
+                      record,
+                      familiarity: familiarity ?? null,
+                    })
+                  : mode === "grade"
+                    ? buildGradePrompt({
+                        ...promptCtx,
+                        plan,
+                        step: step ?? undefined,
+                        question: askedQuestion,
+                        expected: expectedAnswer,
+                        record,
+                      })
+                    : buildSystemPrompt(promptCtx);
 
   const last = messages.length - 1;
   // With thinking off, a model can forget the NDJSON contract — and how much to
@@ -170,15 +198,29 @@ export async function POST(req: Request) {
     mode === "doubt" || mode === "solvedoubt"
       ? "\n\n---\nReply with NDJSON beats only: 1-4 lines, each a complete JSON object. No prose."
       : mode === "teach"
-        ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 3-6 beats, and draw on the board — one short sentence is not a step."
+        ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 4-8 beats, and draw on the board — one short sentence is not a step. Full granularity: one elementary move per line, the arithmetic written out, the rule named before you use it, and the reasoning said aloud, not just the result. The page heading is already written for you — do not repeat the step title."
         : mode === "explain"
           ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Work the item at full granularity: one elementary move per line, every bit of arithmetic written out, and the rule named before you use it. Never skip a step because it looks obvious."
           : mode === "solve"
             ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. The question is already on the board: start at the first step of the solution and box the final answer. SHOW EVERY STEP — one elementary move per line, the arithmetic written out rather than done in your head, the rule named before each step that uses one, and any choice of numbers (such as a factor pair) searched out on the board. A line the student cannot derive from the line above it means you skipped a step."
             : "";
+  // The checkpoint and grade turns are decisions, not board work: everything they
+  // need is in the system prompt, and the board summary that `buildUserTurn`
+  // appends would only be noise. The grade turn's final message is the student's
+  // spoken answer, which is the one thing it is judging.
+  const decisionTurn =
+    mode === "checkpoint"
+      ? "The step just finished. Decide: carry on, or ask? Reply with the JSON object only."
+      : mode === "grade"
+        ? `The student answered, out loud: "${studentAnswer}"
+
+Mark it. Reply with the JSON object only.`
+        : null;
   const rawMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
-    return { role: "user", content: i === last ? buildUserTurn({ text: m.text, canvas }) + formatNudge : m.text };
+    if (i !== last) return { role: "user", content: m.text };
+    if (decisionTurn) return { role: "user", content: decisionTurn };
+    return { role: "user", content: buildUserTurn({ text: m.text, canvas }) + formatNudge };
   });
 
   // Doubt mode talks to a 1M-token window, and a doubt turn is normally a few
@@ -218,7 +260,46 @@ export async function POST(req: Request) {
         send({ type: "question", beat: written.beat, question: boardQuestion, label: boardLabel });
       }
       try {
-        if (mode === "plan") {
+        if (mode === "checkpoint") {
+          await streamJson({
+            models: modelChain,
+            system,
+            messages: modelMessages,
+            signal: req.signal,
+            send,
+            mode,
+            schema: CheckpointPlanSchema,
+            // An "ask" with no question in it is not a decision to ask: treat it
+            // as unparseable so the caller falls back to carrying on, rather
+            // than stopping the lesson on an empty question.
+            accept: (p) => p.action === "continue" || p.question.trim().length > 0,
+            // The difficulty is computed from the record, not chosen by the
+            // model: the fast tier that answers these turns returned "recall"
+            // whatever the record said, so what it reports is overwritten with
+            // the level its own prompt told it to use. Only the decision to ask
+            // and the question itself come from the model.
+            event: (plan) => ({
+              type: "checkpoint",
+              plan: { ...plan, difficulty: nextDifficulty(record, familiarity ?? null) },
+            }),
+            // One short object. The ceiling is for a thinking model's reasoning,
+            // not the answer.
+            budget: 2000,
+          });
+        } else if (mode === "grade") {
+          await streamJson({
+            models: modelChain,
+            system,
+            messages: modelMessages,
+            signal: req.signal,
+            send,
+            mode,
+            schema: AnswerGradeSchema,
+            accept: (g) => g.say.trim().length > 0,
+            event: (grade) => ({ type: "grade", grade }),
+            budget: 1200,
+          });
+        } else if (mode === "plan") {
           await streamPlan({
             models: modelChain,
             system,
@@ -458,6 +539,81 @@ function asProse(raw: string): string | null {
 }
 
 /**
+ * Checkpoint and grade modes: collect one small JSON object and emit it.
+ *
+ * Both are DECISIONS, not teaching: no beats, nothing drawn, a handful of tokens
+ * out. They share this path because they share every requirement — a strict
+ * object, a tight output budget, and a student who is waiting. The grade is the
+ * tighter of the two: the student has just spoken and is listening for whether
+ * they were right, so there is nowhere to hide latency.
+ *
+ * On failure it does NOT error the turn. Both modes have a safe neutral answer —
+ * carry on teaching, or accept the answer as partly right — so a wobbly model
+ * degrades the lesson to its old behaviour instead of stopping it dead.
+ */
+async function streamJson<T>({
+  models,
+  system,
+  messages,
+  signal,
+  send,
+  mode,
+  schema,
+  accept,
+  event,
+  budget,
+}: StreamArgs & {
+  schema: { safeParse: (v: unknown) => { success: true; data: T } | { success: false } };
+  accept?: (v: T) => boolean;
+  event: (v: T) => TutorEvent;
+  budget: number;
+}) {
+  let lastErr: string | undefined;
+  for (let mi = 0; mi < models.length; mi++) {
+    const { model, label } = models[mi];
+    let raw = "";
+    let errMsg: string | undefined;
+    try {
+      const result = streamText({
+        model,
+        system,
+        messages,
+        // Low: both modes are judgements against stated criteria, and the one
+        // thing neither may do is improvise its way out of the JSON contract.
+        temperature: 0.2,
+        maxOutputTokens: budget,
+        maxRetries: 1,
+        abortSignal: signal,
+        onError: ({ error }) => {
+          errMsg ??= errorMessage(error);
+        },
+      });
+      logCacheUsage(result.usage, label, mode);
+      for await (const delta of result.textStream) {
+        if (signal.aborted) return;
+        raw += delta;
+      }
+    } catch (err) {
+      errMsg ??= errorMessage(err);
+    }
+    if (signal.aborted) return;
+    const found = extractObject(raw, schema, accept);
+    if (found) {
+      send(event(found));
+      send({ type: "done" });
+      return;
+    }
+    lastErr = errMsg;
+    console.warn(`[tutor] no valid ${mode} object from ${label} (${errMsg ?? "unparseable"}). raw:
+` + raw.slice(0, 600));
+  }
+  // Nothing usable from any model. The caller treats a turn with no object as
+  // "do the ordinary thing", so say so quietly rather than failing the lesson.
+  console.warn(`[tutor] ${mode} fell through (${lastErr ?? "empty"}); caller will use its default`);
+  send({ type: "done" });
+}
+
+/**
  * Plan mode: collect the planner's full output, pull the lesson-plan JSON object
  * out of it (reasoning models may wrap JSON in prose), validate it and emit one
  * `plan` event. Retries once; on overload walks the fallback model chain.
@@ -484,9 +640,13 @@ async function streamPlan({
           messages,
           temperature: 0.4,
           // Thinking is ON here and reasoning tokens come out of the same
-          // budget, so leave room for a full 8-step plan after the model has
-          // finished thinking.
-          maxOutputTokens: 6000,
+          // budget, so leave room for a full plan AFTER the model has finished
+          // thinking. Raised with the step range (8-12, each carrying a title,
+          // teach note, draw hint and roadmap line): at 6000 a 12-step plan
+          // spent its budget reasoning and truncated mid-array, and a truncated
+          // plan loses its last steps silently — StepScanner only ever sees the
+          // objects that closed.
+          maxOutputTokens: 10000,
           maxRetries: 1,
           abortSignal: signal,
           onError: ({ error }) => {
@@ -530,12 +690,20 @@ async function streamPlan({
 }
 
 /**
- * Find the lesson-plan JSON in the planner's raw output. Scans for every complete
- * top-level {...} object (brace depth, ignoring braces inside strings) and returns
- * the last one that validates — robust to reasoning text and fences around it.
+ * Find the LAST top-level {...} in a model's raw output that validates against
+ * `schema` and satisfies `accept`.
+ *
+ * Scans brace depth while ignoring braces inside strings, so it is robust to the
+ * reasoning text, prose and code fences a thinking model wraps its answer in.
+ * Takes the last match rather than the first because a model that reasons out
+ * loud often writes a draft object before its real answer.
  */
-function extractPlan(raw: string): LessonPlan | null {
-  let best: LessonPlan | null = null;
+function extractObject<T>(
+  raw: string,
+  schema: { safeParse: (v: unknown) => { success: true; data: T } | { success: false } },
+  accept: (v: T) => boolean = () => true,
+): T | null {
+  let best: T | null = null;
   let depth = 0;
   let start = -1;
   let inStr = false;
@@ -556,8 +724,8 @@ function extractPlan(raw: string): LessonPlan | null {
       depth--;
       if (depth === 0 && start >= 0) {
         try {
-          const parsed = LessonPlanSchema.safeParse(JSON.parse(raw.slice(start, i + 1)));
-          if (parsed.success && parsed.data.steps.length > 0) best = parsed.data;
+          const parsed = schema.safeParse(JSON.parse(raw.slice(start, i + 1)));
+          if (parsed.success && accept(parsed.data)) best = parsed.data;
         } catch {
           /* not JSON; skip */
         }
@@ -566,6 +734,11 @@ function extractPlan(raw: string): LessonPlan | null {
     }
   }
   return best;
+}
+
+/** The lesson-plan object in the planner's output: the last one with real steps. */
+function extractPlan(raw: string): LessonPlan | null {
+  return extractObject(raw, LessonPlanSchema, (p) => p.steps.length > 0);
 }
 
 /** LLM_PROVIDER=mock: stream a canned lesson with realistic pacing, no API key needed. */

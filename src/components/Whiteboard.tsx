@@ -99,7 +99,7 @@ export default function Whiteboard({
               <LogoMark className="h-9 w-auto" />
             </span>
           </WelcomeScreen.Center.Logo>
-          <WelcomeScreen.Center.Heading>Ask Indica anything — type or talk. Indica explains here on the board.</WelcomeScreen.Center.Heading>
+          <WelcomeScreen.Center.Heading>Indica explains here on the board. Just talk — the microphone is already listening.</WelcomeScreen.Center.Heading>
         </WelcomeScreen.Center>
       </WelcomeScreen>
     </Excalidraw>

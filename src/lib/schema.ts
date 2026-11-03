@@ -424,8 +424,27 @@ export type LessonPlan = z.infer<typeof LessonPlanSchema>;
  *                 grounded on the solutions index. The question itself is written on
  *                 the board deterministically (lib/question-board), not by the model.
  *   solvedoubt -> a doubt raised mid-solution, on its own page, without restarting
+ *
+ * The between-step CHECKPOINT adds two more. Neither draws on the board — both
+ * return one small JSON object, not beats:
+ *   checkpoint -> decide what to do at the gap between two steps: let the lesson
+ *                 run on, or put a real recall question to the student (and how
+ *                 hard a one). Reads the running record of how the student has
+ *                 been answering so far.
+ *   grade      -> mark the answer the student gave to that question: right,
+ *                 partly right or wrong, plus the one line to say back to them.
  */
-export const TUTOR_MODES = ["plan", "teach", "doubt", "explain", "ask", "solve", "solvedoubt"] as const;
+export const TUTOR_MODES = [
+  "plan",
+  "teach",
+  "doubt",
+  "explain",
+  "ask",
+  "solve",
+  "solvedoubt",
+  "checkpoint",
+  "grade",
+] as const;
 export type TutorMode = (typeof TUTOR_MODES)[number];
 
 /**
@@ -435,6 +454,74 @@ export type TutorMode = (typeof TUTOR_MODES)[number];
  */
 export const TUTOR_TRACKS = ["learn", "solve"] as const;
 export type TutorTrack = (typeof TUTOR_TRACKS)[number];
+
+/**
+ * What the student has done at the checkpoints so far. This is the whole basis
+ * of the adaptive questioning: the model is given this record and decides from
+ * it whether to ask anything at all, and how hard.
+ *
+ * Deliberately small and countable rather than a transcript. The decision has
+ * to be made on every checkpoint of every lesson, and a model asked to re-read
+ * the entire conversation to judge confidence both costs more and drifts; four
+ * counters and the last few outcomes say the same thing and say it the same way
+ * every time.
+ */
+export const LessonRecordSchema = z.object({
+  /** Questions put to the student so far in this lesson. */
+  asked: z.number().int().min(0).default(0),
+  /** How many they got fully right. */
+  correct: z.number().int().min(0).default(0),
+  /** How many were partly right — the idea there, the execution not. */
+  partial: z.number().int().min(0).default(0),
+  /** How many they got wrong, or could not answer. */
+  wrong: z.number().int().min(0).default(0),
+  /** Doubts the student has raised, a second signal of where they are. */
+  doubts: z.number().int().min(0).default(0),
+  /** Steps taught since the last question, so a long unbroken stretch is visible. */
+  sinceAsked: z.number().int().min(0).default(0),
+  /** The most recent outcomes, newest last, e.g. ["correct","partial","correct"]. */
+  recent: z.array(z.enum(["correct", "partial", "wrong"])).default([]),
+  /** The difficulty last asked, so the model can step up or down from it. */
+  lastDifficulty: z.enum(["recall", "apply", "stretch"]).nullish(),
+});
+export type LessonRecord = z.infer<typeof LessonRecordSchema>;
+
+/**
+ * What the model decides at a checkpoint.
+ *
+ * `action: "continue"` means let the lesson run on — the plain "any doubt?"
+ * gate. `action: "ask"` carries the question to put to the student.
+ */
+export const CheckpointPlanSchema = z.object({
+  action: z.enum(["continue", "ask"]).default("continue"),
+  /** The question to SAY, in the student's language. Only for action "ask". */
+  question: z.string().default(""),
+  /**
+   * How hard it is:
+   *   recall  -> say back a fact or term just taught
+   *   apply   -> use what was just taught on a small new case
+   *   stretch -> join two ideas, or a case that looks different on the surface
+   */
+  difficulty: z.enum(["recall", "apply", "stretch"]).default("recall"),
+  /** The answer being looked for, so the grader is not re-deriving it. */
+  expected: z.string().default(""),
+  /** One short sentence on why this call was made. Never spoken; for logs. */
+  why: z.string().default(""),
+});
+export type CheckpointPlan = z.infer<typeof CheckpointPlanSchema>;
+
+/** The verdict on a student's answer, plus the line to say back to them. */
+export const AnswerGradeSchema = z.object({
+  verdict: z.enum(["correct", "partial", "wrong"]).default("partial"),
+  /** What to SAY back: the praise, or the correction. In the student's language. */
+  say: z.string().default(""),
+  /**
+   * True when the miss is big enough that the lesson should not just move on —
+   * the client then re-teaches the point as a doubt turn before continuing.
+   */
+  reteach: z.boolean().default(false),
+});
+export type AnswerGrade = z.infer<typeof AnswerGradeSchema>;
 
 export const TutorRequestSchema = z.object({
   messages: z.array(HistoryMessageSchema).min(1),
@@ -464,6 +551,17 @@ export const TutorRequestSchema = z.object({
    * the context of what is being solved.
    */
   solving: z.string().nullish(),
+  /**
+   * Checkpoint/grade modes: the running record of how this student has been
+   * answering, which is what makes the questioning adaptive rather than a fixed
+   * every-third-step rhythm. See `LessonRecordSchema`.
+   */
+  record: LessonRecordSchema.nullish(),
+  /** Grade mode: the question that was asked, the answer being looked for (from
+   *  the checkpoint decision that produced it), and what the student said back. */
+  question: z.string().nullish(),
+  expected: z.string().nullish(),
+  answer: z.string().nullish(),
 });
 export type TutorRequest = z.infer<typeof TutorRequestSchema>;
 
@@ -481,5 +579,11 @@ export type TutorEvent =
    *  `solving` on a later doubt turn. */
   | { type: "question"; beat: Beat; question: string; label: string | null }
   | { type: "beat"; beat: Beat }
+  /** Checkpoint mode: what to do at the gap between two steps — carry on, or put
+   *  this question to the student. Absent (just `done`) means carry on. */
+  | { type: "checkpoint"; plan: CheckpointPlan }
+  /** Grade mode: the verdict on the answer the student just spoke, and the line
+   *  to say back to them. Absent means treat it as partly right and move on. */
+  | { type: "grade"; grade: AnswerGrade }
   | { type: "done" }
   | { type: "error"; message: string };

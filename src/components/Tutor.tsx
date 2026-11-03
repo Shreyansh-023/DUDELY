@@ -2,36 +2,53 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isGrade, isSubject, type Grade, type SubjectId } from "@/lib/curriculum";
+import { isGrade, isSubject, subjectsForGrade, type Grade, type SubjectId } from "@/lib/curriculum";
 import {
   askPlaceholder,
+  checkpointHandover,
+  checkpointQuestion,
   classifyFamiliarity,
   DEFAULT_LANGUAGE,
   familiarityQuestion,
+  isAnswerDodge,
+  isCheckpointClear,
   isDoubtCleared,
   isExplainRequest,
   isNextQuestion,
   planningHolds,
   planningLines,
   planningStepLead,
+  stripStepNumber,
   resumeLine,
   roadmapIntro,
   voicePrompts,
 } from "@/lib/languages";
-import { blankPageCanvas, CONTENT_LEFT, CONTENT_TOP } from "@/lib/canvas/page";
-import type { Beat, HistoryMessage, LessonPlan, TutorEvent, TutorTrack } from "@/lib/schema";
+import { blankPageCanvas, CONTENT_BOTTOM, CONTENT_LEFT, CONTENT_RIGHT, CONTENT_TOP } from "@/lib/canvas/page";
+import { downloadBoardPdf, pdfPageList } from "@/lib/canvas/pdf";
+import type {
+  AnswerGrade,
+  Beat,
+  CheckpointPlan,
+  DrawOp,
+  HistoryMessage,
+  LessonPlan,
+  LessonRecord,
+  TutorEvent,
+  TutorTrack,
+} from "@/lib/schema";
 import { AsyncQueue, uid } from "@/lib/utils";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer, type SttMode } from "@/lib/voice/stt";
 import { LiveTranscriber, liveSttUnavailable, prewarmLiveStt, relayUrl } from "@/lib/voice/live-stt";
 import { fetchFixedSpeech, fetchSpeech, playBlob, speakBrowser, type TtsMode } from "@/lib/voice/tts";
 import { isPlaybackPaused, pausePlayback, resumePlayback } from "@/lib/voice/playback";
+import BoardMenu, { useBoardMenu } from "./BoardMenu";
 import BoardPager from "./BoardPager";
 import ClassSubjectPicker from "./ClassSubjectPicker";
 import Composer, { joinDictation } from "./Composer";
 import { LogoTile, Wordmark } from "./Logo";
 import LanguageMenu from "./LanguageMenu";
+import StartScreen from "./StartScreen";
 import Transcript from "./Transcript";
-import TrackPicker from "./TrackPicker";
 import VoiceCapture from "./VoiceCapture";
 import VoiceReview from "./VoiceReview";
 import { useVoiceLoop } from "./useVoiceLoop";
@@ -62,9 +79,10 @@ export type ChatMessage = HistoryMessage & { id: string; pending?: boolean };
  *   none            — no lesson yet; the next topic starts one
  *   awaitFamiliarity— asked the familiarity question, waiting for the answer
  *   teaching        — teaching the plan step by step (Ultra)
+ *   checkpoint      — a step just finished; asked "any doubt?" and waiting for the answer
  *   doubt           — answering a student's doubt on its own new page (fast doubt model), paused
  */
-export type LessonPhase = "none" | "awaitFamiliarity" | "teaching" | "doubt";
+export type LessonPhase = "none" | "awaitFamiliarity" | "teaching" | "checkpoint" | "doubt";
 
 // A statement turn ends "ready to continue"; a question turn ends on "?". We use
 // the last character of the spoken reply to tell the two apart.
@@ -135,6 +153,16 @@ type LessonRun = {
   ownIds: Set<string>;
   /** True once the producer has pushed its last beat. */
   done: boolean;
+  /**
+   * Set while the consumer is parked at a checkpoint between two steps, and
+   * resolved by the student's answer (see `clearCheckpoint`).
+   *
+   * The consumer waits on this; the PRODUCER is deliberately left running, so
+   * the step behind the checkpoint keeps being fetched while the student
+   * thinks. That is what makes "no doubt, carry on" instant: the beats and
+   * their speech are already in the queue, exactly as they are across a doubt.
+   */
+  checkpoint: { done: Promise<void>; release: () => void; signal: AbortSignal } | null;
 };
 
 /** The spoken roadmap, queued like a step but generated locally from the plan. */
@@ -189,6 +217,15 @@ function HamburgerIcon() {
       <line x1="4" y1="7" x2="20" y2="7" />
       <line x1="4" y1="12" x2="20" y2="12" />
       <line x1="4" y1="17" x2="20" y2="17" />
+    </svg>
+  );
+}
+
+function KeyboardIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden>
+      <rect x="2.5" y="6" width="19" height="12" rx="2" />
+      <path d="M6 9.5h.01M9.5 9.5h.01M13 9.5h.01M16.5 9.5h.01M6 13h.01M18 13h.01M9.5 13h5" strokeLinecap="round" />
     </svg>
   );
 }
@@ -467,6 +504,17 @@ export default function Tutor() {
   // lessonPhase because nothing is sent to ask() until they actually speak, and
   // the button must disappear the instant it is pressed.
   const [doubtPending, setDoubtPending] = useState(false);
+  /**
+   * True while the lesson is parked on the plain "any doubt?" gate, which is
+   * answered with the Yes/No buttons rather than by guessing at a sentence.
+   *
+   * Only the plain gate: when the checkpoint put a REAL question ("what is b?"),
+   * the answer is the student's own words and there is nothing for a Yes/No pair
+   * to mean, so the buttons stay away and the mic does its job.
+   *
+   * State, not a ref, because two buttons render from it.
+   */
+  const [gateOpen, setGateOpen] = useState(false);
   // The last teaching turn and which step it was drawing, so an interrupted
   // step's content can be wiped before that step is taught again.
   const lastTeachRef = useRef<{ turn: number; step: number } | null>(null);
@@ -476,7 +524,64 @@ export default function Tutor() {
   const setLesson = useCallback((p: LessonPhase) => {
     lessonRef.current.phase = p;
     setLessonPhase(p);
+    if (process.env.NODE_ENV !== "production" && typeof window !== "undefined") {
+      // Mirrors useVoiceLoop's __guruVoicePhase: the staged lesson is driven by
+      // speech and timers, so a smoke test has no other way to see which stage
+      // it reached. Dev only.
+      const w = window as unknown as { __guruLessonPhase?: LessonPhase; __guruPhaseLog?: LessonPhase[] };
+      w.__guruLessonPhase = p;
+      (w.__guruPhaseLog ??= []).push(p);
+    }
   }, []);
+  /**
+   * Opens the mic straight away, with no keypress from the student.
+   *
+   * A ref because the thing that does it — the voice loop — is set up further
+   * down the component, while `askCheckpoint` (above) is what needs to call it.
+   * In chat mode it stays a no-op: there is a composer waiting, and grabbing the
+   * mic of a student who is typing would be worse than asking them to type.
+   */
+  const openMicRef = useRef<() => void>(() => {});
+  /**
+   * True while a doubt is being answered that was raised AT a checkpoint (as
+   * opposed to barged in mid-step).
+   *
+   * The two resume along different paths — a checkpoint doubt releases the
+   * consumer still parked between the steps, a mid-step doubt starts a fresh
+   * one on the held beat — and by the time "got it" arrives the phase is
+   * "doubt" either way, so where the lesson was interrupted has to be
+   * remembered here.
+   */
+  const checkpointDoubtRef = useRef(false);
+  /**
+   * Set when the student pressed "I have a doubt" at the gate. Whatever they say
+   * next is then taken as the doubt, with no sentence classification at all —
+   * they have already told us which it is, so re-deciding from their words could
+   * only overrule them. Cleared as soon as that utterance is routed.
+   */
+  const gateForcedDoubtRef = useRef(false);
+  /**
+   * How the student has been doing at the checkpoints: the signal the model
+   * reads to decide whether to ask anything, and how hard (see
+   * `buildCheckpointPrompt`). Lives for the lesson and resets with it.
+   *
+   * A ref, not state, because nothing renders from it — it is read inside async
+   * callbacks at the moment a checkpoint fires, where a stale closure over
+   * state would hand the model the record from two steps ago.
+   */
+  const recordRef = useRef<LessonRecord>({
+    asked: 0,
+    correct: 0,
+    partial: 0,
+    wrong: 0,
+    doubts: 0,
+    sinceAsked: 0,
+    recent: [],
+    lastDifficulty: null,
+  });
+  /** The question in flight at a checkpoint, so the answer can be graded
+   *  against it. Null whenever the checkpoint is a plain "any doubt?". */
+  const pendingQuestionRef = useRef<{ question: string; expected: string; difficulty: "recall" | "apply" | "stretch"; step: number } | null>(null);
   const lastSeen = useRef(new Map<string, number>());
   const recorderRef = useRef<Recorder | null>(null);
   const browserRecRef = useRef<{ stop: () => void } | null>(null);
@@ -928,6 +1033,149 @@ export default function Tutor() {
   );
 
   /**
+   * Stop between two steps, ask whether anything needs clearing up, and wait
+   * for the answer.
+   *
+   * The question is SPOKEN and nothing else: `draw: []`, so not a mark lands on
+   * the board. The step's working stays the last thing on the page, which is
+   * what the student flips back to later — a stranded "any doubts?" under it
+   * would be noise in the notes.
+   *
+   * It then opens the mic by itself (voice mode): the student does not press
+   * anything to answer a question they were just asked out loud. `ask` routes
+   * what comes back — `isCheckpointClear` means carry on, anything else is a
+   * doubt — and either way `clearCheckpoint` releases the promise this parks on.
+   *
+   * The run is NOT discarded and the producer is NOT stopped, so the next step
+   * is being fetched (and its speech with it) throughout the pause.
+   */
+  const askCheckpoint = useCallback(
+    async (run: LessonRun, signal: AbortSignal) => {
+      if (signal.aborted) return;
+      const lang = languageRef.current;
+      const cfg = configRef.current ?? FALLBACK_CONFIG;
+      const L = lessonRef.current;
+      // Ask the model what this gap is for: let the lesson run on, or put a real
+      // question to the student. It reads the running record, so the answer is
+      // adaptive — a student who is cruising gets asked more and harder, one who
+      // is struggling gets taught instead. It runs in the gap the student is
+      // already pausing in, on the fast tier with thinking off, so the wait is
+      // sub-second; and any failure comes back as null, which simply means the
+      // plain "any doubt?" gate.
+      let decision: CheckpointPlan | null = null;
+      if (L.plan) {
+        try {
+          await postTutorTurn(
+            {
+              messages: messagesRef.current.filter((m) => !m.pending).slice(-6).map((m) => ({ role: m.role, text: m.text })),
+              language: lang,
+              grade: gradeRef.current,
+              subject: subjectRef.current,
+              mode: "checkpoint",
+              plan: L.plan,
+              step: run.step,
+              record: recordRef.current,
+              familiarity: L.familiarity ?? undefined,
+            },
+            signal,
+            (ev) => {
+              if (ev.type === "checkpoint") decision = ev.plan;
+            },
+          );
+        } catch {
+          /* the gate below is the fallback */
+        }
+      }
+      if (signal.aborted) return;
+      const asking: CheckpointPlan | null =
+        decision && (decision as CheckpointPlan).action === "ask" ? (decision as CheckpointPlan) : null;
+      // A real question replaces the "any doubt?" gate for this gap; the record
+      // remembers which it was, so the answer is routed to the grader rather
+      // than the doubt model.
+      pendingQuestionRef.current = asking
+        ? { question: asking.question, expected: asking.expected, difficulty: asking.difficulty, step: run.step }
+        : null;
+      const line = asking ? asking.question : checkpointQuestion(lang);
+      const rec = recordRef.current;
+      if (asking) {
+        rec.asked += 1;
+        rec.sinceAsked = 0;
+        rec.lastDifficulty = asking.difficulty;
+        console.info(`[lesson] checkpoint: ASK (${asking.difficulty}) — ${asking.why}`);
+      } else {
+        rec.sinceAsked += 1;
+        if (decision) console.info(`[lesson] checkpoint: continue — ${(decision as CheckpointPlan).why}`);
+      }
+      let release = () => {};
+      const done = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      // The signal travels with the record so the handover line that releases
+      // this checkpoint is spoken against the run's own lifetime: if the run is
+      // discarded while the student is answering, that line is cut off too.
+      run.checkpoint = { done, release, signal };
+      // Torn down while parked: let the consumer go rather than leave it waiting
+      // on an answer that is never coming.
+      signal.addEventListener("abort", release, { once: true });
+      setLesson("checkpoint");
+      // "asking", not "teaching": the status chip must not claim to be teaching
+      // while the floor belongs to the student.
+      setStatus("asking");
+      // A real question is unique to this moment, so it is fetched like any
+      // spoken beat; the fixed "any doubt?" gate goes through the FIXED-speech
+      // cache, which is what makes it instant after the first lesson.
+      const audio =
+        cfg.tts !== "sarvam"
+          ? null
+          : asking
+            ? fetchSpeech(line, lang, signal, cfg.ttsPace).catch(() => null)
+            : fetchFixedSpeech(line, lang, cfg.ttsPace);
+      // A real question belongs in the transcript — it is teaching, and the
+      // student should be able to read it back. The plain gate does not: it is
+      // the same sentence every step and would bury the lesson in repeats.
+      if (asking) {
+        const qid = uid("a");
+        run.ownIds.add(qid);
+        setMessages((m) => [...m, { id: qid, role: "assistant", text: line }]);
+      }
+      await speakBeat({ say: line, lang, draw: [] }, audio, signal);
+      if (signal.aborted) {
+        setGateOpen(false);
+        signal.removeEventListener("abort", release);
+        run.checkpoint = null;
+        return;
+      }
+      // The question has been asked, so hand the floor over: idle is what the
+      // voice loop's resume effect watches for, and it is also what lets the
+      // chat-mode composer accept an answer.
+      setStatus("idle");
+      // The plain gate is answered by the Yes/No buttons; a real question is not.
+      if (!asking) setGateOpen(true);
+      // Let go of `turnRef` for the duration of the pause, while keeping our own
+      // `signal`. Everything the student can do next — raise a doubt, ask for an
+      // example, start a new topic — goes through `stopTurn()`, which aborts
+      // whatever `turnRef` points at; and until now that has been THIS run's
+      // controller, because `startLessonRun` holds it for the whole of
+      // `playLesson`. Leaving it there would mean a doubt at a checkpoint
+      // aborted the very run it is pausing, throwing away the buffered step the
+      // pause exists to preserve. A mid-step doubt still aborts the run as
+      // before — there the interruption is the point.
+      const parked = turnRef.current;
+      if (parked && parked.signal === signal) turnRef.current = null;
+      openMicRef.current();
+      await done;
+      setGateOpen(false);
+      signal.removeEventListener("abort", release);
+      run.checkpoint = null;
+      // Take the turn back, unless something else has claimed it in the
+      // meantime (a doubt's controller, say) — whoever holds it now owns the
+      // floor, and the handover line has already been spoken against it.
+      if (parked && !parked.signal.aborted && turnRef.current === null) turnRef.current = parked;
+    },
+    [setLesson, speakBeat],
+  );
+
+  /**
    * Consumer of the lesson pipeline: speaks and draws queued beats in order,
    * one page per step. Everything about "where are we in the lesson" is decided
    * here rather than at generation time, because the student is only ever where
@@ -961,6 +1209,23 @@ export default function Tutor() {
           // The previous step has been spoken in full, so a resume starts after it.
           if (run.step >= 0) lessonRef.current.step = run.step + 1;
           settle();
+          // A subtopic has just ended and the next one is in hand: stop and ask
+          // whether anything needs clearing up before it starts. Nothing is
+          // thrown away by waiting — `q` is held right here and the producer
+          // carries on behind it — so whichever way the student answers, the
+          // next step starts speaking the moment they have finished.
+          if (run.step >= 0 && q.step >= 0) {
+            await askCheckpoint(run, signal);
+            // Torn down while parked (the student started something else): this
+            // beat has not been spoken or drawn, so hold it exactly as an
+            // interrupted beat is held. Without this it would be the one beat
+            // the queue has already handed out and the resume never replays —
+            // the next step would open on its second sentence.
+            if (signal.aborted) {
+              run.held = { q, drawn: [] };
+              return;
+            }
+          }
           run.step = q.step;
           // This step is on the air now — free the lookahead slot so the producer
           // can go and fetch the next one while this one is being spoken.
@@ -975,10 +1240,26 @@ export default function Tutor() {
             lastTeachRef.current = { turn: q.turn, step: q.step };
           }
           setStatus("teaching");
-          // A step is a new subtopic, so it takes a fresh page only when the
-          // current one lacks the room to hold one; otherwise it carries on
-          // down the page the previous step left room on.
+          // A step is a whole subtopic, so it always opens a page of its own —
+          // and gets its numbered heading written at the top before any of the
+          // model's own beats land on it.
           player.beginTeachTurn({ newStep: true });
+          if (q.step >= 0) {
+            const title = lessonRef.current.plan?.steps[q.step]?.title?.trim();
+            if (title) {
+              // Drawn as a beat of this turn, silently (no `say`), so it is
+              // measured like everything else and is erased with the step if
+              // the step is ever replayed (`dropTurn`).
+              //
+              // `drawStepHeading`, not `applyBeat`: it also RESERVES the band
+              // the heading occupies, so the step's own first beat starts below
+              // the rule. The model is told its page is blank and writes from
+              // CONTENT_TOP — the heading's own y — so without that reservation
+              // the first line of working lands on top of the title.
+              await player.drawStepHeading(stepHeadingOps(q.step, title), q.turn, signal);
+              if (signal.aborted) return;
+            }
+          }
           run.bubble = uid("a");
           const id = run.bubble;
           run.ownIds.add(id);
@@ -1020,7 +1301,7 @@ export default function Tutor() {
         settle();
       }
     },
-    [speakBeat],
+    [askCheckpoint, speakBeat],
   );
 
   /**
@@ -1151,6 +1432,11 @@ export default function Tutor() {
     run.gen.abort();
     run.queue.close();
     run.held = null;
+    // A consumer parked at a checkpoint is waiting on a promise only an answer
+    // resolves, and this run will never get one. Release it so it can see the
+    // closed queue and finish, instead of being left holding it forever.
+    run.checkpoint?.release();
+    run.checkpoint = null;
   }, []);
 
   /**
@@ -1198,6 +1484,7 @@ export default function Tutor() {
         bubble: "",
         ownIds: new Set<string>(),
         done: false,
+        checkpoint: null,
       };
       runRef.current = run;
       void generateLesson(run, plan, from, opts?.agenda ?? null);
@@ -1270,6 +1557,161 @@ export default function Tutor() {
       setSpeechPaused(false);
     }
   }, [playLesson, speakBeat, startLessonRun, stopTurn]);
+
+  /**
+   * Leave a checkpoint and let the lesson run on.
+   *
+   * Unlike `resumeLesson` this does NOT start a consumer: the one parked in
+   * `askCheckpoint` never let go of the queue, so all that is needed is the
+   * handover line and the release. That is the whole reason a checkpoint is its
+   * own phase rather than a doubt with a different question — no re-fetch, no
+   * second consumer, no page walk, and the next step is already buffered.
+   *
+   * `cleared` picks which set of handovers to speak: the student had a doubt and
+   * it has been answered, or they had none at all.
+   */
+  const clearCheckpoint = useCallback(
+    async (cleared: boolean, opts?: { silent?: boolean }) => {
+      const run = runRef.current;
+      const cp = run?.checkpoint;
+      if (!run || !cp) {
+        // Nothing parked (the run was thrown away under us): fall back to the
+        // normal resume, which re-asks for the step if it has to.
+        setLesson("teaching");
+        await resumeLesson();
+        return;
+      }
+      // NOT stopTurn(): at a checkpoint `turnRef.current` is the lesson run's
+      // OWN controller — the consumer is parked inside the `playLesson` call it
+      // was given — so aborting it here would tear down the very run this is
+      // about to release, throwing away the buffered step and sending the
+      // lesson back through a full re-fetch.
+      setError(null);
+      setInterim("");
+      const signal = cp.signal;
+      if (signal.aborted) return;
+      setLesson("teaching");
+      setStatus("teaching");
+      // `silent` skips the handover line. Used after a graded answer, where the
+      // verdict has just been spoken: following "exactly right, it is minus
+      // four" with "great, let us go ahead" is one acknowledgement too many.
+      if (!opts?.silent) {
+        const cfg = configRef.current ?? FALLBACK_CONFIG;
+        const lang = languageRef.current;
+        const line = checkpointHandover(lang, cleared);
+        await speakBeat(
+          { say: line, lang, draw: [] },
+          cfg.tts === "sarvam" ? fetchFixedSpeech(line, lang, cfg.ttsPace) : null,
+          signal,
+        );
+        if (signal.aborted) return;
+      }
+      cp.release();
+    },
+    [resumeLesson, setLesson, speakBeat],
+  );
+
+  /**
+   * Mark the answer the student just spoke to a checkpoint question, say the
+   * verdict back, and carry on.
+   *
+   * The reply is NOT a yes/no about doubts, so none of the clear/doubt
+   * classifiers apply: the model that asked the question is the one that marks
+   * it, against the answer it said it was looking for.
+   *
+   * What happens next depends on how wrong they were, and that is the point of
+   * grading at all:
+   *  - right or nearly: say so and release the checkpoint, so the buffered next
+   *    step starts immediately. The lesson has lost ten seconds and gained a
+   *    retrieval, which is the trade the whole feature exists to make.
+   *  - wrong in a way that matters (`reteach`): the correction alone will not do.
+   *    The point is taught again as a doubt turn, on its own page, and the
+   *    lesson stays parked at this checkpoint until that is cleared — teaching
+   *    on over a misunderstanding the next steps build on is how a student ends
+   *    up lost without knowing where.
+   *
+   * Either way the outcome goes into the record, which is what the NEXT
+   * checkpoint reads to decide whether to ask again and how hard.
+   */
+  const gradeAnswer = useCallback(
+    async (pending: { question: string; expected: string; difficulty: "recall" | "apply" | "stretch"; step: number }, answer: string) => {
+      pendingQuestionRef.current = null;
+      const run = runRef.current;
+      const cp = run?.checkpoint;
+      const signal = cp?.signal;
+      const L = lessonRef.current;
+      const lang = languageRef.current;
+      const cfg = configRef.current ?? FALLBACK_CONFIG;
+      // Their answer belongs in the transcript before the verdict does.
+      setMessages((m) => [...m, { id: uid("u"), role: "user", text: answer }]);
+      setStatus("thinking");
+
+      let grade: AnswerGrade | null = null;
+      try {
+        await postTutorTurn(
+          {
+            messages: [{ role: "user", text: answer }],
+            language: lang,
+            grade: gradeRef.current,
+            subject: subjectRef.current,
+            mode: "grade",
+            plan: L.plan,
+            step: pending.step,
+            question: pending.question,
+            expected: pending.expected,
+            answer,
+            record: recordRef.current,
+          },
+          signal ?? new AbortController().signal,
+          (ev) => {
+            if (ev.type === "grade") grade = ev.grade;
+          },
+        );
+      } catch {
+        /* fall through to the neutral default below */
+      }
+      if (signal?.aborted) return;
+      // No verdict from any model: do not guess and do not stall. Count it as
+      // partial, say nothing about right or wrong, and let the lesson run on —
+      // the student has at least had the retrieval.
+      const g: AnswerGrade = grade ?? { verdict: "partial", say: "", reteach: false };
+      const rec = recordRef.current;
+      if (g.verdict === "correct") rec.correct += 1;
+      else if (g.verdict === "partial") rec.partial += 1;
+      else rec.wrong += 1;
+      rec.recent = [...rec.recent, g.verdict].slice(-5);
+      console.info(`[lesson] answer ${g.verdict}${g.reteach ? " (reteach)" : ""} — ${rec.correct}/${rec.asked} right`);
+
+      // Say the verdict. Spoken only: a tick on the board would sit under the
+      // step's working for the rest of the lesson.
+      const say = g.say.trim();
+      if (say && signal && !signal.aborted) {
+        setMessages((m) => [...m, { id: uid("a"), role: "assistant", text: say }]);
+        setStatus("teaching");
+        await speakBeat(
+          { say, lang, draw: [] },
+          cfg.tts === "sarvam" ? fetchSpeech(say, lang, signal, cfg.ttsPace).catch(() => null) : null,
+          signal,
+        );
+      }
+      if (signal?.aborted) return;
+
+      // A miss that matters: teach it again before moving on. The lesson stays
+      // parked here, so "got it" comes back through the checkpoint path and the
+      // buffered next step is still waiting.
+      if (g.reteach) {
+        checkpointDoubtRef.current = true;
+        setLesson("doubt");
+        await runTurn({ text: `I got this wrong: ${pending.question}. Please explain it again.`, mode: "doubt", interrupt: true });
+        return;
+      }
+      // Right, or close enough that the correction did the job: carry on. The
+      // verdict has just been spoken, so skip the "great, let's go ahead"
+      // handover — two acknowledgements in a row sounds like a stutter.
+      await clearCheckpoint(true, { silent: !!say });
+    },
+    [clearCheckpoint, runTurn, setLesson, speakBeat],
+  );
 
   /**
    * Opens a lesson: design it, then teach it. One turn from the student's point
@@ -1390,6 +1832,10 @@ export default function Tutor() {
         L.step = 0;
         L.topic = text;
         L.familiarity = null;
+        // A new topic is a new record: how they did on quadratics says nothing
+        // about how to pitch questions on trigonometry.
+        recordRef.current = { asked: 0, correct: 0, partial: 0, wrong: 0, doubts: 0, sinceAsked: 0, recent: [], lastDifficulty: null };
+        pendingQuestionRef.current = null;
         setLesson("awaitFamiliarity");
         await playLocalBeats(text, [{ say: familiarityQuestion(languageRef.current), lang: languageRef.current, draw: [] }]);
         return;
@@ -1400,6 +1846,61 @@ export default function Tutor() {
         L.step = 0;
         setLesson("teaching");
         await startLesson(text); // design it, preview it, then teach it step by step
+        return;
+      }
+
+      // Answering the checkpoint question asked after the step that just ended.
+      // "No doubt" is the common case and the whole point of the pause: it
+      // speaks one acknowledgement and releases the parked consumer, so the
+      // next step (already generated, its speech already fetched) starts
+      // immediately. Anything else is a doubt, and the lesson comes BACK to the
+      // checkpoint once it is answered rather than running straight on — the
+      // student who had one question usually has a second.
+      if (L.phase === "checkpoint") {
+        // They pressed "I have a doubt": this utterance IS the doubt. Skip every
+        // classifier — the student has already answered the yes/no, and reading
+        // their words again could only contradict the button they just pressed.
+        if (gateForcedDoubtRef.current) {
+          gateForcedDoubtRef.current = false;
+          setGateOpen(false);
+          pendingQuestionRef.current = null;
+          recordRef.current.doubts += 1;
+          checkpointDoubtRef.current = true;
+          setLesson("doubt");
+          await runTurn({ text, mode: isExplainRequest(text) ? "explain" : "doubt", interrupt: true });
+          return;
+        }
+        const pending = pendingQuestionRef.current;
+        // A real question was put to them, so this is an ANSWER to be marked —
+        // not a yes/no about doubts. `isCheckpointClear` must not see it: "no"
+        // is a perfectly good answer to "is x = 2 a root?" and would otherwise
+        // be read as "no doubts, carry on".
+        if (pending) {
+          // Unless they are plainly asking rather than answering, in which case
+          // it is a doubt about the question itself.
+          if (!isAnswerDodge(text)) {
+            await gradeAnswer(pending, text);
+            return;
+          }
+          pendingQuestionRef.current = null;
+          recordRef.current.doubts += 1;
+          checkpointDoubtRef.current = true;
+          setLesson("doubt");
+          await runTurn({ text, mode: "doubt", interrupt: true });
+          return;
+        }
+        if (isCheckpointClear(text) && !isExplainRequest(text)) {
+          await clearCheckpoint(false);
+          return;
+        }
+        recordRef.current.doubts += 1;
+        checkpointDoubtRef.current = true;
+        setLesson("doubt");
+        await runTurn({
+          text,
+          mode: isExplainRequest(text) ? "explain" : "doubt",
+          interrupt: true,
+        });
         return;
       }
 
@@ -1417,16 +1918,35 @@ export default function Tutor() {
         // the camera back left onto the lesson page, which still holds
         // everything taught before the doubt.
         boardRef.current?.player.endDoubt();
+        // The doubt was raised AT a checkpoint, so the consumer is still parked
+        // there: release it with a "now that's clear, back to where we were"
+        // handover instead of taking the mid-step resume path, which would
+        // start a second consumer on a queue the first one never let go of.
+        if (checkpointDoubtRef.current && runRef.current?.checkpoint) {
+          checkpointDoubtRef.current = false;
+          await clearCheckpoint(true);
+          return;
+        }
+        checkpointDoubtRef.current = false;
         setLesson("teaching");
         await resumeLesson(); // carries on from the sentence the doubt cut into
         return;
       }
 
       // Otherwise it's a conceptual doubt → the doubt model on a new page, lesson paused.
+      // Reached from "teaching" (barged in mid-step) or from a "doubt" that was
+      // not cleared (a second question). Only the first of those changes how the
+      // lesson resumes, and it resumes mid-step — so the checkpoint flag is set
+      // from "teaching" and otherwise left alone, since a follow-up question at
+      // a checkpoint is still at that checkpoint.
+      if (L.phase === "teaching") checkpointDoubtRef.current = false;
+      // A doubt is the second signal the checkpoint model reads: a student
+      // raising them is a student who should be taught, not quizzed.
+      recordRef.current.doubts += 1;
       setLesson("doubt");
       await runTurn({ text, mode: "doubt", interrupt: true });
     },
-    [playLocalBeats, resumeLesson, runTurn, setLesson, startLesson],
+    [clearCheckpoint, gradeAnswer, playLocalBeats, resumeLesson, runTurn, setLesson, startLesson],
   );
 
   // Voice-loop hooks: if a teaching run ended with steps still to go (a step the
@@ -1442,6 +1962,9 @@ export default function Tutor() {
     const t = lastTurnRef.current;
     return !t.aborted && t.hadText && !t.endedWithQuestion;
   }, []);
+  /** Is the lesson parked at a between-step checkpoint, waiting to be answered?
+   *  The voice loop opens the mic by itself when it is (see `autoListen`). */
+  const atCheckpoint = useCallback(() => lessonRef.current.phase === "checkpoint", []);
 
   // Hands-free conversation loop for voice mode: greets, listens, end-points
   // the student's sentence, submits it, and listens again after each turn.
@@ -1452,16 +1975,25 @@ export default function Tutor() {
     hasConversation: messages.length > 0,
     ask,
     shouldContinue: shouldContinueLesson,
+    autoListen: atCheckpoint,
     continueLesson,
     setInterim,
     setError,
     configRef,
     languageRef,
+    trackRef,
   });
   const voicePhaseRef = useRef(voice.phase);
   useEffect(() => {
     voicePhaseRef.current = voice.phase;
   }, [voice.phase]);
+  // Give `askCheckpoint` its way to open the mic. The answer then goes through
+  // transcribe → review → ask like any other utterance, so nothing reaches the
+  // model unseen. Only in voice mode: in chat mode the student answers in the
+  // composer, which is already there and waiting.
+  useEffect(() => {
+    openMicRef.current = voiceMode ? voice.listenForAnswer : () => {};
+  }, [voiceMode, voice.listenForAnswer]);
 
   // ---- microphone (dictation + push-to-talk, normal chat mode) ------------
   //
@@ -1605,6 +2137,42 @@ export default function Tutor() {
     voiceBargeIn();
   }, [stopTurn, voiceBargeIn]);
 
+  /**
+   * The checkpoint gate's two buttons.
+   *
+   * These exist because the sentence classifier was the wrong tool for the job.
+   * It had to decide, from free text, whether "no, we can move forward" meant
+   * "no doubts" or was itself a doubt — and it got that exact sentence wrong,
+   * because the comma after "no" broke a regex that wanted whitespace. Patching
+   * the pattern would have bought one phrasing; the next one would break it
+   * again. The question is a plain yes/no, so the honest interface is a yes and
+   * a no, and then nothing has to be guessed at.
+   *
+   * `isCheckpointClear` stays for the typed and spoken paths — a student may
+   * still answer out loud, and the buttons are an addition, not a replacement.
+   */
+  const gateNoDoubt = useCallback(() => {
+    setGateOpen(false);
+    // Straight to the handover and the buffered next step. No model call, no
+    // classifier, no transcription — this is the fastest path in the lesson.
+    void clearCheckpoint(false);
+  }, [clearCheckpoint]);
+
+  const gateHaveDoubt = useCallback(() => {
+    setGateOpen(false);
+    // Say nothing and ask nothing: open the mic and let them speak the doubt.
+    // Whatever they say is routed as a doubt (the phase is still "checkpoint"
+    // and `pendingQuestionRef` is null, so `ask` takes the doubt branch) —
+    // which is exactly what the student has just told us by pressing this.
+    setDoubtPending(true);
+    gateForcedDoubtRef.current = true;
+    // Voice mode: open the mic so they can just say it. Chat mode: `openMicRef`
+    // is a no-op by design, and the composer is already there and focused — the
+    // flag is what matters either way, because it is what stops the next thing
+    // they send being re-classified.
+    openMicRef.current();
+  }, []);
+
   // The avatar's stop/resume switch — distinct from "awaiting an answer".
   // Speaking → freeze the voice in place (resume carries on from the same word).
   // Listening → stop listening (the loop's own "paused" phase). Paused → undo it.
@@ -1709,6 +2277,11 @@ export default function Tutor() {
     setLessonPhase("none");
     setLessonStarted(false);
     setDoubtPending(false);
+    checkpointDoubtRef.current = false;
+    gateForcedDoubtRef.current = false;
+    setGateOpen(false);
+    pendingQuestionRef.current = null;
+    recordRef.current = { asked: 0, correct: 0, partial: 0, wrong: 0, doubts: 0, sinceAsked: 0, recent: [], lastDifficulty: null };
     lastTeachRef.current = null;
   };
 
@@ -1721,6 +2294,12 @@ export default function Tutor() {
       trackRef.current = next;
       newTopic();
       setTrack(next);
+      // Picking a mode IS starting the class, so this is also where the voice
+      // stage begins — the student said what they wanted by clicking, and the
+      // next thing they should meet is Indica asking for the topic, not another
+      // screen asking them to choose again.
+      setVoiceMode(true);
+      setChatPanelOpen(false);
     },
     // newTopic is a plain closure recreated each render by design; it only touches
     // refs and setters, so capturing the latest one here is safe.
@@ -1728,9 +2307,96 @@ export default function Tutor() {
     [],
   );
 
+  // --- saving the notes (the board's double-click menu) --------------------
+  const boardMenu = useBoardMenu();
+  const [pdfBusy, setPdfBusy] = useState<string | null>(null);
+  // How many pages the PDF would hold. Read when the menu opens rather than
+  // tracked continuously: the page count only matters while the menu is up.
+  const pdfPages = boardMenu.open && board ? pdfPageList(board.player).length : 0;
+
+  /**
+   * Save the page the student is LOOKING at (not the one Indica is writing on —
+   * they may have flipped back) as a PNG or an SVG.
+   *
+   * Excalidraw's own export dialog is switched off in Whiteboard, so these call
+   * its export helpers directly. Imported here, at the point of use: both pull
+   * in a chunk of the Excalidraw bundle, and neither is needed until a student
+   * actually asks for a file.
+   */
+  const saveBoardImage = useCallback(
+    async (kind: "png" | "svg") => {
+      const b = boardRef.current;
+      if (!b) return;
+      boardMenu.close();
+      const { viewIndex, activeIndex } = b.player.getPageState();
+      const index = viewIndex >= 0 ? viewIndex : activeIndex;
+      const elements = index >= 0 ? b.player.pageElements(index) : [];
+      if (!elements.length) {
+        setError("That page is empty — nothing to save yet.");
+        return;
+      }
+      // Name it by the page number the student can see on the rail, not by the
+      // internal allocation index — `pdfPageList` already works that out, and
+      // using it here keeps the PNG's name and the PDF's page agreeing.
+      const label = pdfPageList(b.player).find((p) => p.index === index)?.label ?? String(index + 1);
+      const topicStem =
+        (lessonRef.current.topic || "indica-notes")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 50) || "indica-notes";
+      const stem = `${topicStem}-page-${label}`;
+      try {
+        const mod = await import("@excalidraw/excalidraw");
+        const appState = { exportBackground: true, viewBackgroundColor: "#ffffff" };
+        let blob: Blob;
+        if (kind === "png") {
+          blob = await mod.exportToBlob({ elements, files: null, appState, exportPadding: 24, mimeType: "image/png" });
+        } else {
+          const svg = await mod.exportToSvg({ elements, files: null, appState, exportPadding: 24 });
+          blob = new Blob([new XMLSerializer().serializeToString(svg)], { type: "image/svg+xml" });
+        }
+        const href = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = href;
+        a.download = `${stem}.${kind}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(href), 10_000);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Could not save that page.");
+      }
+    },
+    [boardMenu],
+  );
+
+  /** Save every page of the session as one landscape PDF. */
+  const saveBoardPdf = useCallback(async () => {
+    const b = boardRef.current;
+    if (!b) return;
+    boardMenu.close();
+    setPdfBusy("Preparing your PDF…");
+    try {
+      const mod = await import("@excalidraw/excalidraw");
+      const res = await downloadBoardPdf({
+        player: b.player,
+        exportToCanvas: mod.exportToCanvas as Parameters<typeof downloadBoardPdf>[0]["exportToCanvas"],
+        topic: lessonRef.current.topic || solveRef.current.question,
+        onProgress: (done, total) => setPdfBusy(`Preparing page ${Math.min(done + 1, total)} of ${total}…`),
+      });
+      if ("error" in res) setError(res.error);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not build the PDF.");
+    } finally {
+      setPdfBusy(null);
+    }
+  }, [boardMenu]);
+
   const busy = status === "thinking" || status === "teaching" || status === "asking";
-  // In voice mode the chat is hidden until the hamburger reopens it.
-  const showChat = !voiceMode || chatPanelOpen;
+  // The chat panel is no longer a mode of its own. A session is spoken: the start
+  // screen hands straight to the voice stage, and the only way the sidebar comes
+  // back is the keyboard affordance (`chatPanelOpen`), which exists because a
+  // refused mic or a browser without speech recognition must not be a dead end.
+  const showChat = chatPanelOpen;
   // The composer invites the right kind of input for the current lesson stage.
   const composerPlaceholder =
     track === "solve"
@@ -1739,9 +2405,11 @@ export default function Tutor() {
         : "Which question? e.g. “exercise 5.2 question 3”"
       : lessonPhase === "awaitFamiliarity"
         ? "Answer: have you learned this before, or is it new?"
-        : lessonPhase === "doubt"
-          ? "Ask your doubt… (say “got it” to continue the lesson)"
-          : askPlaceholder(language);
+        : lessonPhase === "checkpoint"
+          ? "Answer here, or use the buttons above"
+          : lessonPhase === "doubt"
+            ? "Ask your doubt… (say “got it” to continue the lesson)"
+            : askPlaceholder(language);
 
   // Voice-stage derived state. The student's words get their own box (see
   // showSpeechBox); the caption strip below it carries Indica's side — the
@@ -1789,6 +2457,10 @@ export default function Tutor() {
     // with the answer.
     !doubtHold &&
     lessonPhase !== "doubt" &&
+    // At a checkpoint the student has just been ASKED to speak and the mic is
+    // already open, so there is nothing to break into — a Doubt button here
+    // would only compete with the question it was offered alongside.
+    lessonPhase !== "checkpoint" &&
     !guruListening &&
     !transcribing &&
     !avatarPaused &&
@@ -1873,6 +2545,28 @@ export default function Tutor() {
         )}
 
         <Transcript messages={messages} status={status} />
+        {/* The same gate, above the composer, for the chat panel. The bug this
+            fixes was not specific to voice — a TYPED "no, we can move forward"
+            was misread exactly as a spoken one was, because both went through
+            the same sentence test. */}
+        {gateOpen && (
+          <div className="mx-3 mb-2 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={gateNoDoubt}
+              className="flex-1 rounded-xl bg-linear-to-b from-emerald-400 to-emerald-600 px-3 py-2 text-xs font-semibold text-white shadow-sm ring-1 ring-inset ring-white/30 transition hover:brightness-105 active:scale-95"
+            >
+              All clear — continue
+            </button>
+            <button
+              type="button"
+              onClick={gateHaveDoubt}
+              className="flex-1 rounded-xl bg-linear-to-b from-[#fb923c] to-[#e03e22] px-3 py-2 text-xs font-semibold text-white shadow-sm ring-1 ring-inset ring-white/30 transition hover:brightness-105 active:scale-95"
+            >
+              I have a doubt
+            </button>
+          </div>
+        )}
         <Composer
           status={status}
           draft={draft}
@@ -1916,15 +2610,55 @@ export default function Tutor() {
         )}
         {/* The lesson is being designed — the board is still blank, so the wait
             owns the middle of it in both modes. */}
-        {/* First choice of the session: learn a topic, or solve a question. The
-            solve pipeline can only skip the familiarity question because this was
-            answered up front. */}
-        {track === null && <TrackPicker onPick={pickTrack} />}
+        {/* The session's setup and its first choice, on one screen: class,
+            subject, language, then the mode. Picking a mode starts the voice
+            stage, so this is the last thing the student clicks before talking.
+            The solve pipeline can only skip the familiarity question because
+            the mode was answered up front, here. */}
+        {track === null && (
+          <StartScreen
+            grade={grade}
+            subject={subject}
+            language={language}
+            ready={!!board && !!config}
+            onGrade={(g) => {
+              setGrade(g);
+              writeLocal("guru.grade", String(g));
+              // Changing class can invalidate the subject (Class 1 has no
+              // Science), so drop one that is no longer offered.
+              if (subject != null && !subjectsForGrade(g).includes(subject)) {
+                setSubject(null);
+                writeLocal("guru.subject", "");
+              }
+            }}
+            onSubject={(sub) => {
+              setSubject(sub);
+              writeLocal("guru.subject", sub);
+            }}
+            onLanguage={(code) => {
+              setLanguage(code);
+              writeLocal("guru.language", code);
+            }}
+            onStart={pickTrack}
+          />
+        )}
         {planning && <PlanningCard steps={planOutline} />}
         {/* Page navigation, and the way back to the page Indica is writing on.
             Carries the name of Excalidraw's own "Scroll back to content"
             (hidden in globals.css), which knows nothing about pages. */}
         {board && <BoardPager player={board.player} />}
+        {/* Double-click (or two-finger tap) the board: save this page, or the
+            whole session as a landscape PDF. */}
+        <BoardMenu
+          open={boardMenu.open}
+          at={boardMenu.at}
+          onClose={boardMenu.close}
+          pageCount={pdfPages}
+          busy={pdfBusy}
+          onSavePng={() => void saveBoardImage("png")}
+          onSaveSvg={() => void saveBoardImage("svg")}
+          onSavePdf={() => void saveBoardPdf()}
+        />
         {voiceMode && (
           <>
             {/* Hamburger — the single voice-mode control. It toggles between the
@@ -1941,11 +2675,15 @@ export default function Tutor() {
                   if (voicePhaseRef.current === "paused") voice.resume();
                 }
               }}
-              title={chatPanelOpen ? "Back to voice" : "Show chat"}
-              aria-label={chatPanelOpen ? "Back to voice" : "Show chat"}
+              title={chatPanelOpen ? "Back to voice" : "Type instead"}
+              aria-label={chatPanelOpen ? "Back to voice" : "Type instead"}
               className="absolute left-3 top-3 z-20 grid h-10 w-10 place-items-center rounded-full bg-white/90 text-neutral-700 shadow ring-1 ring-black/5 backdrop-blur transition hover:bg-white"
             >
-              <HamburgerIcon />
+              {/* A keyboard, not a hamburger: this is no longer a way to a
+                  second mode, it is the way to type when the mic will not do —
+                  denied permission, a browser with no speech recognition, or a
+                  word Indica keeps mishearing. */}
+              {chatPanelOpen ? <HamburgerIcon /> : <KeyboardIcon />}
             </button>
 
             {!chatPanelOpen && (
@@ -1970,6 +2708,35 @@ export default function Tutor() {
                       className="relative block rounded-full bg-linear-to-b from-[#fb923c] to-[#e03e22] px-5 py-2.5 text-sm font-semibold tracking-wide text-white shadow-lg shadow-orange-900/30 ring-1 ring-inset ring-white/30 transition duration-150 hover:-translate-y-px hover:shadow-xl hover:shadow-orange-900/35 hover:brightness-105 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 active:translate-y-0 active:scale-95"
                     >
                       Doubt
+                    </button>
+                  </div>
+                )}
+
+                {/* The checkpoint gate: two buttons for a two-way question.
+                    Offered only for the plain "any doubt?" — a real recall
+                    question is answered in the student's own words, where a
+                    Yes/No pair would mean nothing. The mic is open at the same
+                    time, so speaking still works; this is the escape from having
+                    to parse what was spoken. */}
+                {gateOpen && (
+                  <div className="absolute bottom-5 left-4 z-20 flex items-center gap-2.5 md:bottom-6 md:left-6">
+                    <button
+                      type="button"
+                      onClick={gateNoDoubt}
+                      title="No doubt — carry on with the lesson"
+                      aria-label="No doubt, carry on"
+                      className="relative block rounded-full bg-linear-to-b from-emerald-400 to-emerald-600 px-5 py-2.5 text-sm font-semibold tracking-wide text-white shadow-lg shadow-emerald-900/30 ring-1 ring-inset ring-white/30 transition duration-150 hover:-translate-y-px hover:shadow-xl hover:brightness-105 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-500 active:translate-y-0 active:scale-95"
+                    >
+                      All clear — continue
+                    </button>
+                    <button
+                      type="button"
+                      onClick={gateHaveDoubt}
+                      title="I have a doubt — ask it now"
+                      aria-label="I have a doubt"
+                      className="relative block rounded-full bg-linear-to-b from-[#fb923c] to-[#e03e22] px-5 py-2.5 text-sm font-semibold tracking-wide text-white shadow-lg shadow-orange-900/30 ring-1 ring-inset ring-white/30 transition duration-150 hover:-translate-y-px hover:shadow-xl hover:brightness-105 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-orange-500 active:translate-y-0 active:scale-95"
+                    >
+                      I have a doubt
                     </button>
                   </div>
                 )}
@@ -2164,13 +2931,71 @@ class StepGate {
 }
 
 /**
+ * The numbered heading that opens a step's page: "3. Factorisation method",
+ * then a thick rule across the page separating it from the working below.
+ *
+ * Drawn by the client, not the model, and that is deliberate on three counts:
+ *  - it appears EXACTLY ONCE per subtopic. A step that spills onto a second or
+ *    third page carries no heading there, so a long subtopic reads as one
+ *    stretch under one title. Asking the model for it per beat could not
+ *    guarantee that, because the model does not know where the page broke.
+ *  - the rule is genuinely thick. The model's `line` op renders at a fixed
+ *    strokeWidth of 2 (see lib/canvas/ops.ts); this stacks three hairlines a
+ *    pixel apart to read as one heavy rule, which is the only way to get real
+ *    weight without plumbing a stroke width through the whole op schema.
+ *  - the number matches the roadmap page. Both come from the same
+ *    `plan.steps[i].title`, so "3. Factorisation method" in the contents is
+ *    "3. Factorisation method" at the top of the page it points at.
+ *
+ * The step's own beats are written as if the page were blank, starting around
+ * CONTENT_TOP — they are not told about this heading, and they do not need to
+ * be: `BoardPlayer.drawStepHeading` reserves the band this occupies, so the
+ * step's content is laid out below the rule. That reservation is load-bearing,
+ * not a nicety — collision avoidance alone does NOT cover it, because it fires
+ * only on a true overprint and prefers to dodge upward, so a first line that
+ * merely grazes the title stays exactly where the model put it.
+ */
+function stepHeadingOps(step: number, title: string): DrawOp[] {
+  const ruleY = CONTENT_TOP + 56; // clears the 36px lg heading plus a little air
+  return [
+    {
+      op: "text",
+      id: `step_head_${step}`,
+      x: CONTENT_LEFT,
+      y: CONTENT_TOP,
+      text: `${step + 1}. ${stripStepNumber(title)}`,
+      size: "lg",
+      color: "purple",
+    },
+    // Three hairlines a pixel apart: one `line` op is 2px, which reads as a
+    // body underline rather than a heading rule.
+    ...[0, 1.5, 3].map((dy, i) => ({
+      op: "line" as const,
+      id: `step_rule_${step}_${i}`,
+      x: CONTENT_LEFT,
+      y: ruleY + dy,
+      x2: CONTENT_RIGHT,
+      y2: ruleY + dy,
+      color: "purple" as const,
+    })),
+  ];
+}
+
+/**
  * The spoken roadmap, as beats, straight from the plan — no model call, so it
  * costs nothing and starts instantly. Indica says each step's one-line preview
  * (the planner wrote those in the student's language) while writing the step
  * titles up as a contents page the student can flip back to.
  */
 function agendaBeats(plan: LessonPlan, lang: string): Beat[] {
-  const steps = plan.steps.slice(0, 8); // a page holds about this many lines
+  // Every step gets a line: the contents page is the map of the whole lesson,
+  // and a plan truncated at 8 would hide the last third of a 12-step one.
+  const steps = plan.steps;
+  // Tighten the line pitch to fit however many there are. A 12-step plan at the
+  // old fixed 56px ran 56px past CONTENT_BOTTOM and off the page; this keeps the
+  // list inside the page and leaves the common 8-step case looking as it did.
+  const listTop = CONTENT_TOP + 100;
+  const pitch = steps.length > 1 ? Math.min(56, (CONTENT_BOTTOM - listTop) / steps.length) : 56;
   const beats: Beat[] = [
     {
       say: plan.intro?.trim() || roadmapIntro(lang),
@@ -2190,16 +3015,16 @@ function agendaBeats(plan: LessonPlan, lang: string): Beat[] {
   ];
   steps.forEach((s, i) => {
     beats.push({
-      say: s.roadmap?.trim() || `${i + 1}. ${s.title}`,
+      say: s.roadmap?.trim() || `${i + 1}. ${stripStepNumber(s.title)}`,
       lang,
       draw: [
         {
           op: "text",
           id: `agenda_${i + 1}`,
           x: CONTENT_LEFT + 30,
-          y: CONTENT_TOP + 100 + i * 56,
-          text: `${i + 1}. ${s.title}`,
-          size: "md",
+          y: listTop + i * pitch,
+          text: `${i + 1}. ${stripStepNumber(s.title)}`,
+          size: pitch < 44 ? "sm" : "md",
         },
       ],
     });

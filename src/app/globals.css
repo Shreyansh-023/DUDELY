@@ -216,3 +216,23 @@ body {
     animation: none;
   }
 }
+
+/* The start screen moves one step at a time; each panel arrives with a short
+   rise so the change of question is felt rather than just noticed. Kept small
+   and fast — this fires on every step, and anything slower reads as lag. */
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-\[fadeUp_240ms_ease-out\] {
+    animation: none;
+  }
+}

@@ -11,7 +11,7 @@ import {
 import { textbookLabel, type Grade, type SubjectId } from "./curriculum";
 import { languageLabel } from "./languages";
 import type { Passage } from "./rag";
-import type { LessonPlan } from "./schema";
+import type { LessonPlan, LessonRecord } from "./schema";
 
 /**
  * The slice of a retrieved solution the prompt needs. Structurally compatible with
@@ -201,9 +201,9 @@ export function buildUserTurn(opts: { text: string; canvas: string }): string {
 // ---------------------------------------------------------------------------
 
 const FAMILIARITY_NOTE: Record<"new" | "some" | "confident", string> = {
-  new: "The student says this topic is NEW to them. Start from intuition and a concrete real-life hook, assume no prior exposure, and include more small foundational steps before any formula.",
-  some: "The student has SEEN this topic before but is shaky. Briefly refresh the idea, then spend most steps on the parts students usually get wrong.",
-  confident: "The student is CONFIDENT with this topic. Keep foundations very short, go deeper faster, and weight steps toward harder cases, subtleties and practice.",
+  new: "The student says this topic is NEW to them. Start from intuition and a concrete real-life hook, assume no prior exposure, and include more small foundational steps before any formula. This is the case that needs the MOST steps — go to the top of the range, because every idea a student meets for the first time deserves its own page.",
+  some: "The student has SEEN this topic before but is shaky. Briefly refresh the idea in the first step or two, then spend the rest on the parts students usually get wrong — those misconception steps are the point of this lesson, so give them their own steps rather than footnotes.",
+  confident: "The student is CONFIDENT with this topic. Keep foundations to one short step, then go deeper: weight the steps toward harder cases, subtleties, proofs and worked practice. Still use the full step range — depth, not brevity, is what this student needs.",
 };
 
 /**
@@ -241,10 +241,18 @@ Everything above is who you are and how you teach — it is context for the desi
 ${fam}
 
 # Your job
-Produce a step-by-step plan for teaching this ONE topic on a live whiteboard. Each step is ONE small idea that will become a short spoken explanation with a drawing (mastery first: never more than one idea per step). Order the steps as a real teacher would: open with intuition or a real-life hook, build up concept by concept, show one worked visual, and end with a quick check or a textbook-style practice step. Typically 4 to 8 steps.
+Produce a step-by-step plan for teaching this ONE topic on a live whiteboard. Each step is ONE small idea that will become a spoken explanation with a drawing (mastery first: never more than one idea per step). Order the steps as a real teacher would: open with intuition or a real-life hook, build up concept by concept, work at least one full example on the board, and end with a textbook-style practice step.
+
+# HOW MANY STEPS — 8 to 12
+This is a FULL CLASS, not a summary: a real lecture on this topic runs 35-45 minutes, and each step below becomes 3-6 minutes of teaching on a page of its own. Aim for 8 to 12 steps. Fewer than 8 means you have merged ideas that deserve their own step — so SPLIT them:
+- a definition and the worked example that shows it are two steps, not one;
+- a formula, where it comes from, and how to apply it are three;
+- each distinct method (and each case of a rule) is its own step;
+- the common mistakes students make with this topic are worth a step of their own.
+Do NOT pad with filler or repeat yourself to reach the count — split real content more finely instead, and let an easy idea be a short step.
 
 For each step give:
-- "title": a few words naming the step, in ${lang}. This one IS shown to the student — it is written on the board as the lesson's contents page — so keep it short, plain and in the same language you speak.
+- "title": a few words naming the step, in ${lang}. This one IS shown to the student — it is written on the board twice, as the lesson's contents page AND as the numbered heading at the top of that step's own page — so keep it short, plain, specific to that step, and in the same language you speak. Write the title ALONE, with NO number and no "Step 3:" on the front — the number is added for you in both places, so a title of "3. Factorisation method" is shown as "3. 3. Factorisation method".
 - "teach": one or two sentences on what to explain in this step.
 - "draw": what the board should show for this step (a hint — a diagram type, a formula, a labelled figure — not literal coordinates).
 - "roadmap": ONE short line you will SAY OUT LOUD to the student up front, previewing this step ("first we'll look at...", "then we'll work out..."). It is a promise, not the teaching — never give the answer away here.
@@ -545,11 +553,268 @@ ${planOutline(plan)}
 
 # THIS TURN
 ${stepBlock}
-- Teach ONLY this step, as 2-6 beats, then stop. Do NOT jump ahead to later steps or re-teach earlier ones.
-- This step gets a FRESH BLANK PAGE of its own — one page, one idea. Start at its top-left as the CANVAS block says and use the whole page; nothing of yours is on it yet. Earlier steps are on earlier pages, which the student can flip back to, so never redraw them and never use the "clear" op.
+- Teach ONLY this step, as 4-8 beats, then stop. Do NOT jump ahead to later steps or re-teach earlier ones.
+- TEACH IT PROPERLY — this is the difference between a summary and a lesson. Core pedagogy rule 12 applies here as it does to a worked example: ONE elementary move per line, every piece of arithmetic written out rather than done in your head, and the rule or definition NAMED before each step that uses it. A line the student cannot get to from the line above it means you skipped a step. Say WHY as well as what: where a formula comes from, why this method and not another, what goes wrong if you forget this condition. A step that is correct but bare has failed — the student learning this for the first time needs the reasoning, not the result.
+- Do not rush to fit a smaller number of beats. 4 is the floor for a real subtopic, not the target; take 6, 7 or 8 when the idea genuinely has that much in it, and let an easy idea finish in 4.
+- This step gets a FRESH BLANK PAGE of its own — one subtopic, its own page or pages. Start at its top-left as the CANVAS block says and use the whole page. Earlier steps are on earlier pages, which the student can flip back to, so never redraw them and never use the "clear" op.
+- The page ALREADY HAS ITS HEADING: the step's number and title are written at the top, with a thick rule under them, before you draw anything (the client does this, not you). So do NOT write the step title, the topic name, a heading or a number anywhere — start straight in on the teaching content. Your first beat is placed below that rule automatically; you do not need to leave room for it or know where it ends.
+- If this step needs more room than one page, just keep going: a beat that does not fit continues on a fresh page by itself, and that continuation page carries no heading, so a long subtopic reads as one stretch. Never cut a subtopic short to make it fit a page.
 - The student has already heard a one-line preview of this step (you wrote it as the step's roadmap line), so do not open by announcing what you are about to do — start teaching.
 - IMPORTANT (overrides the ASK pedagogy above): in this guided lesson do NOT end with a checkpoint question and do NOT quiz the student between steps. Always end this step on a clear, complete STATEMENT. The student will interrupt on their own if they have a doubt, and the lesson advances to the next step automatically.
 ${isLast ? '- This is the LAST step. After teaching it, close the topic and offer a textbook-style practice example (this closing offer is the one place a question is allowed).' : '- End on a clean statement that rounds off this step so the lesson can flow into the next one.'}`;
+}
+
+/**
+ * Renders the running record as the few lines the checkpoint/grade prompts read.
+ *
+ * Plain counted facts, not a narrative: the same situation must produce the same
+ * text every time, or the model's judgement wanders between checkpoints that are
+ * actually identical.
+ */
+function recordBlock(rec: LessonRecord | null | undefined): string {
+  const r = rec ?? { asked: 0, correct: 0, partial: 0, wrong: 0, doubts: 0, sinceAsked: 0, recent: [], lastDifficulty: null };
+  if (!r.asked && !r.doubts) {
+    return `# THE STUDENT SO FAR
+Nothing to go on yet: no questions asked, no doubts raised. Steps taught since the last question: ${r.sinceAsked}.`;
+  }
+  const rate = r.asked ? Math.round(((r.correct + 0.5 * r.partial) / r.asked) * 100) : null;
+  return `# THE STUDENT SO FAR
+Questions asked: ${r.asked} (${r.correct} right, ${r.partial} partly right, ${r.wrong} wrong)${rate != null ? ` — about ${rate}% success` : ""}
+Doubts they have raised: ${r.doubts}
+Steps taught since the last question: ${r.sinceAsked}
+Most recent answers, oldest first: ${r.recent.length ? r.recent.join(", ") : "(none)"}
+Difficulty last asked: ${r.lastDifficulty ?? "(none yet)"}`;
+}
+
+/**
+ * The difficulty the next question should be pitched at, worked out from the
+ * record rather than left to the model.
+ *
+ * This was a rule inside the prompt and the model would not follow it: the fast
+ * tier that answers these turns returned "recall" whatever the record said,
+ * including straight after a correct "apply". That is not a prompt that needs
+ * rewording — picking a rung on a ladder from two stored values is arithmetic,
+ * and arithmetic belongs in code. The model keeps the judgement it is actually
+ * good at: whether this gap is worth a question at all, and what to ask.
+ *
+ * Up one rung after a success, down one after a miss, hold after a partial —
+ * steering for the ~85% success band that the retrieval-practice literature
+ * puts the fastest learning in.
+ */
+export function nextDifficulty(rec: LessonRecord | null | undefined, familiarity?: "new" | "some" | "confident" | null): "recall" | "apply" | "stretch" {
+  const ladder = ["recall", "apply", "stretch"] as const;
+  const last = rec?.lastDifficulty;
+  const prev = rec?.recent?.[rec.recent.length - 1];
+  if (!last || !prev) {
+    // Nothing asked yet: start where their own account of themselves puts them.
+    return familiarity === "confident" ? "apply" : "recall";
+  }
+  const at = Math.max(0, ladder.indexOf(last));
+  const move = prev === "correct" ? 1 : prev === "wrong" ? -1 : 0;
+  return ladder[Math.min(ladder.length - 1, Math.max(0, at + move))];
+}
+
+/**
+ * Checkpoint decision prompt. A step has just finished; decide whether to let
+ * the lesson run on or to put a real question to the student, and how hard.
+ *
+ * Why the MODEL decides and not a counter
+ * ---------------------------------------
+ * A fixed rhythm ("question every third step") is the obvious implementation and
+ * the wrong one: it asks a confident student the same number of questions as a
+ * struggling one, and it asks them at step 3 whether or not anything worth
+ * asking about has been taught yet. The decision belongs where the evidence is —
+ * at the gap, with the record of how the student has actually been answering.
+ *
+ * The pedagogy this encodes (and why those numbers)
+ * -------------------------------------------------
+ *  - Retrieval practice: being made to RECALL beats being shown again, and the
+ *    benefit holds for transfer, not just memorisation. So the question is the
+ *    teaching, not a test bolted on after it.
+ *  - The ~85% success band: learning is fastest when the learner is getting
+ *    roughly 85% right — too easy teaches nothing, too hard costs confidence
+ *    and, in the retrieval literature, stops producing any memory benefit at
+ *    all. That band is what `difficulty` is steering towards, and it is why a
+ *    run of correct answers must be answered by a HARDER question rather than
+ *    more of the same.
+ *  - Desirable difficulty, with the caveat: harder is better only while it stays
+ *    achievable. A student who is getting things wrong does not need a stretch
+ *    question; they need an easier one they can succeed at, because the point is
+ *    to rebuild the ground under them, not to measure the hole.
+ *  - Spacing: questions spread through the lesson beat a cluster at the end, and
+ *    the two effects are roughly additive with retrieval. Hence the pressure to
+ *    ask at all once a few steps have gone by unasked.
+ * The 85% figure comes from machine and animal learning and is an extrapolation
+ * to a human classroom, so it is written here as a target to steer by, not a
+ * constant to enforce.
+ */
+export function buildCheckpointPrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  plan: LessonPlan;
+  step: number;
+  record?: LessonRecord | null;
+  familiarity?: "new" | "some" | "confident" | null;
+}): string {
+  const base = buildSystemPrompt(opts);
+  const { plan, step } = opts;
+  const lang = languageLabel(opts.language);
+  const done = plan.steps.slice(0, step + 1);
+  const current = plan.steps[step];
+  const isLast = step >= plan.steps.length - 1;
+  const fam = opts.familiarity
+    ? `They told you at the start that this topic is ${opts.familiarity === "new" ? "NEW to them" : opts.familiarity === "some" ? "something they have SEEN but are shaky on" : "something they are CONFIDENT with"}.`
+    : "";
+  // Worked out from the record in code, not left to the model — see nextDifficulty.
+  const level = nextDifficulty(opts.record, opts.familiarity);
+  const prev = opts.record?.recent?.[opts.record.recent.length - 1];
+  const why =
+    !opts.record?.lastDifficulty || !prev
+      ? "nothing has been asked yet"
+      : prev === "correct"
+        ? `they got the last "${opts.record.lastDifficulty}" question RIGHT, so this steps up`
+        : prev === "wrong"
+          ? `they got the last "${opts.record.lastDifficulty}" question WRONG, so this steps down`
+          : `they got the last "${opts.record.lastDifficulty}" question only partly right, so this holds the level`;
+  const difficultyLine = `If you ask anything, it MUST be at difficulty "${level}" — ${why}.`;
+
+  return `${base}
+
+---
+
+# RIGHT NOW: YOU ARE NOT TEACHING — YOU ARE DECIDING WHAT TO DO NEXT
+Everything above is who you are and how you teach. This turn you do NOT teach, draw or speak a lesson: you make ONE decision and return it as JSON.
+
+A step of the lesson has just finished and the student is sitting there. You can either let the lesson carry on, or stop and ask them a real question about what was just taught.
+
+# THE LESSON SO FAR
+Topic: ${plan.topic || "(as discussed)"}
+Steps taught up to now:
+${done.map((s, i) => `${i + 1}. ${s.title}`).join("\n")}
+Just finished: step ${step + 1} of ${plan.steps.length} — "${current?.title ?? ""}"${current?.teach ? ` (${current.teach})` : ""}
+Still to come:
+${plan.steps.slice(step + 1).map((s, i) => `${step + i + 2}. ${s.title}`).join("\n") || "(nothing — this was the last step)"}
+${fam}
+
+${recordBlock(opts.record)}
+
+# HOW TO DECIDE — read this properly, it is the whole job
+There is NO fixed rhythm. Do not ask every second step, or every third, or on any schedule. You are a teacher reading the room, and the only question is: right now, for THIS student, does asking something teach them more than carrying on would?
+
+What should push you towards ASKING:
+- Several steps have gone by without a question. Questions spread through a lesson are worth far more than a pile of them at the end.
+- Something has just been taught that can actually be USED — a formula, a rule, a method, a test. A question about a usable thing is teaching; a question about a definition they heard ten seconds ago is a quiz.
+- The student has been getting things right. That is the signal to ask MORE and ask HARDER, not to leave them alone — a student who is cruising is learning slowly.
+- The basics of this chapter are now in place. Early on, when you are still laying foundations, teaching uninterrupted is right. Once there is something to build with, questions become the better use of the minute.
+- You can ask MORE THAN ONE question about the same step, one after another, if the step is rich enough to deserve it and they are answering well. A meaty worked method can carry two or three.
+
+What should push you towards CONTINUING:
+- Nothing usable has been taught yet — the step was pure intuition, a hook, or setting up notation. Asking here just interrupts.
+- You asked a question very recently and they answered it. Let the teaching breathe.
+- They are struggling: several wrong answers, or several doubts in a row. Another question on top of that is pressure, not practice. Teach, let them recover, and come back to asking once they have had a success.
+- This was the last step and the lesson is about to close on practice anyway.
+
+# HOW HARD TO MAKE IT — ALREADY DECIDED FOR YOU
+${difficultyLine}
+
+Why that level: the aim is to keep the student succeeding about four times out of five. A question they are certain to get right teaches nothing, and one they cannot touch costs them confidence and teaches nothing either — so the level steps up after a success and down after a miss, which is what the line above has done for you from the record.
+If you ask, use EXACTLY that level and put it in "difficulty". Do not pick a different one.
+
+What the level means for the question you write:
+- "recall"  — say back a fact, a term, a formula, a condition just taught.
+- "apply"   — use what was just taught on one small new case. Numbers they can do in their head. NOT a definition they can repeat.
+- "stretch" — join two ideas, spot which method a case needs, or handle a case that looks different on the surface but is the same underneath.
+
+# THE QUESTION ITSELF
+- ONE question. Short enough to say in a breath, and answerable out loud in a sentence — this is spoken, and the student answers by speaking.
+- About what was JUST taught (or an earlier step it genuinely builds on). Never about something still to come.
+- It must have a definite answer you can check. Not "what do you think about quadratics?" — "in x² + 5x + 6, what is b?"
+- Use the numbers and notation already on the board where you can, so they can look at it while they think.
+- Write it in ${lang}, exactly as you would say it out loud: natural, warm, no markdown, no LaTeX, no "Question 1:".
+- Give the answer you are looking for in "expected", short and plain. It is never shown to the student.
+- "why" is one short line of YOUR OWN reasoning about the record and the step — not a claim about things the student did. You only know what is written above: do not say they "have practised several examples" or "seem comfortable" unless the record actually shows it.
+
+# OUTPUT (STRICT)
+Ignore the NDJSON beat format described above — that is for teaching turns, and this is not one. Return ONE JSON object and nothing else. No prose, no markdown fences, no beats.
+To carry on teaching:
+{"action":"continue","why":"<short reason>"}
+To ask:
+{"action":"ask","question":"<what you will say, in ${lang}>","difficulty":"recall|apply|stretch","expected":"<the answer you want>","why":"<short reason>"}
+${isLast ? 'This was the LAST step, so "continue" is almost always right — the lesson closes on its own practice offer.' : ""}
+First character of your reply: {`;
+}
+
+/**
+ * Grading prompt. The student has answered a checkpoint question out loud;
+ * decide whether they got it and write the one line to say back.
+ *
+ * Kept separate from the asking prompt, and pointed at the fast model, because
+ * this one is in the student's way: they have just spoken and are waiting to
+ * hear whether they were right. It is a small, closed judgement — question,
+ * expected answer, what they said — so it does not need the reasoning model.
+ */
+export function buildGradePrompt(opts: {
+  language: string;
+  profile: string;
+  grade?: Grade | null;
+  subject?: SubjectId | null;
+  plan?: LessonPlan | null;
+  step?: number;
+  question: string;
+  expected?: string;
+  record?: LessonRecord | null;
+}): string {
+  const base = buildSystemPrompt(opts);
+  const lang = languageLabel(opts.language);
+  const stepTitle = opts.plan && opts.step != null ? opts.plan.steps[opts.step]?.title : null;
+
+  return `${base}
+
+---
+
+# RIGHT NOW: MARK ONE SPOKEN ANSWER
+You do NOT teach, draw or speak a lesson this turn. You asked the student a question, they answered out loud, and you return ONE JSON object judging it.
+
+${stepTitle ? `What had just been taught: "${stepTitle}"\n` : ""}You asked: ${opts.question}
+The answer you were looking for: ${opts.expected || "(not recorded — judge it on the mathematics/science)"}
+
+# MARK ONLY WHAT WAS ASKED
+Before anything else: the question asked for ONE thing. Judge ONLY that thing.
+- If the answer contains the right value for what was asked, it is "correct" — even if the student also volunteered other values, and even if one of those extras is wrong or irrelevant. Asked for b, told "b is 5 and c is 6": b IS 5, so that is correct.
+- Do NOT solve the problem yourself and compare. Do not work out the roots, run the formula, or check anything the question did not ask for. The answer you were given above is the thing to compare against; your job is to match, not to re-derive.
+- Do NOT mark down an answer for being incomplete about something that was never asked.
+
+# HOW TO MARK IT
+Be fair and be generous about FORM, strict about SUBSTANCE. This was spoken aloud and transcribed, so:
+- Judge the mathematics, not the wording. "b squared minus four a c", "b^2-4ac" and "four a c subtracted from b squared" are the same correct answer.
+- Transcription mangles symbols and numbers. If what they said is clearly the right idea with a transcription slip, that is "correct".
+- A right answer arrived at out loud in a clumsy order is still right.
+- But a right-sounding answer with the wrong value, the wrong sign or the wrong condition is NOT right. Do not wave through an answer that is actually wrong — a student told they were right when they were not has learned the wrong thing, which is worse than being corrected.
+- "I don't know", silence, or an answer about something else is "wrong". That is not a failure on their part; it tells you to teach it again.
+
+The three verdicts:
+- "correct" — they have it.
+- "partial" — the idea is there but something is missing or slipped: right method, arithmetic wrong; right formula, forgot a condition; half the answer.
+- "wrong"   — they do not have it, or could not answer.
+
+# WHAT TO SAY BACK ("say")
+AT MOST two short sentences, in ${lang}, spoken warmly, exactly as you would say them out loud. No markdown, no LaTeX, no "Verdict:".
+This is a reply, not a lesson. Do NOT work the problem through, do NOT show a derivation, do NOT bring in the quadratic formula or anything else the question did not ask about. If a longer explanation is genuinely needed, that is what "reteach" is for — set it and say your two sentences.
+- correct: tell them they got it and say the answer back once so it lands. Brief — do not lecture a student who was right.
+- partial: say what they DID get first, then the piece that was missing, then the right answer. Never start with what was wrong.
+- wrong: no blame, ever. Give the answer, and the one sentence of reason that makes it make sense. Treat it as your turn to explain better, not their turn to feel bad.
+- Never sarcastic, never disappointed, never "as I just said".
+
+# "reteach"
+Set true ONLY when the miss means the lesson should not simply move on — they have misunderstood the idea itself, not fumbled a number, and the next steps will build on the thing they just got wrong. Then the point is explained again properly before teaching continues.
+Set false for a correct answer, for a small slip, and for a wrong answer that your one-line correction has already fixed.
+
+# OUTPUT (STRICT)
+Ignore the NDJSON beat format above. Return ONE JSON object and nothing else — no prose, no fences, no beats:
+{"verdict":"correct|partial|wrong","say":"<what you say out loud, in ${lang}>","reteach":true|false}
+First character of your reply: {`;
 }
 
 /**

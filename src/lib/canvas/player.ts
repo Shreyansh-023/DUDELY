@@ -29,9 +29,9 @@ import { expandMathText } from "./primitives/mathline";
 import {
   CLEARANCE,
   CONTENT_BOTTOM,
+  HEADING_GAP,
   CONTENT_TOP,
   FIT_MARGIN,
-  MIN_STEP_ROOM,
   MIN_TURN_ROOM,
   PAGE_H,
   PAGE_W,
@@ -159,17 +159,23 @@ export class BoardPlayer {
    * column and never into a doubt's page beside it.
    * `stayOnPage` keeps the reply beside work the student just drew.
    *
-   * `newStep` begins a new lesson step. A step is a new subtopic, so it starts a
-   * fresh page when the current one is too full to hold one — but it SHARES the
-   * page when there is real room left, which is what stops a three-line step
-   * from burning a whole sheet. The threshold is MIN_STEP_ROOM rather than a
-   * turn's MIN_TURN_ROOM because a step carries a title and several lines.
+   * `newStep` begins a new lesson step, and ALWAYS on a fresh page: one
+   * subtopic never starts half-way down the page another one ends on. Each step
+   * is written under its own numbered heading (see `drawStepHeading` below),
+   * and a heading that appears mid-page reads as a divider rather than a title —
+   * so the page break is what makes the heading mean anything.
    *
-   * Sharing is safe even though the step was generated against a blank-page
-   * description: `applyBeat` measures each beat, collision-pushes it below what
-   * is already on the page, and spills it onto a fresh page when it genuinely
-   * does not fit. The page a step lands on is therefore decided here at
-   * playback time, never at generation time.
+   * A step is free to take MORE than one page: `applyBeat` measures every beat,
+   * collision-pushes it below what is already on the page, and spills it onto a
+   * fresh page when it genuinely does not fit. Those spill pages carry no
+   * heading of their own, so a long subtopic reads as one continuous stretch
+   * under the one heading it started with. Steps therefore vary in length, which
+   * is the point: an intuition hook is short, a worked example is not.
+   *
+   * This used to share a page when ~300px was left, to stop a three-line
+   * step burning a whole sheet. That tradeoff no longer holds: steps are longer
+   * now (4-8 beats) so the saving was small, and it cost the one-page-one-idea
+   * structure the headings depend on.
    *
    * `freshPage` opts out of sharing entirely: the turn gets a clean sheet even
    * if the current page has room. A solved question needs this. Its first beat
@@ -196,9 +202,10 @@ export class BoardPlayer {
       this.emit();
       return;
     }
-    const need = opts?.newStep ? MIN_STEP_ROOM : MIN_TURN_ROOM;
+    // A new step never shares: it opens its own page under its own heading.
     const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
-    const share = Boolean(cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= need);
+    const share =
+      !opts?.newStep && Boolean(cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_TURN_ROOM);
     // A step that shares a page was written as if the page were blank, so its
     // first beat starts around CONTENT_TOP. Drop the whole step to just below
     // what is already there, with a wider gap than the CLEARANCE used between
@@ -329,16 +336,16 @@ export class BoardPlayer {
   }
 
   /**
-   * The page `beginTeachTurn({ newStep: true })` would start on RIGHT NOW. The
-   * staged lesson reads it only to number the page in the canvas header a step
-   * is generated against; the page it truly lands on is chosen at playback
-   * time, by which point the step above it may have left room to share. So this
-   * is a prediction, and deliberately matches the sharing rule rather than
-   * always reporting a fresh page.
+   * The page `beginTeachTurn({ newStep: true })` would start on RIGHT NOW.
+   *
+   * Always a fresh page, matching `beginTeachTurn`: a step no longer shares the
+   * page above it. The staged lesson reads this only to number the page in the
+   * canvas header a step is generated against, and it is still a lower bound
+   * rather than a promise — a step that spills onto a second page pushes every
+   * later step down with it, so the real book ends up longer than the count
+   * predicted here, never shorter.
    */
   nextTeachPage(): number {
-    const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
-    if (cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_STEP_ROOM) return cur.index;
     return this.freshTeachSlot().index;
   }
 
@@ -727,6 +734,30 @@ export class BoardPlayer {
    * of the same kind, re-anchored at that page's top — so a long doubt simply
    * continues on the next page instead of folding back over its own content.
    */
+  /**
+   * Write a step's heading at the very top of its page, then reserve the band
+   * it occupies so the step's own beats start underneath it.
+   *
+   * The order is the whole point and cannot be split by the caller: the heading
+   * is laid out at the page's true top (anchor 0), and only once it is down is
+   * the anchor moved below it. Setting the anchor first would push the heading
+   * down with everything else; drawing the heading and hoping collision
+   * avoidance moves the body is what put the first line of working straight
+   * through the title.
+   */
+  async drawStepHeading(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
+    this.pageAnchorDy = 0;
+    const created = await this.applyBeat(ops, turn, signal);
+    if (!created.length) return created;
+    const page = this.pages[this.activeIndex];
+    if (!page) return created;
+    // `page.bottom` is page-local and was just updated with the rule's real,
+    // post-layout bottom edge — so this reserves exactly what was drawn rather
+    // than a guess at how tall a heading is.
+    this.pageAnchorDy = Math.max(0, page.bottom + HEADING_GAP - CONTENT_TOP);
+    return created;
+  }
+
   async applyBeat(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
     this.currentTurn = turn;
     // Lay nothing out until the board font can be measured: on a cold page
