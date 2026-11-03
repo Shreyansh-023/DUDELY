@@ -34,6 +34,10 @@ export type PdfPage = { index: number; kind: "teach" | "doubt"; label: string };
 
 /** The subset of Excalidraw's `exportToCanvas` this module uses. Passed in by
  *  the caller so the Excalidraw bundle is only pulled in where it already is. */
+/** Excalidraw's own bounds helper: [x1, y1, x2, y2] over a set of elements,
+ *  extents included. Passed in with `exportToCanvas` for the same reason. */
+export type GetCommonBounds = (elements: readonly ExcalidrawElement[]) => readonly [number, number, number, number];
+
 export type ExportToCanvas = (opts: {
   elements: readonly ExcalidrawElement[];
   appState?: Record<string, unknown>;
@@ -68,16 +72,40 @@ async function renderPage(
   player: BoardPlayer,
   index: number,
   exportToCanvas: ExportToCanvas,
+  getCommonBounds: GetCommonBounds,
 ): Promise<string | null> {
-  const elements = player.pageElements(index);
-  if (!elements.length) return null;
+  const raw = player.pageElements(index);
+  if (!raw.length) return null;
+
+  // Export the FULL text of every line, not whatever the typewriter had got to.
+  //
+  // `typeText` animates a line in by patching `text` one chunk at a time, and
+  // it `break`s out of that loop when the turn is aborted — a doubt, a new
+  // topic, the student pressing stop. The element is then left holding the
+  // partial string permanently, and exporting it produced pages of lines cut
+  // off mid-word ("2. Identifying quadratic equatio"). `originalText` is the
+  // line as the model wrote it, so restoring from it is also a repair: the PDF
+  // comes out complete even where the board on screen is not.
+  const elements = raw.map((e) => {
+    if (e.type !== "text") return e;
+    const t = e as ExcalidrawElement & { text?: string; originalText?: string };
+    const full = t.originalText;
+    const shown = t.text ?? "";
+    if (!full || full === shown) return e;
+    // The stored `width` was measured against the truncated string, and the
+    // bounds pass below reads it. Widening it in proportion to the characters
+    // being restored keeps the crop box around the line that will actually be
+    // drawn. It is an estimate — Excalidraw re-measures the glyphs itself when
+    // it renders — but it only ever errs wide, and a crop box slightly too
+    // large costs nothing while one too small clips the line again.
+    const grow = shown.length > 0 ? full.length / shown.length : 1;
+    return { ...t, text: full, width: e.width * grow } as ExcalidrawElement;
+  });
 
   // `exportToCanvas` crops to the elements' own bounding box; it has no notion
-  // of our pages. So the page frame is restored here instead: the content is
-  // drawn back at its PAGE-LOCAL offset on a full 1280x720 page, which keeps
-  // every sheet the same size and keeps the lesson's own margins. Without this,
-  // a page holding one short line would export as a tiny tight crop and the PDF
-  // would be a run of mismatched images.
+  // of our pages. So the page frame is restored here: the crop is drawn back at
+  // its PAGE-LOCAL position on a full 1280x720 sheet, which keeps every page
+  // the same size and keeps the lesson's own margins.
   const rect = player.pageSceneRect(index);
   const src = await exportToCanvas({
     elements,
@@ -86,15 +114,19 @@ async function renderPage(
     appState: { exportBackground: false, viewBackgroundColor: "transparent" },
     getDimensions: (w, h) => ({ width: w, height: h, scale: RASTER_SCALE }),
   });
-  // Where that crop sits inside the page, in page-local coordinates.
-  let minX = Infinity;
-  let minY = Infinity;
-  for (const e of elements) {
-    minX = Math.min(minX, e.x);
-    minY = Math.min(minY, e.y);
-  }
-  const offX = (Number.isFinite(minX) ? minX - rect.x : 0) * RASTER_SCALE;
-  const offY = (Number.isFinite(minY) ? minY - rect.y : 0) * RASTER_SCALE;
+
+  // Where that crop sits inside the page.
+  //
+  // `getCommonBounds` — the same helper the player uses for page.bottom — and
+  // NOT a min() over e.x/e.y. Element extents matter: a wide heading starting
+  // right of a short line still sets the crop's right edge, and a bounds box
+  // measured from origins alone is wrong the moment the leftmost element is not
+  // also the widest. Getting this wrong shifts the whole page sideways and
+  // pushes its right-hand content off the sheet, which is exactly how a PDF ends
+  // up full of lines cut off mid-word.
+  const [bx1, by1] = getCommonBounds(elements);
+  const offX = (bx1 - rect.x) * RASTER_SCALE;
+  const offY = (by1 - rect.y) * RASTER_SCALE;
 
   // The page, at raster scale, on white.
   const page = document.createElement("canvas");
@@ -104,7 +136,18 @@ async function renderPage(
   if (!pctx) return null;
   pctx.fillStyle = "#ffffff";
   pctx.fillRect(0, 0, page.width, page.height);
-  pctx.drawImage(src, offX, offY);
+
+  // Anything that would fall outside the page is a layout escape, not something
+  // to crop away: a beat that ran past CONTENT_RIGHT, or a diagram the collision
+  // pass nudged over the edge. Scale the crop down to fit rather than lose it —
+  // a slightly smaller page reads fine, a page missing the end of every line
+  // does not.
+  const fit = Math.min(1, page.width / (offX + src.width), page.height / (offY + src.height));
+  if (fit < 1) {
+    pctx.drawImage(src, offX * fit, offY * fit, src.width * fit, src.height * fit);
+  } else {
+    pctx.drawImage(src, offX, offY);
+  }
 
   // Letterbox the 16:9 page onto the ~1.41:1 sheet. Centred and aspect-true:
   // a formula stretched 6% horizontally looks wrong in a way that is hard to
@@ -239,6 +282,8 @@ function fileStem(title: string): string {
 export async function downloadBoardPdf(opts: {
   player: BoardPlayer;
   exportToCanvas: ExportToCanvas;
+  /** Excalidraw's `getCommonBounds`, for locating each page's crop. */
+  getCommonBounds: GetCommonBounds;
   /** Used for the file name and the PDF title. */
   topic?: string | null;
   onProgress?: (done: number, total: number) => void;
@@ -251,7 +296,7 @@ export async function downloadBoardPdf(opts: {
     opts.onProgress?.(i, list.length);
     let url: string | null = null;
     try {
-      url = await renderPage(opts.player, list[i].index, opts.exportToCanvas);
+      url = await renderPage(opts.player, list[i].index, opts.exportToCanvas, opts.getCommonBounds);
     } catch {
       // One unrenderable page must not lose the other eleven.
       url = null;

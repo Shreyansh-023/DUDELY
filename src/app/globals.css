@@ -63,6 +63,15 @@ body {
   display: none !important;
 }
 
+/* Excalidraw's own right-click menu. BoardMenu already swallows the gesture in
+   the capture phase, so this should never have anything to hide — it is the
+   backstop for the paths that do not go through that listener (Excalidraw's own
+   long-press timer on touch devices, for one). Without it, its menu opened
+   underneath ours and showed through the translucent panel. */
+.excalidraw .context-menu {
+  display: none !important;
+}
+
 /* No zoom controls (− 100% +): the board frames itself and the UI stays clean. */
 .excalidraw .zoom-actions {
   display: none !important;

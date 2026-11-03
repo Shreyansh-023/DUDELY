@@ -63,7 +63,10 @@ export default function BoardMenu({
         role="menu"
         aria-label="Board options"
         style={{ left: Math.max(12, left), top: Math.max(12, top), width: W }}
-        className="fixed z-50 overflow-hidden rounded-2xl border border-neutral-200 bg-white/95 shadow-2xl ring-1 ring-black/5 backdrop-blur-sm"
+        // Fully opaque, not bg-white/95: a translucent panel let whatever sat
+        // behind it read through, which is how Excalidraw's own menu became
+        // visible under ours in the first place.
+        className="fixed z-50 overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-2xl ring-1 ring-black/5"
       >
         <div className="border-b border-neutral-100 bg-neutral-50/80 px-3.5 py-2">
           <p className="text-[11px] font-semibold uppercase tracking-wider text-neutral-500">Save your notes</p>
@@ -158,11 +161,29 @@ export function useBoardMenu() {
       t instanceof Element && !!t.closest(".excalidraw") && !t.closest("button,[role=menu],[role=dialog]");
 
     const onDbl = (e: MouseEvent) => {
-      if (onCanvas(e.target)) show(e.clientX, e.clientY);
+      if (!onCanvas(e.target)) return;
+      // Excalidraw treats a double-click on the canvas as "start editing text
+      // here". The board is in view mode so no editor should appear, but the
+      // gesture is ours now either way — swallow it rather than rely on that.
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      show(e.clientX, e.clientY);
     };
     const onCtx = (e: MouseEvent) => {
       if (!onCanvas(e.target)) return;
-      e.preventDefault(); // a two-finger tap should open OUR menu, not the browser's
+      // Three separate suppressions, because three different things want to
+      // open a menu on this gesture:
+      //  - preventDefault: the BROWSER's own context menu.
+      //  - stopPropagation + stopImmediatePropagation: EXCALIDRAW's. It binds
+      //    `handleCanvasContextMenu` on the canvas itself, so preventing the
+      //    default does nothing to it — its menu opened anyway and showed
+      //    through ours. This listener runs in the CAPTURE phase (see the
+      //    addEventListener below), which is the only way to get in front of a
+      //    handler attached further down the tree.
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
       show(e.clientX, e.clientY);
     };
     const onTouch = (e: TouchEvent) => {
@@ -181,13 +202,16 @@ export function useBoardMenu() {
       } else lastTap = now;
     };
 
-    window.addEventListener("dblclick", onDbl);
-    window.addEventListener("contextmenu", onCtx);
-    window.addEventListener("touchstart", onTouch, { passive: true });
+    // Capture phase (the `true`): these have to run BEFORE the handlers
+    // Excalidraw attaches inside the canvas, or its own menu is already open by
+    // the time ours is asked for.
+    window.addEventListener("dblclick", onDbl, true);
+    window.addEventListener("contextmenu", onCtx, true);
+    window.addEventListener("touchstart", onTouch, { passive: true, capture: true });
     return () => {
-      window.removeEventListener("dblclick", onDbl);
-      window.removeEventListener("contextmenu", onCtx);
-      window.removeEventListener("touchstart", onTouch);
+      window.removeEventListener("dblclick", onDbl, true);
+      window.removeEventListener("contextmenu", onCtx, true);
+      window.removeEventListener("touchstart", onTouch, true);
     };
   }, []);
 

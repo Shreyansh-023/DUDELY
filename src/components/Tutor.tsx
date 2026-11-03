@@ -1162,7 +1162,14 @@ export default function Tutor() {
       // before — there the interruption is the point.
       const parked = turnRef.current;
       if (parked && parked.signal === signal) turnRef.current = null;
-      openMicRef.current();
+      // The mic opens ONLY for a real question, where the answer has to be
+      // spoken. The plain gate is answered by its two buttons, and opening the
+      // mic alongside them says two contradictory things at once: it asks the
+      // student to speak while showing them what to press, and then has to
+      // guess which of the two they meant. The buttons exist precisely so that
+      // nothing has to be guessed — see `isCheckpointClear`, which got "no, we
+      // can move forward" wrong because of the comma.
+      if (asking) openMicRef.current();
       await done;
       setGateOpen(false);
       signal.removeEventListener("abort", release);
@@ -1964,7 +1971,17 @@ export default function Tutor() {
   }, []);
   /** Is the lesson parked at a between-step checkpoint, waiting to be answered?
    *  The voice loop opens the mic by itself when it is (see `autoListen`). */
-  const atCheckpoint = useCallback(() => lessonRef.current.phase === "checkpoint", []);
+  /**
+   * Should the mic open by itself right now?
+   *
+   * Only at a checkpoint that asked a REAL question, where the answer has to be
+   * spoken. The plain "any doubt?" gate is answered by its two buttons, and a
+   * live mic beside them is the app asking and telling at the same time.
+   */
+  const atCheckpoint = useCallback(
+    () => lessonRef.current.phase === "checkpoint" && pendingQuestionRef.current != null,
+    [],
+  );
 
   // Hands-free conversation loop for voice mode: greets, listens, end-points
   // the student's sentence, submits it, and listens again after each turn.
@@ -2380,6 +2397,7 @@ export default function Tutor() {
       const res = await downloadBoardPdf({
         player: b.player,
         exportToCanvas: mod.exportToCanvas as Parameters<typeof downloadBoardPdf>[0]["exportToCanvas"],
+        getCommonBounds: mod.getCommonBounds as Parameters<typeof downloadBoardPdf>[0]["getCommonBounds"],
         topic: lessonRef.current.topic || solveRef.current.question,
         onProgress: (done, total) => setPdfBusy(`Preparing page ${Math.min(done + 1, total)} of ${total}…`),
       });
@@ -2715,11 +2733,16 @@ export default function Tutor() {
                 {/* The checkpoint gate: two buttons for a two-way question.
                     Offered only for the plain "any doubt?" — a real recall
                     question is answered in the student's own words, where a
-                    Yes/No pair would mean nothing. The mic is open at the same
-                    time, so speaking still works; this is the escape from having
-                    to parse what was spoken. */}
+                    Yes/No pair would mean nothing.
+                    The mic stays SHUT while these are up. Opening it alongside
+                    them asked the student to speak and showed them what to
+                    press at the same time, and then had to guess which they
+                    meant; the buttons exist so that nothing is guessed.
+                    They sit where the caption strip normally is — centred, low
+                    on the stage — because that is where the student is already
+                    looking when Indica stops talking. */}
                 {gateOpen && (
-                  <div className="absolute bottom-5 left-4 z-20 flex items-center gap-2.5 md:bottom-6 md:left-6">
+                  <div className="absolute inset-x-4 bottom-24 z-30 flex flex-wrap items-center justify-center gap-2.5 md:bottom-16">
                     <button
                       type="button"
                       onClick={gateNoDoubt}
@@ -2825,7 +2848,11 @@ export default function Tutor() {
                   </div>
                 )}
 
-                {!showSpeechBox && (voice.voiceCaption || liveCaption || awaitingAnswer || stripStatus) && (
+                {/* `!gateOpen`: the gate's buttons stand where this strip does,
+                    and the strip's only message at that moment would be the
+                    "press Enter, then speak" hint — advice for a mic that is
+                    deliberately shut. */}
+                {!showSpeechBox && !gateOpen && (voice.voiceCaption || liveCaption || awaitingAnswer || stripStatus) && (
                   <div className="pointer-events-none absolute inset-x-4 bottom-4 z-20 flex justify-center">
                     <div
                       aria-live="polite"
