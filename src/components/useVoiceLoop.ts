@@ -118,6 +118,8 @@ export function useVoiceLoop(deps: Deps): {
   /** Throw the transcript away and listen again. */
   retryReview: () => void;
   resume: () => void;
+  /** Go to "awaiting" without opening the mic. */
+  standBy: () => void;
   pause: () => void;
   /** Open the mic now — called when the student presses Enter in the "awaiting" phase. */
   listen: () => void;
@@ -621,6 +623,18 @@ export function useVoiceLoop(deps: Deps): {
     setPhase("paused");
   }, [cancelCapture, setPhase]);
 
+  // Hand the floor back without opening the mic: settle on "awaiting" so the
+  // student presses Enter when they're ready (e.g. returning from the keyboard).
+  const standBy = useCallback(() => {
+    if (!depsRef.current.enabled) return;
+    genRef.current += 1;
+    cancelCapture();
+    autoContinueRef.current = 0;
+    setReview("");
+    depsRef.current.setError(null);
+    setPhase("awaiting");
+  }, [cancelCapture, setPhase]);
+
   return {
     phase,
     voiceCaption,
@@ -629,6 +643,7 @@ export function useVoiceLoop(deps: Deps): {
     sendReview,
     retryReview,
     resume,
+    standBy,
     pause,
     listen,
     listenForAnswer,
