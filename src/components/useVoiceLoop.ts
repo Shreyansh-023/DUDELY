@@ -24,7 +24,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
-import { voicePrompts } from "@/lib/languages";
+import { trackGreeting, voicePrompts } from "@/lib/languages";
 import { Recorder, browserSttAvailable, recognizeBrowser, transcribeOnServer } from "@/lib/voice/stt";
 import { LiveTranscriber, liveSttUnavailable, relayUrl } from "@/lib/voice/live-stt";
 import { fetchSpeech, playBlob, speakBrowser } from "@/lib/voice/tts";
@@ -60,6 +60,12 @@ const MAX_AUTO_CONTINUE = 8;
 /** Browser STT: abort if not even an interim result arrives within this window. */
 const NO_INTERIM_TIMEOUT_MS = 5000;
 /**
+ * How many times a silent checkpoint reopens the mic before it gives up and
+ * waits for a keypress instead. A student who is thinking gets another go; a
+ * muted or refused mic stops being re-prompted into.
+ */
+const MAX_CHECKPOINT_RETRIES = 2;
+/**
  * How long "Transcribing…" stays up at minimum. The browser recogniser hands
  * back its final text the instant it endpoints, so without a floor the state
  * would flash past in a frame and read as a glitch rather than a step.
@@ -74,12 +80,29 @@ type Deps = {
   ask: (text: string) => void;
   /** True when the last turn ended on a statement and Guru should keep teaching. */
   shouldContinue: () => boolean;
+  /**
+   * True while Guru is waiting on an answer it asked for out loud and the mic
+   * should open by itself — the lesson's between-step checkpoints.
+   *
+   * The loop's usual ending for a question is "awaiting": the floor goes back to
+   * the student but the mic stays shut until they press Enter, which is right
+   * for a question they may want to think about or type. A checkpoint is the
+   * opposite — it is asked after every single step, and making the student reach
+   * for a key eight times a lesson to say "no, carry on" is precisely the
+   * friction the checkpoint exists to remove. So this one opens the mic.
+   */
+  autoListen: () => boolean;
   /** Ask the model to teach the next small step (a hidden, unspoken-by-student turn). */
   continueLesson: () => void;
   setInterim: (t: string) => void;
   setError: (e: string | null) => void;
   configRef: RefObject<Config | null>;
   languageRef: RefObject<string>;
+  /** Which pipeline the student picked, so the greeting asks for the right
+   *  thing: a topic in study mode, a question in a question session. Null only
+   *  before a pick, which the greeting never sees — the voice stage opens
+   *  because a mode was chosen — so it falls back to the study wording. */
+  trackRef: RefObject<"learn" | "solve" | null>;
 };
 
 export function useVoiceLoop(deps: Deps): {
@@ -98,6 +121,18 @@ export function useVoiceLoop(deps: Deps): {
   pause: () => void;
   /** Open the mic now — called when the student presses Enter in the "awaiting" phase. */
   listen: () => void;
+  /**
+   * Open the mic for an answer Guru has just finished asking for out loud — the
+   * lesson's between-step checkpoints.
+   *
+   * Separate from `listen` because it forces past the "a turn is still playing"
+   * gate. The caller has just spoken the question itself and is holding the
+   * lesson still until the answer arrives, so the gate's premise — that
+   * something is mid-flight and the mic would be talking over it — is already
+   * false; and `deps.status` is a render away from catching up, so leaving the
+   * decision to the gate turns the mic on or off by luck.
+   */
+  listenForAnswer: () => void;
   /** Interrupt Guru and start listening immediately — the Doubt button. */
   bargeIn: () => void;
   /** Close the utterance now and transcribe it — the stop button on the waveform. */
@@ -131,6 +166,9 @@ export function useVoiceLoop(deps: Deps): {
   const browserRecRef = useRef<{ stop: () => void; abort: () => void } | null>(null);
   const noInterimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoContinueRef = useRef(0);
+  /** Consecutive silent tries at the checkpoint currently waiting (see
+   *  MAX_CHECKPOINT_RETRIES). Reset whenever something is actually heard. */
+  const silentCheckpointsRef = useRef(0);
   const prevStatusRef = useRef<Status>("idle");
   const micLevelRef = useRef(0);
   const transcribeAtRef = useRef(0);
@@ -217,6 +255,7 @@ export function useVoiceLoop(deps: Deps): {
   const submit = useCallback(
     (text: string, gen: number) => {
       if (gen !== genRef.current) return;
+      silentCheckpointsRef.current = 0; // something was heard; the mic works
       const show = () => {
         if (gen !== genRef.current) return;
         // Swap the live caption for the reviewable text in one commit, so the box
@@ -258,7 +297,21 @@ export function useVoiceLoop(deps: Deps): {
     async (gen: number) => {
       if (gen !== genRef.current) return;
       await speakPrompt(voicePrompts(depsRef.current.languageRef.current).reprompt, gen);
-      if (gen === genRef.current) void listenOnceRef.current(gen); // → "awaiting" (needs Enter)
+      if (gen !== genRef.current) return;
+      // At a checkpoint the mic goes back up after the re-prompt rather than
+      // stopping at "awaiting". The lesson is parked on this answer and nothing
+      // else can move it along, so landing on a phase that needs a keypress
+      // would strand a hands-free student mid-lesson — the one place where
+      // "press Enter to speak" is not a safe resting state. Everywhere else it
+      // still is: the student asked for nothing and owes no answer.
+      //
+      // Bounded, because the reason for the silence may be a muted or refused
+      // mic, and reopening it forever would re-prompt into a void. After a
+      // couple of tries it settles on "awaiting" like any other question, where
+      // Enter (or the chat composer) is still a way through.
+      const retry = depsRef.current.autoListen() && silentCheckpointsRef.current < MAX_CHECKPOINT_RETRIES;
+      if (retry) silentCheckpointsRef.current += 1;
+      void listenOnceRef.current(gen, retry, retry);
     },
     [speakPrompt],
   );
@@ -439,7 +492,11 @@ export function useVoiceLoop(deps: Deps): {
     const gen = ++genRef.current;
     const greetFirst = !depsRef.current.hasConversation;
     if (greetFirst) {
-      void speakPrompt(voicePrompts(depsRef.current.languageRef.current).greeting, gen).then(() => {
+      const greeting = trackGreeting(
+        depsRef.current.languageRef.current,
+        depsRef.current.trackRef.current ?? "learn",
+      );
+      void speakPrompt(greeting, gen).then(() => {
         if (gen === genRef.current) void listenOnceRef.current(gen);
       });
     } else {
@@ -464,7 +521,9 @@ export function useVoiceLoop(deps: Deps): {
         depsRef.current.continueLesson(); // stays in "processing"; we land back here when it ends
       } else {
         autoContinueRef.current = 0;
-        void listenOnceRef.current(++genRef.current); // not immediate → "awaiting"
+        // A checkpoint asked its question out loud and is waiting on the answer:
+        // open the mic rather than stopping at "awaiting" for an Enter.
+        void listenOnceRef.current(++genRef.current, depsRef.current.autoListen());
       }
     } else if (
       (phase === "listening" ||
@@ -510,6 +569,17 @@ export function useVoiceLoop(deps: Deps): {
     setReview("");
     depsRef.current.setError(null);
     void listenOnceRef.current(++genRef.current, true);
+  }, []);
+
+  // A checkpoint has asked its question and the lesson is parked on the answer:
+  // open the mic straight away, forcing past the turn gate (see listenForAnswer).
+  const listenForAnswer = useCallback(() => {
+    if (!depsRef.current.enabled) return;
+    autoContinueRef.current = 0;
+    silentCheckpointsRef.current = 0; // a new checkpoint gets its own retries
+    setReview("");
+    depsRef.current.setError(null);
+    void listenOnceRef.current(++genRef.current, true, true);
   }, []);
 
   // The student tapped the Doubt button mid-lesson: whoever stopped Guru's turn,
@@ -561,6 +631,7 @@ export function useVoiceLoop(deps: Deps): {
     resume,
     pause,
     listen,
+    listenForAnswer,
     bargeIn,
     endUtterance,
     micLevelRef,

@@ -20,7 +20,15 @@ export type Board = {
   summarizeScene: typeof summarizeScene;
 };
 
-export default function Whiteboard({ onReady }: { onReady: (board: Board) => void }) {
+export default function Whiteboard({
+  onReady,
+  /** The lesson is being designed: the planning card covers this canvas, so
+   *  Excalidraw's "ask me anything" welcome screen must not show through it. */
+  planning = false,
+}: {
+  onReady: (board: Board) => void;
+  planning?: boolean;
+}) {
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<BoardPlayer | null>(null);
 
@@ -48,7 +56,7 @@ export default function Whiteboard({ onReady }: { onReady: (board: Board) => voi
   // background properties panel stay hidden and never cover the canvas. The
   // imperative API still works in view mode, so Guru draws normally.
   return (
-    <div ref={hostRef} className="h-full w-full">
+    <div ref={hostRef} className="h-full w-full" data-planning={planning ? "true" : undefined}>
     <Excalidraw
       viewModeEnabled
       excalidrawAPI={(api) => {
@@ -91,7 +99,7 @@ export default function Whiteboard({ onReady }: { onReady: (board: Board) => voi
               <LogoMark className="h-9 w-auto" />
             </span>
           </WelcomeScreen.Center.Logo>
-          <WelcomeScreen.Center.Heading>Ask Indica anything — type or talk. Indica explains here on the board.</WelcomeScreen.Center.Heading>
+          <WelcomeScreen.Center.Heading>Indica explains here on the board. Just talk — the microphone is already listening.</WelcomeScreen.Center.Heading>
         </WelcomeScreen.Center>
       </WelcomeScreen>
     </Excalidraw>

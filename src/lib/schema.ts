@@ -30,6 +30,7 @@ export const OPS = [
   "angle",
   "vector",
   "table",
+  "circles",
   "circuit",
   "optics",
   "molecule",
@@ -87,6 +88,10 @@ export const DrawOpSchema = z.object({
   // .catch keeps an op alive when the model picks a word outside the enum
   // (e.g. "yellow", "small"): it falls back to null and the consumer defaults it.
   size: z.enum(SIZES).nullish().catch(null).describe("Text size: sm=16px, md=24px (default), lg=36px."),
+  // Internal: set by the superscript/subscript expander, which needs the exact
+  // reduced size of an exponent rather than one of the three named sizes. The
+  // model never sets this; `size` stays the only text-size control it has.
+  px: z.number().nullish().catch(null).optional(),
   color: z.enum(COLORS).nullish().catch(null).describe("Stroke/text colour. Default black."),
   temp: z
     .boolean()
@@ -101,6 +106,13 @@ export const DrawOpSchema = z.object({
   min: z.number().nullish().catch(null).describe("numberline: smallest value on the line."),
   max: z.number().nullish().catch(null).describe("numberline: largest value on the line."),
   step: z.number().nullish().catch(null).describe("numberline: spacing between ticks (optional; auto-picked if omitted)."),
+  denominator: z
+    .number()
+    .nullish()
+    .catch(null)
+    .describe(
+      "numberline: teaching fractions? give the denominator (3 for thirds) and ticks land ON the fractions, labelled 1/3, 2/3 — instead of the default decimal 0.1…0.9 scale.",
+    ),
   marks: z
     .array(
       z.object({
@@ -145,6 +157,32 @@ export const DrawOpSchema = z.object({
     .nullish()
     .catch(null)
     .describe("bars: the bars [{label?, value, color?}]."),
+  // --- circles op (concentric) ---
+  radii: z
+    .array(z.number())
+    .nullish()
+    .catch(null)
+    .describe("circles: radius of each circle in px, sharing one centre (e.g. [140, 90, 45])."),
+  labels: z
+    .array(z.string())
+    .nullish()
+    .catch(null)
+    .describe("circles: label for each radius, in the same order as `radii`."),
+  colors: z
+    .array(z.enum(COLORS))
+    .nullish()
+    .catch(null)
+    .describe("circles: colour for each circle, in the same order as `radii`."),
+  radii_lines: z
+    .boolean()
+    .nullish()
+    .catch(null)
+    .describe("circles: draw a radius line from the centre to each circle (default false)."),
+  centre: z
+    .boolean()
+    .nullish()
+    .catch(null)
+    .describe("circles: draw the centre dot (default true)."),
   // --- fraction op ---
   parts: z.number().nullish().catch(null).describe("fraction: how many equal parts (denominator)."),
   shaded: z.number().nullish().catch(null).describe("fraction: how many parts are filled (numerator)."),
@@ -308,12 +346,43 @@ export const HistoryMessageSchema = z.object({
 export type HistoryMessage = z.infer<typeof HistoryMessageSchema>;
 
 /**
+ * Drop the second half of a bilingual step title.
+ *
+ * Asked for a title in the student's language, the planner sometimes supplies both
+ * languages joined by a slash — "Real-life hook / Quadratic Equations in daily life",
+ * and in the degenerate case "Standard form / Standard form". That reaches the board
+ * verbatim and reads as a bug to the student, so the first half is kept.
+ *
+ * Deliberately conservative: it fires only on a slash with spaces around it and only
+ * when both halves read as titles (several words, no further slashes). A real title
+ * with a slash in it — "and/or", "cm/s", "Regular vs diffuse / scattered" — keeps it.
+ */
+function stripTranslationPair(title: string): string {
+  const t = title.trim();
+  const parts = t.split(/\s+\/\s+/);
+  if (parts.length !== 2) return t;
+  const [first, second] = parts.map((p) => p.trim());
+  if (!first || !second) return t;
+  // The giveaway of a translation pair: both sides stand alone as a step title. A
+  // one-word tail ("Regular / diffuse") is a real title listing two things, not a
+  // translation — keep the whole thing.
+  const words = (s: string) => s.split(/\s+/).length;
+  if (words(second) < 2 && words(first) < 2) return t;
+  return first;
+}
+
+/**
  * A single step of a lesson plan, designed up front by the planner model
  * (Nemotron Ultra). The teaching model later turns one step into spoken beats +
  * board drawings. `draw` is a hint about what the board should show for the step.
  */
 export const LessonStepSchema = z.object({
-  title: z.string().describe("Short title of this step, e.g. 'Opening analogy' or 'Derive the quadratic formula'."),
+  title: z
+    .string()
+    .transform(stripTranslationPair)
+    .describe(
+      "Short title of this step, in the student's language and ONE language only, e.g. 'Opening analogy' or 'Derive the quadratic formula'. Never give the same title twice separated by '/' — write it once.",
+    ),
   teach: z.string().default("").describe("What to explain in this step, in a sentence or two."),
   draw: z.string().default("").describe("What the board should show for this step (a hint, not literal ops)."),
   roadmap: z
@@ -347,9 +416,112 @@ export type LessonPlan = z.infer<typeof LessonPlanSchema>;
  *   explain -> work a specific textbook item (example/exercise/theorem) the student
  *              named, as beats (Ultra), drawn on the MAIN canvas like normal teaching
  *   ask     -> legacy single-turn behaviour (no plan); the original tutor loop
+ *
+ * The SOLVE pipeline (track "solve") adds two more. It deliberately has no plan
+ * stage and no familiarity question — the student named a question, so the first
+ * turn already solves it:
+ *   solve      -> explain the solution to the question the student named, as beats,
+ *                 grounded on the solutions index. The question itself is written on
+ *                 the board deterministically (lib/question-board), not by the model.
+ *   solvedoubt -> a doubt raised mid-solution, on its own page, without restarting
+ *
+ * The between-step CHECKPOINT adds two more. Neither draws on the board — both
+ * return one small JSON object, not beats:
+ *   checkpoint -> decide what to do at the gap between two steps: let the lesson
+ *                 run on, or put a real recall question to the student (and how
+ *                 hard a one). Reads the running record of how the student has
+ *                 been answering so far.
+ *   grade      -> mark the answer the student gave to that question: right,
+ *                 partly right or wrong, plus the one line to say back to them.
  */
-export const TUTOR_MODES = ["plan", "teach", "doubt", "explain", "ask"] as const;
+export const TUTOR_MODES = [
+  "plan",
+  "teach",
+  "doubt",
+  "explain",
+  "ask",
+  "solve",
+  "solvedoubt",
+  "checkpoint",
+  "grade",
+] as const;
 export type TutorMode = (typeof TUTOR_MODES)[number];
+
+/**
+ * Which pipeline the student is in, chosen before their first question.
+ *   learn -> understand a topic: familiarity question, lesson plan, step-by-step teaching
+ *   solve -> solve a question: straight into the worked solution, no plan stage
+ */
+export const TUTOR_TRACKS = ["learn", "solve"] as const;
+export type TutorTrack = (typeof TUTOR_TRACKS)[number];
+
+/**
+ * What the student has done at the checkpoints so far. This is the whole basis
+ * of the adaptive questioning: the model is given this record and decides from
+ * it whether to ask anything at all, and how hard.
+ *
+ * Deliberately small and countable rather than a transcript. The decision has
+ * to be made on every checkpoint of every lesson, and a model asked to re-read
+ * the entire conversation to judge confidence both costs more and drifts; four
+ * counters and the last few outcomes say the same thing and say it the same way
+ * every time.
+ */
+export const LessonRecordSchema = z.object({
+  /** Questions put to the student so far in this lesson. */
+  asked: z.number().int().min(0).default(0),
+  /** How many they got fully right. */
+  correct: z.number().int().min(0).default(0),
+  /** How many were partly right — the idea there, the execution not. */
+  partial: z.number().int().min(0).default(0),
+  /** How many they got wrong, or could not answer. */
+  wrong: z.number().int().min(0).default(0),
+  /** Doubts the student has raised, a second signal of where they are. */
+  doubts: z.number().int().min(0).default(0),
+  /** Steps taught since the last question, so a long unbroken stretch is visible. */
+  sinceAsked: z.number().int().min(0).default(0),
+  /** The most recent outcomes, newest last, e.g. ["correct","partial","correct"]. */
+  recent: z.array(z.enum(["correct", "partial", "wrong"])).default([]),
+  /** The difficulty last asked, so the model can step up or down from it. */
+  lastDifficulty: z.enum(["recall", "apply", "stretch"]).nullish(),
+});
+export type LessonRecord = z.infer<typeof LessonRecordSchema>;
+
+/**
+ * What the model decides at a checkpoint.
+ *
+ * `action: "continue"` means let the lesson run on — the plain "any doubt?"
+ * gate. `action: "ask"` carries the question to put to the student.
+ */
+export const CheckpointPlanSchema = z.object({
+  action: z.enum(["continue", "ask"]).default("continue"),
+  /** The question to SAY, in the student's language. Only for action "ask". */
+  question: z.string().default(""),
+  /**
+   * How hard it is:
+   *   recall  -> say back a fact or term just taught
+   *   apply   -> use what was just taught on a small new case
+   *   stretch -> join two ideas, or a case that looks different on the surface
+   */
+  difficulty: z.enum(["recall", "apply", "stretch"]).default("recall"),
+  /** The answer being looked for, so the grader is not re-deriving it. */
+  expected: z.string().default(""),
+  /** One short sentence on why this call was made. Never spoken; for logs. */
+  why: z.string().default(""),
+});
+export type CheckpointPlan = z.infer<typeof CheckpointPlanSchema>;
+
+/** The verdict on a student's answer, plus the line to say back to them. */
+export const AnswerGradeSchema = z.object({
+  verdict: z.enum(["correct", "partial", "wrong"]).default("partial"),
+  /** What to SAY back: the praise, or the correction. In the student's language. */
+  say: z.string().default(""),
+  /**
+   * True when the miss is big enough that the lesson should not just move on —
+   * the client then re-teaches the point as a doubt turn before continuing.
+   */
+  reteach: z.boolean().default(false),
+});
+export type AnswerGrade = z.infer<typeof AnswerGradeSchema>;
 
 export const TutorRequestSchema = z.object({
   messages: z.array(HistoryMessageSchema).min(1),
@@ -371,6 +543,25 @@ export const TutorRequestSchema = z.object({
   step: z.number().int().min(0).nullish(),
   /** The student's self-reported familiarity with the topic, fed into planning. */
   familiarity: z.enum(["new", "some", "confident"]).nullish(),
+  /** Which pipeline the student chose up front. Only "solve" changes behaviour. */
+  track: z.enum(TUTOR_TRACKS).nullish(),
+  /**
+   * Solve mode: the question text already written on the board by the client, so the
+   * server tells the model not to repeat it. Sent back on a solvedoubt turn too, as
+   * the context of what is being solved.
+   */
+  solving: z.string().nullish(),
+  /**
+   * Checkpoint/grade modes: the running record of how this student has been
+   * answering, which is what makes the questioning adaptive rather than a fixed
+   * every-third-step rhythm. See `LessonRecordSchema`.
+   */
+  record: LessonRecordSchema.nullish(),
+  /** Grade mode: the question that was asked, the answer being looked for (from
+   *  the checkpoint decision that produced it), and what the student said back. */
+  question: z.string().nullish(),
+  expected: z.string().nullish(),
+  answer: z.string().nullish(),
 });
 export type TutorRequest = z.infer<typeof TutorRequestSchema>;
 
@@ -382,6 +573,17 @@ export type TutorEvent =
    *  authoritative plan still arrives as a single `plan` event at the end. */
   | { type: "planstep"; index: number; step: LessonStep }
   | { type: "plan"; plan: LessonPlan }
+  /** Solve mode: the question, laid out as draw ops by the server (no LLM involved),
+   *  sent before the first beat so the board shows what is being solved immediately.
+   *  `question` is the plain text, for the transcript and for threading back as
+   *  `solving` on a later doubt turn. */
+  | { type: "question"; beat: Beat; question: string; label: string | null }
   | { type: "beat"; beat: Beat }
+  /** Checkpoint mode: what to do at the gap between two steps — carry on, or put
+   *  this question to the student. Absent (just `done`) means carry on. */
+  | { type: "checkpoint"; plan: CheckpointPlan }
+  /** Grade mode: the verdict on the answer the student just spoke, and the line
+   *  to say back to them. Absent means treat it as partly right and move on. */
+  | { type: "grade"; grade: AnswerGrade }
   | { type: "done" }
   | { type: "error"; message: string };

@@ -15,15 +15,27 @@ import type {
 import type { ExcalidrawImperativeAPI, NormalizedZoomValue } from "@excalidraw/excalidraw/types";
 import type { DrawOp } from "../schema";
 import { clamp, sleep } from "../utils";
-import { isPermanentNote, opToSkeleton, type TutorMeta } from "./ops";
+import { fontsReady } from "./measure";
+import { flattenMath, hasMathScript, normalizeScripts } from "./mathtext";
+import {
+  isPermanentNote,
+  MATH_FONT_FAMILY,
+  needsHandToMathSwitch,
+  needsMathFont,
+  opToSkeleton,
+  type TutorMeta,
+} from "./ops";
+import { expandMathText } from "./primitives/mathline";
 import {
   CLEARANCE,
   CONTENT_BOTTOM,
+  HEADING_GAP,
   CONTENT_TOP,
   FIT_MARGIN,
   MIN_TURN_ROOM,
   PAGE_H,
   PAGE_W,
+  STEP_GAP,
   TWEEN_MS,
   cellAtScene,
   cellRect,
@@ -53,6 +65,11 @@ type Page = Rect &
     rev: number;
     /** turn -> every element id it created here, so dropTurn can wipe a turn. */
     turnIds: Map<number, Set<string>>;
+    /** Set once any text on this page has had to fall back to the math font, so
+     *  the REST of the page follows it. A board where `x = [5 ± √49] / 4` is
+     *  Helvetica and the line under it is hand-drawn reads as a glitch; the
+     *  mixture is what looks wrong, not either font. See `boardFontFamily`. */
+    mathFont: boolean;
   };
 
 export type PageInfo = Cell & { index: number; kind: PageKind; used: boolean; rev: number };
@@ -142,31 +159,61 @@ export class BoardPlayer {
    * column and never into a doubt's page beside it.
    * `stayOnPage` keeps the reply beside work the student just drew.
    *
-   * `newPage` forces a fresh page even when the current one has room. The staged
-   * lesson uses it to give every plan step a page of its own: one page, one idea,
-   * and — the reason it exists — a step's page state no longer depends on what
-   * the previous step drew, so the next step can be generated while this one is
-   * still being drawn without being told the wrong amount of room.
+   * `newStep` begins a new lesson step, and ALWAYS on a fresh page: one
+   * subtopic never starts half-way down the page another one ends on. Each step
+   * is written under its own numbered heading (see `drawStepHeading` below),
+   * and a heading that appears mid-page reads as a divider rather than a title —
+   * so the page break is what makes the heading mean anything.
+   *
+   * A step is free to take MORE than one page: `applyBeat` measures every beat,
+   * collision-pushes it below what is already on the page, and spills it onto a
+   * fresh page when it genuinely does not fit. Those spill pages carry no
+   * heading of their own, so a long subtopic reads as one continuous stretch
+   * under the one heading it started with. Steps therefore vary in length, which
+   * is the point: an intuition hook is short, a worked example is not.
+   *
+   * This used to share a page when ~300px was left, to stop a three-line
+   * step burning a whole sheet. That tradeoff no longer holds: steps are longer
+   * now (4-8 beats) so the saving was small, and it cost the one-page-one-idea
+   * structure the headings depend on.
+   *
+   * `freshPage` opts out of sharing entirely: the turn gets a clean sheet even
+   * if the current page has room. A solved question needs this. Its first beat
+   * is laid out SERVER-side (question-board.ts) at fixed page-local coordinates
+   * from CONTENT_TOP, so unlike a model-written step it cannot be re-anchored
+   * below existing content — sharing a page would print the new question's
+   * heading straight over the previous one's.
    */
-  beginTeachTurn(opts?: { stayOnPage?: boolean; newPage?: boolean }) {
+  beginTeachTurn(opts?: { stayOnPage?: boolean; newStep?: boolean; freshPage?: boolean }) {
     this.doubtMode = false;
     this.plannedKind = "teach";
     this.pageAnchorDy = 0;
     this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
+    // `freshPage` is checked FIRST, so it also overrides `stayOnPage`: a fixed
+    // server-laid question block can no more dodge the student's own sketch than
+    // it can dodge the previous question.
+    if (opts?.freshPage) {
+      this.planAt(this.freshTeachSlot());
+      this.emit();
+      return;
+    }
     if (opts?.stayOnPage && this.activeIndex >= 0) {
       this.planAt(this.pages[this.activeIndex]);
       this.emit();
       return;
     }
-    if (opts?.newPage) {
-      this.planAt(this.freshTeachSlot());
-      this.emit();
-      return;
-    }
+    // A new step never shares: it opens its own page under its own heading.
     const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
-    this.planAt(
-      cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_TURN_ROOM ? cur : this.freshTeachSlot(),
-    );
+    const share =
+      !opts?.newStep && Boolean(cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_TURN_ROOM);
+    // A step that shares a page was written as if the page were blank, so its
+    // first beat starts around CONTENT_TOP. Drop the whole step to just below
+    // what is already there, with a wider gap than the CLEARANCE used between
+    // beats of one step — that gap is what makes two subtopics on one page read
+    // as two subtopics instead of one run-on block. Collision avoidance still
+    // runs underneath and corrects anything this estimate gets wrong.
+    this.pageAnchorDy = share && cur && cur.used ? Math.max(0, cur.bottom + STEP_GAP - CONTENT_TOP) : 0;
+    this.planAt(share && cur ? cur : this.freshTeachSlot());
     this.emit();
   }
 
@@ -289,9 +336,14 @@ export class BoardPlayer {
   }
 
   /**
-   * The page `beginTeachTurn({ newPage: true })` would start on. The staged
-   * lesson reads it to describe the page a step will own while that step is
-   * still being generated. See `freshTeachSlot` for the reuse rule.
+   * The page `beginTeachTurn({ newStep: true })` would start on RIGHT NOW.
+   *
+   * Always a fresh page, matching `beginTeachTurn`: a step no longer shares the
+   * page above it. The staged lesson reads this only to number the page in the
+   * canvas header a step is generated against, and it is still a lower bound
+   * rather than a promise — a step that spills onto a second page pushes every
+   * later step down with it, so the real book ends up longer than the count
+   * predicted here, never shorter.
    */
   nextTeachPage(): number {
     return this.freshTeachSlot().index;
@@ -345,6 +397,7 @@ export class BoardPlayer {
         bottom: CONTENT_TOP,
         rev: 0,
         turnIds: new Map(),
+        mathFont: false,
       };
       this.pages.push(p);
       this.plannedIndex = p.index;
@@ -599,6 +652,32 @@ export class BoardPlayer {
   }
 
   /**
+   * Bring text ALREADY on `pageIndex` over to the math font, called the moment
+   * the page latches (see Page.mathFont).
+   *
+   * The glyph that forces the fallback usually turns up in the middle of a
+   * working — "x = [5 ± √49] / 4" on line three — so latching only the lines
+   * after it would still leave the board in two typefaces, which is the actual
+   * complaint. Lines carrying a complex script are left alone: the fallback font
+   * has no Devanagari and switching would drop the letters.
+   *
+   * Width/height are kept as measured, so re-styling can never move anything:
+   * the two fonts differ in metrics and re-flowing committed text would shift a
+   * board the collision logic has already placed around.
+   */
+  private adoptMathFont(pageIndex: number) {
+    let changed = false;
+    const elements = this.all().map((e) => {
+      if (e.type !== "text" || e.isDeleted) return e;
+      if ((e.customData as TutorMeta | undefined)?.page !== pageIndex) return e;
+      if (e.fontFamily === MATH_FONT_FAMILY || !needsHandToMathSwitch(e.text)) return e;
+      changed = true;
+      return { ...e, fontFamily: MATH_FONT_FAMILY, versionNonce: e.versionNonce + 1 };
+    });
+    if (changed) this.commit(elements as readonly ExcalidrawElement[]);
+  }
+
+  /**
    * A scene id for the model's own id, unique against EVERY id the board has
    * ever held.
    *
@@ -655,8 +734,40 @@ export class BoardPlayer {
    * of the same kind, re-anchored at that page's top — so a long doubt simply
    * continues on the next page instead of folding back over its own content.
    */
+  /**
+   * Write a step's heading at the very top of its page, then reserve the band
+   * it occupies so the step's own beats start underneath it.
+   *
+   * The order is the whole point and cannot be split by the caller: the heading
+   * is laid out at the page's true top (anchor 0), and only once it is down is
+   * the anchor moved below it. Setting the anchor first would push the heading
+   * down with everything else; drawing the heading and hoping collision
+   * avoidance moves the body is what put the first line of working straight
+   * through the title.
+   */
+  async drawStepHeading(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
+    this.pageAnchorDy = 0;
+    const created = await this.applyBeat(ops, turn, signal);
+    if (!created.length) return created;
+    const page = this.pages[this.activeIndex];
+    if (!page) return created;
+    // `page.bottom` is page-local and was just updated with the rule's real,
+    // post-layout bottom edge — so this reserves exactly what was drawn rather
+    // than a guess at how tall a heading is.
+    this.pageAnchorDy = Math.max(0, page.bottom + HEADING_GAP - CONTENT_TOP);
+    return created;
+  }
+
   async applyBeat(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
     this.currentTurn = turn;
+    // Lay nothing out until the board font can be measured: on a cold page
+    // Excalifont is still loading, and widths measured against a substitute
+    // put superscripts and diagram labels in the wrong place.
+    await fontsReady();
+    if (signal.aborted) return [];
+    // Rewrite any Unicode "x²"/"H₂O" the model slipped in into ^/_ notation, so
+    // it is laid out as real raised type instead of rendering as mojibake.
+    ops = ops.map(withNormalizedScripts);
     // erase/clear-only beats (and a beat with no draw ops at all) must not
     // allocate a page or move the camera, or an answer given in words alone
     // would leave a blank page behind.
@@ -664,15 +775,24 @@ export class BoardPlayer {
     if (drawing.length) {
       const page = this.ensurePage();
       const carried = this.turnShift.turn === turn ? this.turnShift : { dx: 0, dy: 0 };
-      const box = this.measureBeat(drawing, carried);
+      const raw = this.measureBeat(drawing, carried);
+      // Measure where this beat will REALLY sit: ops are drawn at
+      // `pageAnchorDy`, so a step sharing a page is already offset below the
+      // step above it. Testing the unoffset box would under-report the bottom
+      // and let a beat run off the page it was supposed to spill from.
+      const box = raw && { ...raw, y1: raw.y1 + this.pageAnchorDy, y2: raw.y2 + this.pageAnchorDy };
       if (box && page.used) {
         // Collision avoidance will push this beat below what is already here;
         // model that push, or the beat spills one page later than it should.
+        // The anchor already clears `page.bottom` for a shared step's first
+        // beat, so `push` correctly comes out as 0 there rather than doubling.
         const push = Math.max(0, page.bottom + CLEARANCE - box.y1);
         if (box.y2 + push + FIT_MARGIN > CONTENT_BOTTOM) {
           this.appendPage(page.kind);
           this.turnShift = { turn, dx: 0, dy: 0 }; // stays page-local
-          this.pageAnchorDy = CONTENT_TOP - box.y1;
+          // Re-anchor at the fresh page's top, measured from the UNOFFSET box:
+          // the old page's step gap must not travel to the new page.
+          this.pageAnchorDy = CONTENT_TOP - (raw ? raw.y1 : CONTENT_TOP);
         }
       }
       const target = this.pages[this.activeIndex];
@@ -699,7 +819,7 @@ export class BoardPlayer {
   private expand(op: DrawOp): Expanded {
     let e = this.expandCache.get(op as object);
     if (!e) {
-      e = PRIMITIVES[op.op](op);
+      e = PRIMITIVES[op.op] ? PRIMITIVES[op.op](op) : expandMathText(op);
       this.expandCache.set(op as object, e);
     }
     return e;
@@ -728,7 +848,7 @@ export class BoardPlayer {
     for (const op of ops) {
       if (op.temp === true) continue;
       if (op.op === "arrow" && op.temp !== false) continue; // a bare arrow is a pointing gesture
-      if (PRIMITIVES[op.op]) {
+      if (PRIMITIVES[op.op] || isMathText(op)) {
         const ex = this.expand(op);
         // The declared bbox carries padding the children do not report; the
         // children are exact where the bbox under-covers. Use both.
@@ -772,7 +892,9 @@ export class BoardPlayer {
     // Carry forward any shift collision avoidance made earlier in this turn.
     const carried = this.turnShift.turn === turn ? this.turnShift : { dx: 0, dy: 0 };
     // High-level primitives lay themselves out perfectly, then dodge as one unit.
-    if (PRIMITIVES[op.op]) return this.applyGroup(op, carried, turn, signal);
+    // A text op written with ^/_ notation joins them: it becomes several runs at
+    // different sizes and baselines, which must move together.
+    if (PRIMITIVES[op.op] || isMathText(op)) return this.applyGroup(op, carried, turn, signal);
 
     // A bare `arrow` op is a pointing gesture by default: it fades on its own
     // unless the model explicitly marks it permanent (temp:false). The model
@@ -790,7 +912,13 @@ export class BoardPlayer {
     const ox = page.x;
     const oy = page.y + this.pageAnchorDy;
     const elementId = this.resolveId(op.id);
-    const skeleton = opToSkeleton(shiftOp(op, carried.dx + ox, carried.dy + oy), turn, elementId, page.index);
+    // Latch the page onto the math font BEFORE converting, so the op that forces
+    // the switch is itself drawn in it along with everything that follows.
+    if (!page.mathFont && needsMathFont(op.text)) {
+      page.mathFont = true;
+      this.adoptMathFont(page.index); // bring the lines already written over too
+    }
+    const skeleton = opToSkeleton(shiftOp(op, carried.dx + ox, carried.dy + oy), turn, elementId, page.index, page.mathFont);
     if (!skeleton) return [];
 
     const converted = convertToExcalidrawElements([skeleton], { regenerateIds: false });
@@ -874,10 +1002,17 @@ export class BoardPlayer {
     const placed = tx || ty ? children.map((c) => shiftOp(c, tx, ty)) : children;
 
     const groupId = this.resolveId(op.id); // one stable id for the whole group
+    // A primitive is one figure: if ANY of its labels needs the math font, the
+    // whole figure (and the rest of the page) uses it, so a diagram's own labels
+    // never disagree with each other.
+    if (!page.mathFont && placed.some((c) => needsMathFont(c.text))) {
+      page.mathFont = true;
+      this.adoptMathFont(page.index);
+    }
     const created: ExcalidrawElement[] = [];
     for (const child of placed) {
       if (signal.aborted) break;
-      const base = opToSkeleton(child, turn, this.resolveId(child.id), page.index);
+      const base = opToSkeleton(child, turn, this.resolveId(child.id), page.index, page.mathFont);
       if (!base) continue;
       // Tag children so the summary collapses the group and erase can target it.
       const skel = { ...base, customData: { ...(base.customData as object), group: groupId, groupLabel: label } };
@@ -907,6 +1042,9 @@ export class BoardPlayer {
 
   /** Near-zero-area segments (thin lines/arrows) get this much effective thickness. */
   private static MIN_THICK = 6;
+  /** Slack when judging containment, so a hand-picked radius that lands a few
+   *  px proud of its neighbour still counts as nested rather than colliding. */
+  private static NEST_TOL = 8;
   /** A single nudge never moves an element farther than this, so nothing is flung away. */
   private static MAX_TRAVEL = 400;
 
@@ -935,6 +1073,22 @@ export class BoardPlayer {
 
   private overlaps(el: ExcalidrawElement, b: { x1: number; y1: number; x2: number; y2: number }, gap: number): boolean {
     return el.x < b.x2 + gap && el.x + el.width > b.x1 - gap && el.y < b.y2 + gap && el.y + el.height > b.y1 - gap;
+  }
+
+  /** True when `el` sits entirely within `b` — the new shape nests inside an old one. */
+  private contains(b: { x1: number; y1: number; x2: number; y2: number }, el: ExcalidrawElement): boolean {
+    const t = BoardPlayer.NEST_TOL;
+    return (
+      el.x >= b.x1 - t && el.y >= b.y1 - t && el.x + el.width <= b.x2 + t && el.y + el.height <= b.y2 + t
+    );
+  }
+
+  /** True when `b` sits entirely within `el` — the new shape encloses an old one. */
+  private containedBy(el: ExcalidrawElement, b: { x1: number; y1: number; x2: number; y2: number }): boolean {
+    const t = BoardPlayer.NEST_TOL;
+    return (
+      b.x1 >= el.x - t && b.y1 >= el.y - t && b.x2 <= el.x + el.width + t && b.y2 <= el.y + el.height + t
+    );
   }
 
   /** Large penalty for a move that would push the element off its own page. */
@@ -980,6 +1134,13 @@ export class BoardPlayer {
     // Only move for a REAL overprint; a near-miss within the gap keeps the model's coords.
     const hit = boxes.filter((b) => this.overlaps(el, b, 0));
     if (!hit.length) return { dx: 0, dy: 0 };
+    // Nesting is deliberate, not a collision: a shape drawn wholly inside an
+    // existing one (concentric circles, a box inside a box, a shaded region in
+    // a figure) means the model placed it there on purpose. Pushing it "clear"
+    // is what made concentric circles impossible to draw by hand. Containment
+    // must hold against EVERY box it touches, so a shape straddling the edge of
+    // a neighbour is still dodged normally.
+    if (hit.every((b) => this.contains(b, el) || this.containedBy(el, b))) return { dx: 0, dy: 0 };
     const onlyThin = hit.every((b) => b.thin);
     const gap = onlyThin ? 7 : 16; // keep tick labels snug to their line
 
@@ -1182,6 +1343,37 @@ export class BoardPlayer {
     this.turnShift = { turn: 0, dx: 0, dy: 0 };
     this.resetPages();
   }
+}
+
+/**
+ * A copy of the op with Unicode script characters in its text rewritten to the
+ * `^`/`_` notation the layout understands. Only `text` ops get the full raised
+ * treatment; a shape or arrow LABEL is bound text that Excalidraw owns, which
+ * cannot hold runs of two sizes, so its scripts are flattened to ordinary
+ * characters ("x²" -> "x2") — plain, but readable, which mojibake is not.
+ */
+function withNormalizedScripts(op: DrawOp): DrawOp {
+  if (!op.text) return op;
+  if (op.op === "text") {
+    if (!HAS_UNICODE_SCRIPT.test(op.text)) return op;
+    return { ...op, text: normalizeScripts(op.text) };
+  }
+  // A label: flatten both notations so neither a stray caret nor a missing
+  // glyph is drawn literally inside the shape.
+  const flat = flattenMath(normalizeScripts(op.text));
+  return flat === op.text ? op : { ...op, text: flat };
+}
+
+const HAS_UNICODE_SCRIPT = /[²³¹⁰-₟ⁱ]/;
+
+/**
+ * True for a `text` op that needs superscript/subscript layout. Such an op is
+ * drawn as a GROUP of differently-sized runs rather than one element, so it
+ * takes the same path as the diagram primitives: laid out by code, moved as one
+ * unit by collision avoidance, erased by its single id.
+ */
+function isMathText(op: DrawOp): boolean {
+  return op.op === "text" && hasMathScript(op.text);
 }
 
 /** A copy of the op moved by (dx, dy) — start and end points alike. */

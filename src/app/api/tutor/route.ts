@@ -8,16 +8,25 @@ import {
 } from "@/lib/llm";
 import { mockLesson } from "@/lib/mock-lesson";
 import {
+  buildCheckpointPrompt,
   buildDoubtSystemPrompt,
   buildExplainSystemPrompt,
+  buildGradePrompt,
   buildPlanPrompt,
+  nextDifficulty,
+  buildSolveDoubtSystemPrompt,
+  buildSolveSystemPrompt,
   buildSystemPrompt,
   buildTeachSystemPrompt,
   buildUserTurn,
 } from "@/lib/prompt";
+import { questionBeat } from "@/lib/question-board";
 import { retrieveTextbookContext, type Passage } from "@/lib/rag";
+import { retrieveSolutions, type Solution } from "@/lib/solutions";
 import {
+  AnswerGradeSchema,
   BeatSchema,
+  CheckpointPlanSchema,
   LessonPlanSchema,
   LessonStepSchema,
   TutorRequestSchema,
@@ -46,7 +55,13 @@ export async function POST(req: Request) {
   if (!parsed.success) {
     return Response.json({ error: "Bad request", issues: parsed.error.issues }, { status: 400 });
   }
-  const { messages, canvas, language, profile, mode, step, familiarity } = parsed.data;
+  const { messages, canvas, language, profile, mode, step, familiarity, solving } = parsed.data;
+  // Checkpoint/grade only: the running record of how the student has been
+  // answering, and (for grade) the question put to them with what they said.
+  const record = parsed.data.record ?? null;
+  const askedQuestion = parsed.data.question ?? "";
+  const expectedAnswer = parsed.data.expected ?? "";
+  const studentAnswer = parsed.data.answer ?? "";
   const grade = (parsed.data.grade ?? null) as Grade | null;
   const subject = (parsed.data.subject ?? null) as SubjectId | null;
   const plan: LessonPlan | null = parsed.data.plan ?? null;
@@ -74,13 +89,62 @@ export async function POST(req: Request) {
   const book = textbookKey(grade, subject);
   let edition = "";
   let passages: Passage[] = [];
+  // Solve turns also look up the book's own worked solution for the question named.
+  // Like textbook grounding this is additive: no index, no match or a failure all
+  // mean the model works the problem out itself.
+  let solutions: Solution[] = [];
+  /** True only when the student named the item by position, so the match is certain. */
+  let exactSolution = false;
+  const solveTurn = mode === "solve" || mode === "solvedoubt";
+  // What the lesson is about, for retrieval. A teach turn's last "student" message is
+  // a nudge the client wrote ("Continue to the next step."), so the history alone
+  // carries no topic and search would match the nudge; the plan is what knows the
+  // topic and the step. Doubt/explain pass the topic too, so a two-word doubt
+  // ("why minus?") still searches inside the right chapter.
+  const lesson = plan
+    ? { topic: plan.topic, step: mode === "teach" ? (plan.steps[step ?? 0] ?? null) : null }
+    : null;
   if (book) {
     try {
-      ({ edition, passages } = await retrieveTextbookContext(book, messages, { mode }));
+      ({ edition, passages } = await retrieveTextbookContext(book, messages, { mode, lesson }));
     } catch (err) {
       console.warn(`[tutor] textbook retrieval failed for ${book}: ${errorMessage(err)}`);
     }
+    if (solveTurn) {
+      try {
+        ({ solutions, exactSolution } = await retrieveSolutions(book, messages));
+      } catch (err) {
+        console.warn(`[tutor] solution retrieval failed for ${book}: ${errorMessage(err)}`);
+      }
+    }
   }
+
+  // The question that goes on the board, and that the model is told not to re-write.
+  //
+  // Only an EXACT reference ("exercise 5.1 q4") may supply it. A semantic hit is a
+  // guess — asked to solve their own sum, the student would otherwise watch the board
+  // fill with a different, merely similar question from the book. Their own words are
+  // always right about what they asked.
+  //
+  // A question whose own text did not survive the PDF is treated like a non-exact
+  // match for board purposes: writing "Prove that 5 is irrational" (the √ having
+  // been dropped in extraction) puts a false statement up as the student's question.
+  // The reference is still correct, so the label stays and the model still receives
+  // the book's method — only the transcription falls back to the student's words.
+  const askedText = messages.filter((m) => m.role === "user").at(-1)?.text.trim() ?? "";
+  const quotable = exactSolution && solutions.length > 0 && !solutions[0].questionDamaged;
+  const boardQuestion = mode === "solve" ? (quotable ? solutions[0].question.trim() : askedText) : "";
+  const boardLabel = mode === "solve" && exactSolution ? (solutions[0]?.label ?? null) : null;
+  const written = mode === "solve" && boardQuestion
+    ? questionBeat({ question: boardQuestion, heading: boardLabel })
+    : null;
+  // Spot the questions whose own data was a picture: the book answered with a figure
+  // AND the question text does not carry the values it talks about. Without this the
+  // model fills the gap with invented numbers and presents them as the book's.
+  const dataInFigure =
+    exactSolution && solveTurn && solutions.length > 0 && solutions[0].hasImageAnswer
+      ? referencesMissingData(solutions[0].question)
+      : false;
 
   // System prompt per stage. Teaching and doubt reuse the shared board-rules prompt
   // (plus their framing); planning uses its own designer prompt.
@@ -94,7 +158,35 @@ export async function POST(req: Request) {
           ? buildDoubtSystemPrompt({ ...promptCtx, plan })
           : mode === "explain"
             ? buildExplainSystemPrompt({ ...promptCtx, plan })
-            : buildSystemPrompt(promptCtx);
+            : mode === "solve"
+              ? buildSolveSystemPrompt({
+                  ...promptCtx,
+                  solutions,
+                  exactSolution,
+                  dataInFigure,
+                  startY: written?.nextY,
+                  boardQuestion: written?.lines,
+                })
+              : mode === "solvedoubt"
+                ? buildSolveDoubtSystemPrompt({ ...promptCtx, solutions, solving: solving ?? null })
+                : mode === "checkpoint"
+                  ? buildCheckpointPrompt({
+                      ...promptCtx,
+                      plan: plan ?? LessonPlanSchema.parse({}),
+                      step: step ?? 0,
+                      record,
+                      familiarity: familiarity ?? null,
+                    })
+                  : mode === "grade"
+                    ? buildGradePrompt({
+                        ...promptCtx,
+                        plan,
+                        step: step ?? undefined,
+                        question: askedQuestion,
+                        expected: expectedAnswer,
+                        record,
+                      })
+                    : buildSystemPrompt(promptCtx);
 
   const last = messages.length - 1;
   // With thinking off, a model can forget the NDJSON contract — and how much to
@@ -103,14 +195,32 @@ export async function POST(req: Request) {
   // length reminder most: left to itself a no-thinking teacher will answer a
   // whole lesson step in one short sentence.
   const formatNudge =
-    mode === "doubt"
+    mode === "doubt" || mode === "solvedoubt"
       ? "\n\n---\nReply with NDJSON beats only: 1-4 lines, each a complete JSON object. No prose."
-      : mode === "teach" || mode === "explain"
-        ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 3-6 beats, and draw on the board — one short sentence is not a step."
-        : "";
+      : mode === "teach"
+        ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 4-8 beats, and draw on the board — one short sentence is not a step. Full granularity: one elementary move per line, the arithmetic written out, the rule named before you use it, and the reasoning said aloud, not just the result. The page heading is already written for you — do not repeat the step title."
+        : mode === "explain"
+          ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Work the item at full granularity: one elementary move per line, every bit of arithmetic written out, and the rule named before you use it. Never skip a step because it looks obvious."
+          : mode === "solve"
+            ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. The question is already on the board: start at the first step of the solution and box the final answer. SHOW EVERY STEP — one elementary move per line, the arithmetic written out rather than done in your head, the rule named before each step that uses one, and any choice of numbers (such as a factor pair) searched out on the board. A line the student cannot derive from the line above it means you skipped a step."
+            : "";
+  // The checkpoint and grade turns are decisions, not board work: everything they
+  // need is in the system prompt, and the board summary that `buildUserTurn`
+  // appends would only be noise. The grade turn's final message is the student's
+  // spoken answer, which is the one thing it is judging.
+  const decisionTurn =
+    mode === "checkpoint"
+      ? "The step just finished. Decide: carry on, or ask? Reply with the JSON object only."
+      : mode === "grade"
+        ? `The student answered, out loud: "${studentAnswer}"
+
+Mark it. Reply with the JSON object only.`
+        : null;
   const rawMessages: ModelMessage[] = messages.map((m, i) => {
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
-    return { role: "user", content: i === last ? buildUserTurn({ text: m.text, canvas }) + formatNudge : m.text };
+    if (i !== last) return { role: "user", content: m.text };
+    if (decisionTurn) return { role: "user", content: decisionTurn };
+    return { role: "user", content: buildUserTurn({ text: m.text, canvas }) + formatNudge };
   });
 
   // Doubt mode talks to a 1M-token window, and a doubt turn is normally a few
@@ -118,7 +228,7 @@ export async function POST(req: Request) {
   // unusually large retrieval can never push it over the model's limit.
   let system = systemPrompt;
   let modelMessages = rawMessages;
-  if (mode === "doubt") {
+  if (mode === "doubt" || mode === "solvedoubt") {
     const fitted = fitDoubtContext(system, modelMessages);
     if (fitted.trimmed > 0) {
       console.warn(`[tutor] doubt context over budget; dropped ${fitted.trimmed} oldest message(s)`);
@@ -134,12 +244,62 @@ export async function POST(req: Request) {
       send({
         type: "meta",
         model: primary.label,
-        ...(passages.length > 0
-          ? { sources: passages.map((p) => `${book} ${edition}: ${p.label} (pdf p.${p.pages.join("-")})`) }
+        ...(passages.length > 0 || solutions.length > 0
+          ? {
+              sources: [
+                ...solutions.map((s) => `${book} solutions: ${s.label}${exactSolution ? "" : " (similar)"}`),
+                ...passages.map((p) => `${book} ${edition}: ${p.label} (pdf p.${p.pages.join("-")})`),
+              ],
+            }
           : {}),
       });
+      // The question goes up before the model has written a word: it is already
+      // known exactly, so laying it out here (rather than asking the LLM for it)
+      // costs nothing, cannot be paraphrased, and fills the board during the wait.
+      if (written) {
+        send({ type: "question", beat: written.beat, question: boardQuestion, label: boardLabel });
+      }
       try {
-        if (mode === "plan") {
+        if (mode === "checkpoint") {
+          await streamJson({
+            models: modelChain,
+            system,
+            messages: modelMessages,
+            signal: req.signal,
+            send,
+            mode,
+            schema: CheckpointPlanSchema,
+            // An "ask" with no question in it is not a decision to ask: treat it
+            // as unparseable so the caller falls back to carrying on, rather
+            // than stopping the lesson on an empty question.
+            accept: (p) => p.action === "continue" || p.question.trim().length > 0,
+            // The difficulty is computed from the record, not chosen by the
+            // model: the fast tier that answers these turns returned "recall"
+            // whatever the record said, so what it reports is overwritten with
+            // the level its own prompt told it to use. Only the decision to ask
+            // and the question itself come from the model.
+            event: (plan) => ({
+              type: "checkpoint",
+              plan: { ...plan, difficulty: nextDifficulty(record, familiarity ?? null) },
+            }),
+            // One short object. The ceiling is for a thinking model's reasoning,
+            // not the answer.
+            budget: 2000,
+          });
+        } else if (mode === "grade") {
+          await streamJson({
+            models: modelChain,
+            system,
+            messages: modelMessages,
+            signal: req.signal,
+            send,
+            mode,
+            schema: AnswerGradeSchema,
+            accept: (g) => g.say.trim().length > 0,
+            event: (grade) => ({ type: "grade", grade }),
+            budget: 1200,
+          });
+        } else if (mode === "plan") {
           await streamPlan({
             models: modelChain,
             system,
@@ -147,6 +307,7 @@ export async function POST(req: Request) {
             signal: req.signal,
             send,
             fallbackTopic: messages[last]?.text ?? "",
+            mode,
           });
         } else {
           await streamBeats({
@@ -156,11 +317,14 @@ export async function POST(req: Request) {
             signal: req.signal,
             send,
             // The doubt model is a small MoE; low temperature keeps it on the
-            // strict NDJSON beat format instead of drifting into prose.
-            temperature: mode === "doubt" ? 0.2 : 0.6,
+            // strict NDJSON beat format instead of drifting into prose. Solving is
+            // held low too: a worked solution should follow the book's method, not
+            // improvise around it.
+            temperature: mode === "doubt" || mode === "solvedoubt" ? 0.2 : mode === "solve" ? 0.3 : 0.6,
             // A doubt is a spoken side-note, so prose with no drawing is still a
             // usable answer — speak it rather than failing the student's question.
-            salvageProse: mode === "doubt",
+            salvageProse: mode === "doubt" || mode === "solvedoubt",
+            mode,
           });
         }
       } finally {
@@ -188,6 +352,8 @@ type StreamArgs = {
   send: (ev: TutorEvent) => void;
   temperature?: number;
   salvageProse?: boolean;
+  /** The request's stage, for the cache/usage log line only. */
+  mode: string;
 };
 
 /**
@@ -210,6 +376,48 @@ type StreamArgs = {
 const FIRST_BEAT_TIMEOUT_MS = 15_000;
 
 /**
+ * Logs what the provider's prefix cache did with this request.
+ *
+ * The NVIDIA endpoint prefix-caches automatically — no parameter to set — and
+ * reports the hit as `cached_tokens`, which the AI SDK surfaces as
+ * `usage.inputTokenDetails.cacheReadTokens`. A hit needs an exact prefix match
+ * from token zero, so this line is how a prompt edit that silently moves the
+ * shared prefix (and so stops matching) becomes visible instead of just slow.
+ *
+ * Two things to know when reading the output:
+ *  - `cached=n/a` is NOT a miss. Some models — Nemotron Ultra among them — omit
+ *    the field entirely rather than reporting zero, so absent and zero mean
+ *    different things and must not be collapsed.
+ *  - The hit is capped at a fixed block size (measured: 4336 tokens on the Super
+ *    tier), so a long prompt plateaus at a partial percentage however identical
+ *    it is. A number well below that cap on a repeated call is the real warning
+ *    sign; one at the cap is as good as it gets.
+ *
+ * Never throws and never blocks the stream: usage resolves after the body is
+ * done, so this is attached as a floating `.then` and a failure is swallowed.
+ */
+function logCacheUsage(usage: PromiseLike<unknown>, label: string, mode: string) {
+  // `usage` is only PromiseLike, so wrap it before attaching a rejection handler:
+  // without one, a failed usage promise becomes an unhandled rejection and can
+  // take the server process down over a log line.
+  void Promise.resolve(usage)
+    .then((u) => {
+      const { inputTokens, inputTokenDetails } = (u ?? {}) as {
+        inputTokens?: number;
+        inputTokenDetails?: { cacheReadTokens?: number };
+      };
+      const cached = inputTokenDetails?.cacheReadTokens;
+      const pct = cached != null && inputTokens ? ` (${Math.round((100 * cached) / inputTokens)}%)` : "";
+      console.info(
+        `[tutor] ${mode} via ${label}: prompt=${inputTokens ?? "?"} cached=${cached ?? "n/a"}${pct}`,
+      );
+    })
+    .catch(() => {
+      /* usage is diagnostics only — never let it affect the turn */
+    });
+}
+
+/**
  * Teach/doubt/ask: the model emits beats as NDJSON. We extract each complete
  * top-level JSON object from the text stream (tolerant of arrays, commas, code
  * fences and pretty-printing) and validate it ourselves — no provider-side
@@ -225,6 +433,7 @@ async function streamBeats({
   send,
   temperature = 0.6,
   salvageProse = false,
+  mode,
 }: StreamArgs) {
   let lastErr: string | null = null;
   for (let mi = 0; mi < models.length; mi++) {
@@ -244,13 +453,17 @@ async function streamBeats({
           system,
           messages,
           temperature,
-          maxOutputTokens: 3000,
+          // Every beat mode works at full granularity (one elementary move per
+          // line, arithmetic shown), so a turn can legitimately run long — give
+          // it the room or the stream truncates mid-explanation.
+          maxOutputTokens: 6000,
           maxRetries: 1,
           abortSignal: AbortSignal.any([signal, watchdog.signal]),
           onError: ({ error }) => {
             errMsg ??= errorMessage(error);
           },
         });
+        logCacheUsage(result.usage, label, mode);
         const scanner = new BeatScanner((beat) => {
           beatCount++;
           clearTimeout(timer); // it is answering; let it finish at its own pace
@@ -326,6 +539,81 @@ function asProse(raw: string): string | null {
 }
 
 /**
+ * Checkpoint and grade modes: collect one small JSON object and emit it.
+ *
+ * Both are DECISIONS, not teaching: no beats, nothing drawn, a handful of tokens
+ * out. They share this path because they share every requirement — a strict
+ * object, a tight output budget, and a student who is waiting. The grade is the
+ * tighter of the two: the student has just spoken and is listening for whether
+ * they were right, so there is nowhere to hide latency.
+ *
+ * On failure it does NOT error the turn. Both modes have a safe neutral answer —
+ * carry on teaching, or accept the answer as partly right — so a wobbly model
+ * degrades the lesson to its old behaviour instead of stopping it dead.
+ */
+async function streamJson<T>({
+  models,
+  system,
+  messages,
+  signal,
+  send,
+  mode,
+  schema,
+  accept,
+  event,
+  budget,
+}: StreamArgs & {
+  schema: { safeParse: (v: unknown) => { success: true; data: T } | { success: false } };
+  accept?: (v: T) => boolean;
+  event: (v: T) => TutorEvent;
+  budget: number;
+}) {
+  let lastErr: string | undefined;
+  for (let mi = 0; mi < models.length; mi++) {
+    const { model, label } = models[mi];
+    let raw = "";
+    let errMsg: string | undefined;
+    try {
+      const result = streamText({
+        model,
+        system,
+        messages,
+        // Low: both modes are judgements against stated criteria, and the one
+        // thing neither may do is improvise its way out of the JSON contract.
+        temperature: 0.2,
+        maxOutputTokens: budget,
+        maxRetries: 1,
+        abortSignal: signal,
+        onError: ({ error }) => {
+          errMsg ??= errorMessage(error);
+        },
+      });
+      logCacheUsage(result.usage, label, mode);
+      for await (const delta of result.textStream) {
+        if (signal.aborted) return;
+        raw += delta;
+      }
+    } catch (err) {
+      errMsg ??= errorMessage(err);
+    }
+    if (signal.aborted) return;
+    const found = extractObject(raw, schema, accept);
+    if (found) {
+      send(event(found));
+      send({ type: "done" });
+      return;
+    }
+    lastErr = errMsg;
+    console.warn(`[tutor] no valid ${mode} object from ${label} (${errMsg ?? "unparseable"}). raw:
+` + raw.slice(0, 600));
+  }
+  // Nothing usable from any model. The caller treats a turn with no object as
+  // "do the ordinary thing", so say so quietly rather than failing the lesson.
+  console.warn(`[tutor] ${mode} fell through (${lastErr ?? "empty"}); caller will use its default`);
+  send({ type: "done" });
+}
+
+/**
  * Plan mode: collect the planner's full output, pull the lesson-plan JSON object
  * out of it (reasoning models may wrap JSON in prose), validate it and emit one
  * `plan` event. Retries once; on overload walks the fallback model chain.
@@ -337,6 +625,7 @@ async function streamPlan({
   signal,
   send,
   fallbackTopic,
+  mode,
 }: StreamArgs & { fallbackTopic: string }) {
   let lastErr: string | null = null;
   for (let mi = 0; mi < models.length; mi++) {
@@ -351,15 +640,20 @@ async function streamPlan({
           messages,
           temperature: 0.4,
           // Thinking is ON here and reasoning tokens come out of the same
-          // budget, so leave room for a full 8-step plan after the model has
-          // finished thinking.
-          maxOutputTokens: 6000,
+          // budget, so leave room for a full plan AFTER the model has finished
+          // thinking. Raised with the step range (8-12, each carrying a title,
+          // teach note, draw hint and roadmap line): at 6000 a 12-step plan
+          // spent its budget reasoning and truncated mid-array, and a truncated
+          // plan loses its last steps silently — StepScanner only ever sees the
+          // objects that closed.
+          maxOutputTokens: 10000,
           maxRetries: 1,
           abortSignal: signal,
           onError: ({ error }) => {
             errMsg ??= errorMessage(error);
           },
         });
+        logCacheUsage(result.usage, label, mode);
         const steps = new StepScanner((step, index) => send({ type: "planstep", index, step }));
         for await (const delta of result.textStream) {
           if (signal.aborted) return;
@@ -396,12 +690,20 @@ async function streamPlan({
 }
 
 /**
- * Find the lesson-plan JSON in the planner's raw output. Scans for every complete
- * top-level {...} object (brace depth, ignoring braces inside strings) and returns
- * the last one that validates — robust to reasoning text and fences around it.
+ * Find the LAST top-level {...} in a model's raw output that validates against
+ * `schema` and satisfies `accept`.
+ *
+ * Scans brace depth while ignoring braces inside strings, so it is robust to the
+ * reasoning text, prose and code fences a thinking model wraps its answer in.
+ * Takes the last match rather than the first because a model that reasons out
+ * loud often writes a draft object before its real answer.
  */
-function extractPlan(raw: string): LessonPlan | null {
-  let best: LessonPlan | null = null;
+function extractObject<T>(
+  raw: string,
+  schema: { safeParse: (v: unknown) => { success: true; data: T } | { success: false } },
+  accept: (v: T) => boolean = () => true,
+): T | null {
+  let best: T | null = null;
   let depth = 0;
   let start = -1;
   let inStr = false;
@@ -422,8 +724,8 @@ function extractPlan(raw: string): LessonPlan | null {
       depth--;
       if (depth === 0 && start >= 0) {
         try {
-          const parsed = LessonPlanSchema.safeParse(JSON.parse(raw.slice(start, i + 1)));
-          if (parsed.success && parsed.data.steps.length > 0) best = parsed.data;
+          const parsed = schema.safeParse(JSON.parse(raw.slice(start, i + 1)));
+          if (parsed.success && accept(parsed.data)) best = parsed.data;
         } catch {
           /* not JSON; skip */
         }
@@ -432,6 +734,11 @@ function extractPlan(raw: string): LessonPlan | null {
     }
   }
   return best;
+}
+
+/** The lesson-plan object in the planner's output: the last one with real steps. */
+function extractPlan(raw: string): LessonPlan | null {
+  return extractObject(raw, LessonPlanSchema, (p) => p.steps.length > 0);
 }
 
 /** LLM_PROVIDER=mock: stream a canned lesson with realistic pacing, no API key needed. */
@@ -570,6 +877,28 @@ class StepScanner {
     const parsed = LessonStepSchema.safeParse(value);
     if (parsed.success && parsed.data.title.trim()) this.onStep(parsed.data, this.count++);
   }
+}
+
+/**
+ * Does this question point at data it does not actually contain?
+ *
+ * "In the following APs find the missing term in the blanks" names a list that the PDF
+ * printed as a picture: the text survives, the values do not. Contrast "Find the sum of
+ * the first 22 terms of an AP in which d = 7", which carries its own numbers. The test
+ * is deliberately conservative — it only fires on a phrase that explicitly defers to
+ * something else AND a question too sparse in numbers to stand alone — because a false
+ * positive turns a solvable question into a method lecture.
+ */
+function referencesMissingData(question: string): boolean {
+  const defers =
+    /\b(following|below|above|given (?:figure|table|diagram|graph)|in the (?:blanks?|boxes?|figure|table|diagram|graph)|shown|adjoining|these shapes?|each of the)\b/i.test(
+      question,
+    );
+  if (!defers) return false;
+  // Numbers the question supplies itself. A genuine self-contained question names
+  // several; a pointer to a figure names none or one (often just the question number).
+  const numbers = question.match(/-?\d+(?:\.\d+)?/g) ?? [];
+  return numbers.length <= 2;
 }
 
 function errorMessage(err: unknown): string {

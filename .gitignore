@@ -1,5 +1,7 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
+/qa-report
+
 # dependencies
 /node_modules
 /.pnp
@@ -47,6 +49,10 @@ next-env.d.ts
 # RAG data: NCERT PDFs are copyright ("not to be republished"); the index is regenerated
 # from them by rag/build_index.py. Keep both out of git.
 /rag/data/
+
+# Solution PDFs (Vedantu, ~785 MB) are third-party copyright for the same reason, and
+# rag/build_solutions.py + rag/embed_solutions.py regenerate everything derived from them.
+/rag/NCERT_Solutions/
 
 # python
 __pycache__/

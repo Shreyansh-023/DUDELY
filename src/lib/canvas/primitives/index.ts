@@ -3,6 +3,7 @@ import { expandAngle } from "./angle";
 import { expandApparatus } from "./apparatus";
 import { expandAxes } from "./axes";
 import { expandBars } from "./bars";
+import { expandCircles } from "./circles";
 import { expandCircuit } from "./circuit";
 import { expandCurvearrow } from "./curvearrow";
 import { expandFraction } from "./fraction";
@@ -41,6 +42,7 @@ export const PRIMITIVES: Record<string, (op: DrawOp) => Expanded> = {
   angle: expandAngle,
   vector: expandVector,
   table: expandTable,
+  circles: expandCircles,
   circuit: expandCircuit,
   optics: expandOptics,
   molecule: expandMolecule,

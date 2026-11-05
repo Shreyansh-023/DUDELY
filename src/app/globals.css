@@ -63,6 +63,15 @@ body {
   display: none !important;
 }
 
+/* Excalidraw's own right-click menu. BoardMenu already swallows the gesture in
+   the capture phase, so this should never have anything to hide — it is the
+   backstop for the paths that do not go through that listener (Excalidraw's own
+   long-press timer on touch devices, for one). Without it, its menu opened
+   underneath ours and showed through the translucent panel. */
+.excalidraw .context-menu {
+  display: none !important;
+}
+
 /* No zoom controls (− 100% +): the board frames itself and the UI stays clean. */
 .excalidraw .zoom-actions {
   display: none !important;
@@ -74,6 +83,15 @@ body {
    going through the player. BoardPager renders the button under this same name,
    and takes the student back to the page Indica is actually writing on. */
 .excalidraw .scroll-back-to-content {
+  display: none !important;
+}
+
+/* Excalidraw's welcome screen ("Ask Indica anything — type or talk") invites the
+   student to ask something. While the lesson is being PLANNED they already have,
+   and the planning card sits over this same empty canvas — so the invitation read
+   straight through the card. Hidden for the duration; it comes back if planning
+   fails and the board is genuinely empty and waiting again. */
+[data-planning="true"] .excalidraw .welcome-screen-center {
   display: none !important;
 }
 
@@ -204,6 +222,26 @@ body {
   .doubt-frame::after,
   .doubt-frame i,
   .doubt-frame b {
+    animation: none;
+  }
+}
+
+/* The start screen moves one step at a time; each panel arrives with a short
+   rise so the change of question is felt rather than just noticed. Kept small
+   and fast — this fires on every step, and anything slower reads as lag. */
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-\[fadeUp_240ms_ease-out\] {
     animation: none;
   }
 }

@@ -8,7 +8,8 @@
     "dev:relay": "node scripts/stt-relay.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "qa:regress": "node --experimental-strip-types --import ./scripts/ts-resolve.mjs scripts/qa-regress.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.74",

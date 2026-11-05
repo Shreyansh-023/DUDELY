@@ -54,6 +54,12 @@ const TOP_K_BY_MODE: Record<string, number> = {
   doubt: Number(process.env.RAG_TOP_K_DOUBT || 5),
   explain: Number(process.env.RAG_TOP_K_EXPLAIN || TOP_K),
   ask: Number(process.env.RAG_TOP_K_ASK || TOP_K),
+  // Solving is grounded mainly by the solutions index (lib/solutions), but the
+  // textbook passages matter more than "theory for a step": where a question's data
+  // was a figure the solution sheet lost, the chapter text is usually the only place
+  // the real values survive. Worth a few extra passages.
+  solve: Number(process.env.RAG_TOP_K_SOLVE_BOOK || 4),
+  solvedoubt: Number(process.env.RAG_TOP_K_SOLVEDOUBT || 3),
 };
 const CANDIDATES = 30;
 const RRF_K = 60;
@@ -145,8 +151,13 @@ class Bm25 {
   private lens: number[];
   private avgdl: number;
   private idf = new Map<string, number>();
+  // Written out rather than declared as constructor parameter properties, which
+  // need a full TS transform: this file is imported directly by
+  // scripts/qa-regress.mjs under `node --experimental-strip-types`.
+  private k1 = 1.5;
+  private b = 0.75;
 
-  constructor(docs: string[][], private k1 = 1.5, private b = 0.75) {
+  constructor(docs: string[][]) {
     this.tfs = docs.map((d) => {
       const tf = new Map<string, number>();
       for (const t of d) tf.set(t, (tf.get(t) ?? 0) + 1);
@@ -254,18 +265,19 @@ type Refs = {
 // is NUMERIC and the numbering is identical across editions, so a Hindi/Hinglish request
 // ("अध्याय 1 का उदाहरण 2", "chapter 1 ka example 2") resolves straight into the (English)
 // structure index; the tutor then teaches that unit in the student's language.
-const SEP = "[\\s:#.\\-]*"; // optional separators between a keyword and its number
+const SEP = String.raw`[\s:#.\-]*`; // optional separators between a keyword and its number
 // Negative lookbehind: not preceded by a letter (Latin or Devanagari) so short aliases
 // ("q", "chap") never fire inside a word ("each 1", "quadratic 2").
-const kw = (...alts: string[]) => `(?<![a-z\\u0900-\\u097f])(?:${alts.join("|")})`;
+const kw = (...alts: string[]) =>
+  String.raw`(?<![a-z\u0900-\u097f])` + `(?:${alts.join("|")})`;
 const K_CHAPTER = kw("chapters?", "chap", "adhyaay", "adhyay", "अध्याय", "चैप्टर");
-const K_EXAMPLE = kw("examples?", "udaharan\\w*", "udhaaran\\w*", "उदाहरण");
+const K_EXAMPLE = kw("examples?", String.raw`udaharan\w*`, String.raw`udhaaran\w*`, "उदाहरण");
 const K_THEOREM = kw("theorems?", "prameya?", "प्रमेय");
 const K_EXERCISE = kw("exercises?", "prashnaavali", "prashnavali", "abhyaas", "abhyas", "प्रश्नावली", "अभ्यास");
 const K_SECTION = kw("sections?", "anubhag", "अनुभाग", "खंड", "भाग");
 const K_PAGE = kw("page", "pej", "prishtha?", "पृष्ठ", "पेज");
 const K_QUESTION = kw("questions?", "ques", "prashn", "sawaal", "sawal", "problem", "q", "प्रश्न", "सवाल");
-const NUM = "(?:no\\.?\\s*|number\\s*|sankhya\\s*|संख्या\\s*)?"; // optional "no."/"number"/"संख्या"
+const NUM = String.raw`(?:no\.?\s*|number\s*|sankhya\s*|संख्या\s*)?`; // optional "no."/"number"/"संख्या"
 
 // Devanagari digits ०-९ -> 0-9, so "उदाहरण २" is read like "example 2".
 function normalizeDigits(s: string): string {
@@ -277,13 +289,13 @@ function parseStructuralRefs(query: string): Refs {
   const refs: Refs = { examples: [], theorems: [], exercises: [], sections: [], pages: [] };
   // "chapter N" scopes examples (numbered per chapter). Theorems/exercises/sections carry
   // their chapter in the "N.N" ref, so they need no separate chapter.
-  const chapter = q.match(new RegExp(`${K_CHAPTER}${SEP}${NUM}(\\d+)`, "i"))?.[1] ?? null;
-  for (const m of q.matchAll(new RegExp(`${K_EXAMPLE}${SEP}${NUM}(\\d+)`, "gi"))) refs.examples.push({ chapter, num: m[1] });
-  for (const m of q.matchAll(new RegExp(`${K_THEOREM}${SEP}(\\d+\\.\\d+)`, "gi"))) refs.theorems.push(m[1]);
-  const question = q.match(new RegExp(`${K_QUESTION}${SEP}${NUM}(\\d+)`, "i"))?.[1] ?? null;
-  for (const m of q.matchAll(new RegExp(`${K_EXERCISE}${SEP}(\\d+\\.\\d+)`, "gi"))) refs.exercises.push({ ref: m[1], question });
-  for (const m of q.matchAll(new RegExp(`${K_SECTION}${SEP}(\\d+\\.\\d+)`, "gi"))) refs.sections.push(m[1]);
-  for (const m of q.matchAll(new RegExp(`${K_PAGE}${SEP}${NUM}(\\d+)`, "gi"))) refs.pages.push(Number(m[1]));
+  const chapter = q.match(new RegExp(`${K_CHAPTER}${SEP}${NUM}` + String.raw`(\d+)`, "i"))?.[1] ?? null;
+  for (const m of q.matchAll(new RegExp(`${K_EXAMPLE}${SEP}${NUM}` + String.raw`(\d+)`, "gi"))) refs.examples.push({ chapter, num: m[1] });
+  for (const m of q.matchAll(new RegExp(`${K_THEOREM}${SEP}` + String.raw`(\d+\.\d+)`, "gi"))) refs.theorems.push(m[1]);
+  const question = q.match(new RegExp(`${K_QUESTION}${SEP}${NUM}` + String.raw`(\d+)`, "i"))?.[1] ?? null;
+  for (const m of q.matchAll(new RegExp(`${K_EXERCISE}${SEP}` + String.raw`(\d+\.\d+)`, "gi"))) refs.exercises.push({ ref: m[1], question });
+  for (const m of q.matchAll(new RegExp(`${K_SECTION}${SEP}` + String.raw`(\d+\.\d+)`, "gi"))) refs.sections.push(m[1]);
+  for (const m of q.matchAll(new RegExp(`${K_PAGE}${SEP}${NUM}` + String.raw`(\d+)`, "gi"))) refs.pages.push(Number(m[1]));
   return refs;
 }
 
@@ -350,6 +362,49 @@ function resolveStructural(index: Index, query: string): Passage[] {
 const DEVANAGARI = /[ऀ-ॿ]/g;
 
 /**
+ * What the lesson is about, for turns whose own words do not say.
+ *
+ * A teaching turn's last user message is a synthetic nudge ("Continue to the next
+ * step.") pushed by the client, not something the student typed — so the history
+ * carries no topic at all and search would match the nudge itself. The plan does
+ * carry the topic, so teach/doubt/explain turns pass it here.
+ */
+export type LessonContext = {
+  /** `plan.topic`, e.g. "Quadratic Equations". */
+  topic?: string;
+  /** The step being taught, when there is one: its title and teaching note. */
+  step?: { title?: string; teach?: string } | null;
+};
+
+/** Words the client puts in the student's mouth to drive the lesson forward. */
+const SYNTHETIC_TURN = /^(continue to the next step\.?|begin the lesson\.?)$/i;
+
+/**
+ * The text search should match for this turn.
+ *
+ * Normally that is what the student last said. During a lesson it is the plan's
+ * topic plus the current step, because the "student turn" is a synthetic nudge
+ * with no topic in it: matching on that retrieves whatever the nudge happens to
+ * be nearest to (the same wrong chapter every step).
+ */
+function buildQuery(userTurns: string[], lesson?: LessonContext | null): string {
+  const real = userTurns.filter((t) => !SYNTHETIC_TURN.test(t));
+  const planned = [lesson?.topic, lesson?.step?.title, lesson?.step?.teach]
+    .map((s) => s?.trim())
+    .filter((s): s is string => !!s)
+    .join(" ");
+  // A step of a planned lesson: the plan says what this turn teaches. The student's
+  // own opening question comes along too — it is how they framed the topic, and it
+  // is what makes an opener an opener (see OPENER / addChapterFraming).
+  if (planned) return real.length > 0 ? `${real[0]} ${planned}` : planned;
+
+  let query = real.at(-1) ?? userTurns.at(-1) ?? "";
+  // Short follow-ups ("haan", "next step", "why?") carry no topic; add the previous question.
+  if (query.split(/\s+/).length < 6 && real.length > 1) query = `${real.at(-2)} ${query}`;
+  return query;
+}
+
+/**
  * Passages from the student's textbook for the latest question, or [] when there is
  * no index for this book or nothing usable. Devanagari questions search the Hindi
  * edition, everything else the English one (falling back to the other if missing).
@@ -357,12 +412,10 @@ const DEVANAGARI = /[ऀ-ॿ]/g;
 export async function retrieveTextbookContext(
   book: string,
   messages: HistoryMessage[],
-  opts?: { mode?: string },
+  opts?: { mode?: string; lesson?: LessonContext | null },
 ): Promise<{ edition: string; passages: Passage[] }> {
   const userTurns = messages.filter((m) => m.role === "user").map((m) => m.text.trim());
-  let query = userTurns.at(-1) ?? "";
-  // Short follow-ups ("haan", "next step", "why?") carry no topic; add the previous question.
-  if (query.split(/\s+/).length < 6 && userTurns.length > 1) query = `${userTurns.at(-2)} ${query}`;
+  const query = buildQuery(userTurns, opts?.lesson);
   if (!query.trim()) return { edition: "", passages: [] };
 
   const k = (opts?.mode && TOP_K_BY_MODE[opts.mode]) || TOP_K;

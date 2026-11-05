@@ -22,6 +22,20 @@ export const CONTENT_BOTTOM = 660;
 export const MD_PITCH = 50;
 /** Clearance left below existing content when suggesting an origin. */
 export const CLEARANCE = 40;
+/**
+ * Vertical break between two lesson STEPS that share a page. Wider than
+ * CLEARANCE (which separates beats inside one step) so that two subtopics on
+ * one page still read as two subtopics.
+ */
+export const STEP_GAP = 72;
+/**
+ * Air between a step's heading rule and the first line of its working.
+ *
+ * Wider than CLEARANCE (the gap between beats) on purpose: the rule is a
+ * divider, and content that crowds it reads as part of the title rather than as
+ * the body under it.
+ */
+export const HEADING_GAP = 34;
 /** A teaching turn needs at least this much room to continue an existing page. */
 export const MIN_TURN_ROOM = 200;
 /** Below this much room the page is reported FULL. */

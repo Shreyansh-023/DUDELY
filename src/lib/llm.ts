@@ -271,6 +271,7 @@ export function isOverloadedError(msg: string | null | undefined): boolean {
  *   plan           -> [Ultra 253B ("550"), Super 120B, Lightning 30B, other-NVIDIA]
  *   teach / explain-> [Super 120B,         Lightning 30B, other-NVIDIA]
  *   doubt          -> [Super 120B,         Lightning 30B, other-NVIDIA]   (all thinking-OFF)
+ *   checkpoint/grade-> [Lightning 30B,      Super 120B,    other-NVIDIA]   (thinking-OFF, small JSON)
  *   ask (legacy)   -> [configured default model]
  *
  * After the NVIDIA chain exhausts, Groq / Google / the generic default are
@@ -297,13 +298,26 @@ export function getModelChain(mode: string): { model: LanguageModel; label: stri
       push(nvidiaModel(LESSON_MODEL, { thinking: true }));
       push(nvidiaModel(DOUBT_MODEL, { thinking: true }));
       push(nvidiaModel(OTHER_NVIDIA_MODEL));
-    } else if (mode === "teach" || mode === "explain") {
+    } else if (mode === "teach" || mode === "explain" || mode === "solve") {
+      // Solve sits with teach: the reasoning is already done (the book's method is
+      // in the prompt), so thinking stays off and the first beat arrives fast.
       push(nvidiaModel(LESSON_MODEL, { thinking: false }));
       push(nvidiaModel(DOUBT_MODEL, { thinking: false }));
       push(nvidiaModel(OTHER_NVIDIA_MODEL));
-    } else if (mode === "doubt") {
+    } else if (mode === "doubt" || mode === "solvedoubt") {
       push(nvidiaModel(LESSON_MODEL, { thinking: false }));
       push(nvidiaModel(DOUBT_MODEL, { thinking: false }));
+      push(nvidiaModel(OTHER_NVIDIA_MODEL));
+    } else if (mode === "checkpoint" || mode === "grade") {
+      // Both are small closed judgements that return one JSON object, and both
+      // sit in the student's way: the checkpoint runs in the gap after a step
+      // (where the alternative is silence), and the grade runs with the student
+      // waiting to hear whether they were right. So thinking is OFF and the
+      // smaller tier leads — Lightning answers these in well under a second,
+      // and the decision criteria are spelled out in the prompt rather than
+      // being something the model has to reason its way to.
+      push(nvidiaModel(DOUBT_MODEL, { thinking: false }));
+      push(nvidiaModel(LESSON_MODEL, { thinking: false }));
       push(nvidiaModel(OTHER_NVIDIA_MODEL));
     } else {
       // ask: keep the legacy "configured default" (which may itself be NVIDIA).
