@@ -312,6 +312,36 @@ export const DrawOpSchema = z.object({
     .nullish()
     .catch(null)
     .describe("venn: 2 or 3 sets [{label, color?}]."),
+  // --- placement by NAME (figure anchors; see lib/canvas/anchors.ts) ---
+  // The board lays content out itself, so nothing the model draws on a figure
+  // is placed by coordinates: an angle mark, a side label, a highlight or a
+  // construction line names the part of the figure it belongs to instead.
+  at: z
+    .string()
+    .nullish()
+    .catch(null)
+    .describe(
+      'angle/text/highlight: the part of a figure this attaches to — a vertex ("A"), a side ("AB"), "mid AB", "foot A BC" — or, for highlight/arrow, the id of an earlier element.',
+    ),
+  of: z.string().nullish().catch(null).describe("Id of the figure that `at`/`from`/`to` name parts of. Omit for the most recent figure."),
+  from: z.string().nullish().catch(null).describe('line/arrow: start point by name ("A", "mid AB", "foot A BC").'),
+  to: z.string().nullish().catch(null).describe("line/arrow: end point by name, or the id of an element to point at."),
+  place: z
+    .enum(["right", "below"])
+    .nullish()
+    .catch(null)
+    .describe("figure: beside the notes (right) or full-width under them (below). Omit to let the board decide."),
+  // Internal: a run of a scripted line that is drawn in the math fallback font
+  // (the line holds a glyph the hand font lacks). Set by the math layout so the
+  // runs are measured and drawn in the same font; the model never sets it.
+  font: z.enum(["math"]).nullish().catch(null).optional(),
+  // Internal: rotation in radians of a highlight laid along a figure's side.
+  // Set by the anchor expander; the model never sets it.
+  rot: z.number().nullish().catch(null).optional(),
+  // Internal: "fixed" ops are client-authored furniture (step heading, agenda,
+  // question block) drawn at their own page-local coordinates, outside the flow
+  // layout. The model never sets it.
+  layout: z.enum(["fixed"]).nullish().catch(null).optional(),
 });
 export type DrawOp = z.infer<typeof DrawOpSchema>;
 

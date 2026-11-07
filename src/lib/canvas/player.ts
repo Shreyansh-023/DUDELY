@@ -15,25 +15,44 @@ import type {
 import type { ExcalidrawImperativeAPI, NormalizedZoomValue } from "@excalidraw/excalidraw/types";
 import type { DrawOp } from "../schema";
 import { clamp, sleep } from "../utils";
-import { fontsReady } from "./measure";
-import { flattenMath, hasMathScript, normalizeScripts } from "./mathtext";
 import {
-  isPermanentNote,
-  MATH_FONT_FAMILY,
-  needsHandToMathSwitch,
-  needsMathFont,
-  opToSkeleton,
-  type TutorMeta,
-} from "./ops";
-import { expandMathText } from "./primitives/mathline";
+  anchoredAngle,
+  anchoredHighlight,
+  anchoredLabel,
+  elementHighlight,
+  pointerArrow,
+  resolvePoint,
+  retargetSide,
+  segmentLabel,
+  splitAnchorRef,
+  transformAnchors,
+  type Figure,
+} from "./anchors";
+import {
+  freshPageLayout,
+  groupBlocks,
+  isGesture,
+  layoutBeat,
+  textBlockOf,
+  type Block,
+  type BoxBlock,
+  type PageLayout,
+  type Placement,
+  type RawBlock,
+  type SketchFrame,
+  type TextBlock,
+} from "./layout";
+import { fontsReady, measureText } from "./measure";
+import { flattenMath, hasMathNotation, normalizeScripts, symbolsForWords } from "./mathtext";
+import { isPermanentNote, opToSkeleton, type TutorMeta } from "./ops";
 import {
   CLEARANCE,
-  CONTENT_BOTTOM,
-  HEADING_GAP,
+  CONTENT_LEFT,
+  CONTENT_RIGHT,
   CONTENT_TOP,
-  FIT_MARGIN,
+  HEADING_GAP,
   MIN_TURN_ROOM,
-  PAGE_H,
+  CONTENT_BOTTOM,
   PAGE_W,
   STEP_GAP,
   TWEEN_MS,
@@ -46,9 +65,11 @@ import {
   type PageKind,
   type Rect,
 } from "./page";
-import { PRIMITIVES, type Expanded } from "./primitives";
+import { PRIMITIVES, expandPrimitive, type Expanded } from "./primitives";
+import { expandMathText } from "./primitives/mathline";
+import { SCALABLE_OPS, readableSize, scaleOp, type Pt } from "./primitives/util";
 
-/** One page of the board, plus the bookkeeping the UI and the spill test need.
+/** One page of the board, plus the bookkeeping the UI and the layout need.
  *  `Cell` is where it sits on the sheet; `index` is only the order it was
  *  allocated in. */
 type Page = Rect &
@@ -65,11 +86,21 @@ type Page = Rect &
     rev: number;
     /** turn -> every element id it created here, so dropTurn can wipe a turn. */
     turnIds: Map<number, Set<string>>;
-    /** Set once any text on this page has had to fall back to the math font, so
-     *  the REST of the page follows it. A board where `x = [5 ± √49] / 4` is
-     *  Helvetica and the line under it is hand-drawn reads as a glitch; the
-     *  mixture is what looks wrong, not either font. See `boardFontFamily`. */
-    mathFont: boolean;
+    /** Where the next flowed content goes: the cursor and the figures text may wrap beside. */
+    layout: PageLayout;
+    /** Something other than furniture (heading, question) has been flowed here. */
+    bodyPlaced: boolean;
+    /** The figure a bare `at: "A"` refers to on this page. */
+    lastFigure: string | null;
+    /** Student strokes already folded into the layout state. */
+    seenStudent: Set<string>;
+    /**
+     * The page this one is shown together with, as a two-page spread. A step
+     * that runs past its page continues on the page to the RIGHT of it, and
+     * the camera frames both — the figure stays in view while the explanation
+     * under it carries on, the way a teacher keeps the diagram on the board.
+     */
+    spreadWith: number | null;
   };
 
 export type PageInfo = Cell & { index: number; kind: PageKind; used: boolean; rev: number };
@@ -90,6 +121,14 @@ export type PageSnapshot = {
  * text is typed out character by character, arrows grow from start to end,
  * shapes fade in. Everything is appended with CaptureUpdateAction.NEVER so
  * the student's undo stack is untouched.
+ *
+ * WHERE things go is decided by the flow layout engine (layout.ts), never by
+ * the model's coordinates: each beat is split into blocks, the engine places
+ * them below and beside what the page already holds, and this class only
+ * draws at the positions it is handed. Ops that annotate a figure name the
+ * part they belong to and are resolved against the figure's committed
+ * geometry (anchors.ts). There is no collision pass, because nothing is ever
+ * placed where something already is.
  */
 export class BoardPlayer {
   /** LLM-chosen id -> actual element id in the scene. */
@@ -100,17 +139,11 @@ export class BoardPlayer {
   private currentTurn = 0;
   /** The last turn we auto-recentered on, so we jump once at the start of each turn. */
   private recenteredTurn = 0;
-  /**
-   * When collision avoidance moves a shape, every later op in the same turn is
-   * shifted by the same vector, so a diagram keeps its internal layout (arrows
-   * drawn next still meet the shape where the model expected it).
-   */
-  private turnShift = { turn: 0, dx: 0, dy: 0 };
   /** Pending fade-out timers for transient annotations, cancelled on clear. */
   private ephemeralTimers = new Set<ReturnType<typeof setTimeout>>();
   /**
    * Paging: the board is a column of fixed PAGE_W x PAGE_H pages rather than one
-   * endless surface. The model always draws in PAGE-LOCAL coordinates and the
+   * endless surface. Everything is laid out in PAGE-LOCAL coordinates and the
    * player adds the page origin at draw time, so a page is simply a rect in
    * scene space that the camera frames exactly.
    *
@@ -133,8 +166,6 @@ export class BoardPlayer {
   private returnIndex = -1;
   private framedIndex = -1;
   private doubtMode = false;
-  /** Re-anchors a beat at the top of a fresh page after a mid-turn spill. */
-  private pageAnchorDy = 0;
   /** False while the student is reading a page other than the one being written. */
   private follow = true;
   private tween: number | null = null;
@@ -142,8 +173,15 @@ export class BoardPlayer {
   private lastWrote: { scrollX: number; scrollY: number; zoom: number } | null = null;
   private listeners = new Set<() => void>();
   private snapshot: PageSnapshot = { pages: [], activeIndex: -1, viewIndex: -1, follow: true };
-  /** Primitives are expanded once per op: the fit test and the draw share this. */
+  /** Primitives are expanded once per op: measuring and drawing share this. */
   private expandCache = new WeakMap<object, Expanded>();
+  /** Every figure placed so far, by the model's id, with its committed geometry. */
+  private figures = new Map<string, Figure>();
+  /**
+   * Where this turn's free-form sketch landed relative to the model's own
+   * coordinates, so a later beat that draws over it lands over it on the board.
+   */
+  private sketchFrame: { turn: number; page: number; frame: SketchFrame } | null = null;
 
   constructor(private api: ExcalidrawImperativeAPI) {}
 
@@ -165,33 +203,20 @@ export class BoardPlayer {
    * and a heading that appears mid-page reads as a divider rather than a title —
    * so the page break is what makes the heading mean anything.
    *
-   * A step is free to take MORE than one page: `applyBeat` measures every beat,
-   * collision-pushes it below what is already on the page, and spills it onto a
-   * fresh page when it genuinely does not fit. Those spill pages carry no
-   * heading of their own, so a long subtopic reads as one continuous stretch
-   * under the one heading it started with. Steps therefore vary in length, which
-   * is the point: an intuition hook is short, a worked example is not.
-   *
-   * This used to share a page when ~300px was left, to stop a three-line
-   * step burning a whole sheet. That tradeoff no longer holds: steps are longer
-   * now (4-8 beats) so the saving was small, and it cost the one-page-one-idea
-   * structure the headings depend on.
+   * A step is free to take MORE than one page: the layout engine continues a
+   * beat that does not fit on a fresh page. Those spill pages carry no heading
+   * of their own, so a long subtopic reads as one continuous stretch under the
+   * one heading it started with.
    *
    * `freshPage` opts out of sharing entirely: the turn gets a clean sheet even
-   * if the current page has room. A solved question needs this. Its first beat
-   * is laid out SERVER-side (question-board.ts) at fixed page-local coordinates
-   * from CONTENT_TOP, so unlike a model-written step it cannot be re-anchored
-   * below existing content — sharing a page would print the new question's
-   * heading straight over the previous one's.
+   * if the current page has room. A solved question needs this: its question
+   * block is furniture drawn at the top of the page.
    */
   beginTeachTurn(opts?: { stayOnPage?: boolean; newStep?: boolean; freshPage?: boolean }) {
     this.doubtMode = false;
     this.plannedKind = "teach";
-    this.pageAnchorDy = 0;
+    this.sketchFrame = null;
     this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
-    // `freshPage` is checked FIRST, so it also overrides `stayOnPage`: a fixed
-    // server-laid question block can no more dodge the student's own sketch than
-    // it can dodge the previous question.
     if (opts?.freshPage) {
       this.planAt(this.freshTeachSlot());
       this.emit();
@@ -206,13 +231,11 @@ export class BoardPlayer {
     const cur = this.teachIndex >= 0 ? this.pages[this.teachIndex] : undefined;
     const share =
       !opts?.newStep && Boolean(cur && cur.kind === "teach" && CONTENT_BOTTOM - cur.bottom >= MIN_TURN_ROOM);
-    // A step that shares a page was written as if the page were blank, so its
-    // first beat starts around CONTENT_TOP. Drop the whole step to just below
-    // what is already there, with a wider gap than the CLEARANCE used between
-    // beats of one step — that gap is what makes two subtopics on one page read
-    // as two subtopics instead of one run-on block. Collision avoidance still
-    // runs underneath and corrects anything this estimate gets wrong.
-    this.pageAnchorDy = share && cur && cur.used ? Math.max(0, cur.bottom + STEP_GAP - CONTENT_TOP) : 0;
+    if (share && cur && cur.used) {
+      // Two subtopics on one page read as two subtopics: a wider gap than the
+      // one between beats. A figure the previous turn floated is still a float.
+      cur.layout.cursorY = Math.max(cur.layout.cursorY, cur.bottom + STEP_GAP);
+    }
     this.planAt(share && cur ? cur : this.freshTeachSlot());
     this.emit();
   }
@@ -227,7 +250,7 @@ export class BoardPlayer {
    * pointer more slowly than a teaching aside.
    */
   beginDoubtTurn() {
-    this.pageAnchorDy = 0;
+    this.sketchFrame = null;
     if (!this.doubtMode) this.returnIndex = this.teachIndex; // only the FIRST doubt sets the way back
     this.doubtMode = true;
     this.plannedKind = "doubt";
@@ -245,7 +268,7 @@ export class BoardPlayer {
   endDoubt() {
     this.doubtMode = false;
     this.plannedKind = "teach";
-    this.pageAnchorDy = 0;
+    this.sketchFrame = null;
     this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
     const back = this.returnIndex;
     this.returnIndex = -1;
@@ -397,7 +420,11 @@ export class BoardPlayer {
         bottom: CONTENT_TOP,
         rev: 0,
         turnIds: new Map(),
-        mathFont: false,
+        layout: freshPageLayout(),
+        bodyPlaced: false,
+        lastFigure: null,
+        seenStudent: new Set(),
+        spreadWith: null,
       };
       this.pages.push(p);
       this.plannedIndex = p.index;
@@ -407,12 +434,39 @@ export class BoardPlayer {
     return p;
   }
 
-  /** A fresh page of `kind` for a beat that spilled off the one it started on:
+  /** A fresh page of `kind` for a beat that ran past the one it started on:
    *  teaching carries on down its column, a doubt along its row. */
   private appendPage(kind: PageKind): Page {
     this.plannedKind = kind;
-    this.planAt(kind === "doubt" ? this.freshDoubtSlot() : { index: this.pages.length, row: this.lastRow() + 1, col: 0 });
+    if (kind === "doubt") {
+      this.planAt(this.freshDoubtSlot());
+      return this.ensurePage();
+    }
+    // A teaching page that runs over continues on the page to its RIGHT, and
+    // the two are shown as one spread — unless that slot is taken (a second
+    // overflow, or a doubt page already beside it), when the lesson carries on
+    // down the column as a fresh single page.
+    const head = this.pages[this.activeIndex];
+    const slotFree = head && head.kind === "teach" && head.spreadWith == null && head.col === 0 && !this.pages.some((p) => p.row === head.row && p.col === 1);
+    if (head && slotFree) {
+      this.planAt({ index: this.pages.length, row: head.row, col: 1 });
+      const next = this.ensurePage();
+      head.spreadWith = next.index;
+      next.spreadWith = head.index;
+      return next;
+    }
+    this.planAt({ index: this.pages.length, row: this.lastRow() + 1, col: 0 });
     return this.ensurePage();
+  }
+
+  /** The scene rect the camera frames for a page: the page, or its two-page spread. */
+  private viewRect(index: number): Rect {
+    const p = this.pages[index];
+    const partner = p?.spreadWith != null ? this.pages[p.spreadWith] : undefined;
+    if (!p || !partner) return this.pageSceneRect(index);
+    const x = Math.min(p.x, partner.x);
+    const y = Math.min(p.y, partner.y);
+    return { x, y, w: Math.max(p.x + p.w, partner.x + partner.w) - x, h: Math.max(p.y + p.h, partner.y + partner.h) - y };
   }
 
   private recordOnPage(i: number, turn: number, created: ExcalidrawElement[]) {
@@ -426,13 +480,27 @@ export class BoardPlayer {
     for (const e of created) ids.add(e.id);
     const keep = created.filter((e) => isPermanentNote(e));
     if (keep.length) {
-      // Post-collision committed bounds: where the content actually landed.
+      // Committed bounds: where the content actually landed.
       const [, , , y2] = getCommonBounds(keep);
       p.bottom = Math.max(p.bottom, y2 - p.y);
       p.used = true;
     }
     p.rev++;
     this.emit();
+  }
+
+  /** Book-keep what a beat drew, page by page: an anchored annotation may have
+   *  landed on an earlier page than the one being written, and its bounds must
+   *  not be read as that page's. */
+  private recordCreated(turn: number, created: ExcalidrawElement[]) {
+    const byPage = new Map<number, ExcalidrawElement[]>();
+    for (const e of created) {
+      const p = (e.customData as TutorMeta | undefined)?.page ?? this.activeIndex;
+      const list = byPage.get(p) ?? [];
+      list.push(e);
+      byPage.set(p, list);
+    }
+    for (const [p, list] of byPage) this.recordOnPage(p, turn, list);
   }
 
   /**
@@ -449,11 +517,8 @@ export class BoardPlayer {
     this.deleteIds(set, true);
     for (const id of set) this.minted.delete(id);
     this.recomputePages();
-    // The replay lays the beat out again from the model's own coordinates, so
-    // neither the collision shift the abandoned attempt accumulated nor the page
-    // it had spilled onto may carry over into it.
-    this.turnShift = { turn: 0, dx: 0, dy: 0 };
-    this.pageAnchorDy = 0;
+    // The replay lays the beat out again from what is left on the page.
+    this.sketchFrame = null;
     this.emit();
   }
 
@@ -477,7 +542,13 @@ export class BoardPlayer {
     this.emit();
   }
 
-  /** Re-derive every page's occupancy from what is actually left on the board. */
+  /** Whether anything drawn for the model's id `id` is still on the board. */
+  private isLive(id: string): boolean {
+    const rid = this.idMap.get(id) ?? id;
+    return this.all().some((e) => !e.isDeleted && (e.id === rid || (e.customData as TutorMeta | undefined)?.group === rid));
+  }
+
+  /** Re-derive every page's occupancy and layout state from what is actually left on the board. */
   private recomputePages() {
     const live = this.all().filter((e) => !e.isDeleted && isPermanentNote(e));
     for (const p of this.pages) {
@@ -485,13 +556,30 @@ export class BoardPlayer {
       if (!mine.length) {
         p.used = false;
         p.bottom = CONTENT_TOP;
+        p.layout = freshPageLayout();
+        p.bodyPlaced = false;
+        p.lastFigure = null;
       } else {
         const [, , , y2] = getCommonBounds(mine);
         p.used = true;
         p.bottom = Math.max(CONTENT_TOP, y2 - p.y);
+        // A float survives while any of what it framed does; the cursor sits
+        // under everything else, so a replayed beat wraps beside the float.
+        const floats = p.layout.floats.filter((f) => f.ids.some((id) => this.isLive(id)));
+        const floatIds = new Set(floats.flatMap((f) => f.ids.map((id) => this.idMap.get(id) ?? id)));
+        const inFloat = (e: ExcalidrawElement) => {
+          const g = (e.customData as TutorMeta | undefined)?.group;
+          return floatIds.has(e.id) || (g != null && floatIds.has(g));
+        };
+        const rest = mine.filter((e) => !inFloat(e));
+        const restBottom = rest.length ? getCommonBounds(rest)[3] - p.y : CONTENT_TOP - CLEARANCE;
+        p.layout = { cursorY: Math.max(CONTENT_TOP, restBottom + CLEARANCE), floats };
+        p.bodyPlaced = mine.some((e) => !(e.customData as TutorMeta | undefined)?.fixed);
+        if (p.lastFigure && !this.isLive(p.lastFigure)) p.lastFigure = null;
       }
       p.rev++;
     }
+    for (const id of [...this.figures.keys()]) if (!this.isLive(id)) this.figures.delete(id);
   }
 
   /** Back to an empty book. Shared by the `clear` op and clearAll(). */
@@ -505,11 +593,12 @@ export class BoardPlayer {
     this.returnIndex = -1;
     this.framedIndex = -1;
     this.doubtMode = false;
-    this.pageAnchorDy = 0;
     this.follow = true;
     this.recenteredTurn = 0; // so the next beat takes the re-frame branch
     this.ephemeralLingerMs = BoardPlayer.EPHEMERAL_LINGER_MS;
     this.expandCache = new WeakMap();
+    this.figures.clear();
+    this.sketchFrame = null;
     this.emit();
     this.showPage(0, { animate: false });
   }
@@ -584,7 +673,7 @@ export class BoardPlayer {
    * browsing to an earlier page is not undone by the very next beat.
    */
   showPage(index: number, opts?: { animate?: boolean; manual?: boolean }) {
-    const to = this.fitRect(this.pageSceneRect(index));
+    const to = this.fitRect(this.viewRect(index));
     if (!to) return;
     this.framedIndex = index;
     if (opts?.manual) this.follow = index === this.activeIndex;
@@ -638,6 +727,14 @@ export class BoardPlayer {
     this.showPage(this.activeIndex >= 0 ? this.activeIndex : 0, { animate: true, manual: true });
   }
 
+  /** Follow the writing onto `page` once per turn, and whenever the page changes. */
+  private frameForWriting(page: Page, turn: number) {
+    if (this.follow && (page.index !== this.framedIndex || turn !== this.recenteredTurn)) {
+      this.recenteredTurn = turn;
+      this.showPage(page.index, { animate: true }); // navigate, THEN draw
+    }
+  }
+
   private all(): readonly OrderedExcalidrawElement[] {
     return this.api.getSceneElementsIncludingDeleted();
   }
@@ -649,32 +746,6 @@ export class BoardPlayer {
   /** Replace one element (by id) in the scene and commit. */
   private patch(updated: ExcalidrawElement) {
     this.commit(this.all().map((e) => (e.id === updated.id ? updated : e)));
-  }
-
-  /**
-   * Bring text ALREADY on `pageIndex` over to the math font, called the moment
-   * the page latches (see Page.mathFont).
-   *
-   * The glyph that forces the fallback usually turns up in the middle of a
-   * working — "x = [5 ± √49] / 4" on line three — so latching only the lines
-   * after it would still leave the board in two typefaces, which is the actual
-   * complaint. Lines carrying a complex script are left alone: the fallback font
-   * has no Devanagari and switching would drop the letters.
-   *
-   * Width/height are kept as measured, so re-styling can never move anything:
-   * the two fonts differ in metrics and re-flowing committed text would shift a
-   * board the collision logic has already placed around.
-   */
-  private adoptMathFont(pageIndex: number) {
-    let changed = false;
-    const elements = this.all().map((e) => {
-      if (e.type !== "text" || e.isDeleted) return e;
-      if ((e.customData as TutorMeta | undefined)?.page !== pageIndex) return e;
-      if (e.fontFamily === MATH_FONT_FAMILY || !needsHandToMathSwitch(e.text)) return e;
-      changed = true;
-      return { ...e, fontFamily: MATH_FONT_FAMILY, versionNonce: e.versionNonce + 1 };
-    });
-    if (changed) this.commit(elements as readonly ExcalidrawElement[]);
   }
 
   /**
@@ -725,116 +796,192 @@ export class BoardPlayer {
     );
   }
 
+  // --- furniture -------------------------------------------------------------
+
+  /**
+   * Write a step's heading at the very top of its page, then set the cursor
+   * under it so the step's own beats flow beneath the rule. The page's layout
+   * state is reset first: a page is reused after `dropTurn`, and the heading
+   * must not land under whatever the abandoned attempt left in the cursor.
+   */
+  async drawStepHeading(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
+    return this.drawFurniture(ops, turn, signal);
+  }
+
+  /**
+   * Draw a solve turn's server-laid question block, then keep the model's
+   * solution below it. The question is written deterministically
+   * (question-board.ts) at fixed coordinates; the cursor is then set under its
+   * real, post-layout bottom, so no beat can land on it whatever the model
+   * imagined about the page.
+   */
+  async drawQuestionBlock(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
+    return this.drawFurniture(ops, turn, signal);
+  }
+
+  private async drawFurniture(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
+    const page = this.ensurePage();
+    page.layout = freshPageLayout();
+    page.bodyPlaced = false;
+    const created = await this.applyBeat(
+      ops.map((o) => ({ ...o, layout: "fixed" as const })),
+      turn,
+      signal,
+    );
+    if (created.length) page.layout.cursorY = Math.max(page.layout.cursorY, page.bottom + HEADING_GAP);
+    return created;
+  }
+
+  // --- beats ---------------------------------------------------------------
+
   /**
    * Applies a beat's ops in order. Resolves when all animation is done or the
    * signal aborts.
    *
-   * Before any drawing: work out which page this beat belongs on and frame it.
-   * A beat that would run off the bottom of a used page spills onto a fresh one
-   * of the same kind, re-anchored at that page's top — so a long doubt simply
-   * continues on the next page instead of folding back over its own content.
+   * The beat is split into blocks, laid out by the flow engine against the
+   * page's current state (continuing onto fresh pages as needed), and drawn at
+   * the positions the engine returns. Ops that annotate a figure by name are
+   * resolved against the registry and drawn on that figure's page.
    */
-  /**
-   * Write a step's heading at the very top of its page, then reserve the band
-   * it occupies so the step's own beats start underneath it.
-   *
-   * The order is the whole point and cannot be split by the caller: the heading
-   * is laid out at the page's true top (anchor 0), and only once it is down is
-   * the anchor moved below it. Setting the anchor first would push the heading
-   * down with everything else; drawing the heading and hoping collision
-   * avoidance moves the body is what put the first line of working straight
-   * through the title.
-   */
-  async drawStepHeading(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
-    this.pageAnchorDy = 0;
-    const created = await this.applyBeat(ops, turn, signal);
-    if (!created.length) return created;
-    const page = this.pages[this.activeIndex];
-    if (!page) return created;
-    // `page.bottom` is page-local and was just updated with the rule's real,
-    // post-layout bottom edge — so this reserves exactly what was drawn rather
-    // than a guess at how tall a heading is.
-    this.pageAnchorDy = Math.max(0, page.bottom + HEADING_GAP - CONTENT_TOP);
-    return created;
-  }
-
   async applyBeat(ops: DrawOp[], turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
     this.currentTurn = turn;
     // Lay nothing out until the board font can be measured: on a cold page
     // Excalifont is still loading, and widths measured against a substitute
-    // put superscripts and diagram labels in the wrong place.
+    // wrap lines and place labels wrongly.
     await fontsReady();
     if (signal.aborted) return [];
     // Rewrite any Unicode "x²"/"H₂O" the model slipped in into ^/_ notation, so
     // it is laid out as real raised type instead of rendering as mojibake.
-    ops = ops.map(withNormalizedScripts);
+    ops = ops.map(normalizeBoardText);
+    ops = ops.flatMap((o) => this.dedupeFigure(o, turn));
+    const raw = groupBlocks(ops);
+    for (const b of raw) if (b.kind === "control") this.applyControl(b.op);
+    const flow = raw.filter(
+      (b): b is Extract<RawBlock, { kind: "text" | "figure" | "sketch" | "fixed" }> =>
+        b.kind === "text" || b.kind === "figure" || b.kind === "sketch" || b.kind === "fixed",
+    );
+    const anchored = raw.filter((b): b is Extract<RawBlock, { kind: "anchored" }> => b.kind === "anchored");
+    for (const b of raw) {
+      if (b.kind === "gesture") console.warn("[board] dropped a pointing gesture with nothing to point at", b.op);
+    }
     // erase/clear-only beats (and a beat with no draw ops at all) must not
     // allocate a page or move the camera, or an answer given in words alone
     // would leave a blank page behind.
-    const drawing = ops.filter((o) => o.op !== "clear" && o.op !== "erase");
-    if (drawing.length) {
-      const page = this.ensurePage();
-      const carried = this.turnShift.turn === turn ? this.turnShift : { dx: 0, dy: 0 };
-      const raw = this.measureBeat(drawing, carried);
-      // Measure where this beat will REALLY sit: ops are drawn at
-      // `pageAnchorDy`, so a step sharing a page is already offset below the
-      // step above it. Testing the unoffset box would under-report the bottom
-      // and let a beat run off the page it was supposed to spill from.
-      const box = raw && { ...raw, y1: raw.y1 + this.pageAnchorDy, y2: raw.y2 + this.pageAnchorDy };
-      if (box && page.used) {
-        // Collision avoidance will push this beat below what is already here;
-        // model that push, or the beat spills one page later than it should.
-        // The anchor already clears `page.bottom` for a shared step's first
-        // beat, so `push` correctly comes out as 0 there rather than doubling.
-        const push = Math.max(0, page.bottom + CLEARANCE - box.y1);
-        if (box.y2 + push + FIT_MARGIN > CONTENT_BOTTOM) {
-          this.appendPage(page.kind);
-          this.turnShift = { turn, dx: 0, dy: 0 }; // stays page-local
-          // Re-anchor at the fresh page's top, measured from the UNOFFSET box:
-          // the old page's step gap must not travel to the new page.
-          this.pageAnchorDy = CONTENT_TOP - (raw ? raw.y1 : CONTENT_TOP);
-        }
-      }
-      const target = this.pages[this.activeIndex];
-      if (target && this.follow && (target.index !== this.framedIndex || turn !== this.recenteredTurn)) {
-        this.recenteredTurn = turn;
-        this.showPage(target.index, { animate: true }); // navigate, THEN draw
-      }
-    }
+    if (!flow.length && !anchored.length) return [];
+
     const created: ExcalidrawElement[] = [];
-    for (const op of ops) {
+    if (flow.length) {
+      const page = this.ensurePage();
+      this.absorbStudentContent(page);
+      const blocks: Block[] = flow.map((b, i) => {
+        if (b.kind === "text") return textBlockOf(b.op, i);
+        const ops = b.kind === "figure" ? b.ops.map(readableSize) : b.ops;
+        const bbox = this.measureOps(ops);
+        const scalable = ops.every((o) => SCALABLE_OPS.has(o.op) || o.op === "text");
+        const gestureOnly = b.kind === "sketch" && ops.every(isGesture);
+        return { kind: b.kind, index: i, ops, bbox, scalable, place: ops[0]?.place ?? null, gestureOnly } satisfies BoxBlock;
+      });
+      const frame =
+        this.sketchFrame && this.sketchFrame.turn === turn && this.sketchFrame.page === page.index
+          ? this.sketchFrame.frame
+          : null;
+      const res = layoutBeat(blocks, page.layout, frame, (t, px) => measureText(t, px), { startsFresh: !page.bodyPlaced });
+      const targets: Page[] = [page];
+      for (let k = 1; k < res.pages.length; k++) targets.push(this.appendPage(page.kind));
+      res.pages.forEach((st, k) => {
+        targets[k].layout = st;
+      });
+      const last = targets[targets.length - 1];
+      this.sketchFrame = res.frame ? { turn, page: last.index, frame: res.frame } : null;
+
+      let shown: Page | null = null;
+      for (const p of res.placements) {
+        if (signal.aborted) break;
+        const target = targets[p.page];
+        if (target !== shown) {
+          this.frameForWriting(target, turn);
+          shown = target;
+        }
+        const block = blocks[p.index];
+        try {
+          if (p.kind === "text" && block.kind === "text") created.push(...(await this.drawTextAt(block, p, target, turn, signal)));
+          else if (p.kind === "box" && block.kind !== "text") created.push(...(await this.drawBoxAt(block, p, target, turn, signal)));
+        } catch (err) {
+          console.warn("[board] failed block", block, err);
+        }
+        if (block.kind !== "fixed") target.bodyPlaced = true;
+        await sleep(60, signal);
+      }
+      // The write cursor stays on the page the beat ended on.
+      this.activeIndex = last.index;
+      if (last.kind === "teach") this.teachIndex = last.index;
+      this.planAt(last);
+    }
+    for (const b of anchored) {
       if (signal.aborted) break;
       try {
-        created.push(...(await this.applyOp(op, turn, signal)));
+        created.push(...(await this.drawAnchored(b.op, turn, signal, !flow.length)));
       } catch (err) {
-        console.warn("[board] failed op", op, err);
+        console.warn("[board] failed annotation", b.op, err);
       }
-      await sleep(80, signal);
+      await sleep(60, signal);
     }
-    if (created.length) this.recordOnPage(this.activeIndex, turn, created);
+    if (created.length) this.recordCreated(turn, created);
     return created;
   }
 
-  /** Expand a primitive once and reuse it: the fit test and the draw agree. */
+  private applyControl(op: DrawOp) {
+    if (op.op === "clear") {
+      this.cancelEphemeralFades();
+      const next = this.all().map((e) => (e.isDeleted ? e : newElementWith(e, { isDeleted: true })));
+      this.commit(next);
+      this.idMap.clear();
+      this.minted.clear();
+      this.resetPages(); // board wiped: back to a single blank first page
+      return;
+    }
+    if (op.op === "erase") {
+      const ids = new Set<string>();
+      for (const id of op.ids ?? []) ids.add(this.idMap.get(id) ?? id);
+      this.deleteIds(ids);
+      this.recomputePages();
+    }
+  }
+
+  /**
+   * Fold the student's own strokes on this page into its layout state, so a
+   * reply beside their work lands beside it: a sketch on the right half is a
+   * float the notes wrap around, anything else pushes the cursor below it.
+   */
+  private absorbStudentContent(page: Page) {
+    for (const e of this.all()) {
+      if (e.isDeleted || (e.customData as TutorMeta | undefined)?.tutor) continue;
+      if (page.seenStudent.has(e.id) || this.pageOf(e) !== page.index) continue;
+      page.seenStudent.add(e.id);
+      const [x1, y1, x2, y2] = getCommonBounds([e]);
+      const r = { x: x1 - page.x, y: y1 - page.y, w: x2 - x1, h: y2 - y1 };
+      if (r.x > PAGE_W / 2) page.layout.floats.push({ rect: r, ids: [e.id] });
+      else page.layout.cursorY = Math.max(page.layout.cursorY, r.y + r.h + CLEARANCE);
+    }
+  }
+
+  /** Expand a primitive once and reuse it: measuring and drawing agree. */
   private expand(op: DrawOp): Expanded {
     let e = this.expandCache.get(op as object);
     if (!e) {
-      e = PRIMITIVES[op.op] ? PRIMITIVES[op.op](op) : expandMathText(op);
+      e = expandPrimitive(op) ?? expandMathText(op);
       this.expandCache.set(op as object, e);
     }
     return e;
   }
 
   /**
-   * The page-local box this beat WOULD occupy, before collision avoidance.
-   * Built from real converted elements rather than measure.ts (which sizes a
-   * stand-in font) or `e.y + e.height` (wrong for an arrow drawn upward).
-   * Transient gestures are skipped: they fade, so they must not force a break.
+   * The box a set of ops WOULD occupy, in their own coordinates, before any
+   * placement. Built from real converted elements rather than measure.ts
+   * (which sizes a stand-in font) or `e.y + e.height` (wrong for an arrow
+   * drawn upward).
    */
-  private measureBeat(
-    ops: DrawOp[],
-    carried: { dx: number; dy: number },
-  ): { x1: number; y1: number; x2: number; y2: number } | null {
+  private measureOps(ops: DrawOp[]): Rect {
     let x1 = Infinity;
     let y1 = Infinity;
     let x2 = -Infinity;
@@ -846,8 +993,6 @@ export class BoardPlayer {
       y2 = Math.max(y2, ay2);
     };
     for (const op of ops) {
-      if (op.temp === true) continue;
-      if (op.op === "arrow" && op.temp !== false) continue; // a bare arrow is a pointing gesture
       if (PRIMITIVES[op.op] || isMathText(op)) {
         const ex = this.expand(op);
         // The declared bbox carries padding the children do not report; the
@@ -858,8 +1003,8 @@ export class BoardPlayer {
         this.measureLow(op, add);
       }
     }
-    if (!Number.isFinite(x1)) return null;
-    return { x1: x1 + carried.dx, y1: y1 + carried.dy, x2: x2 + carried.dx, y2: y2 + carried.dy };
+    if (!Number.isFinite(x1)) return { x: ops[0]?.x ?? 0, y: ops[0]?.y ?? 0, w: 1, h: 1 };
+    return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
   }
 
   private measureLow(op: DrawOp, add: (x1: number, y1: number, x2: number, y2: number) => void) {
@@ -871,89 +1016,286 @@ export class BoardPlayer {
     add(x1, y1, x2, y2);
   }
 
-  private async applyOp(op: DrawOp, turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
-    if (op.op === "clear") {
-      this.cancelEphemeralFades();
-      const next = this.all().map((e) => (e.isDeleted ? e : newElementWith(e, { isDeleted: true })));
-      this.commit(next);
-      this.idMap.clear();
-      this.minted.clear();
-      this.turnShift = { turn: 0, dx: 0, dy: 0 };
-      this.resetPages(); // board wiped: back to a single blank first page
-      return [];
+  /** A text block at the position the engine gave it (wrapped, maybe one part of a split). */
+  private async drawTextAt(
+    block: TextBlock,
+    p: Extract<Placement, { kind: "text" }>,
+    page: Page,
+    turn: number,
+    signal: AbortSignal,
+  ): Promise<ExcalidrawElement[]> {
+    const op: DrawOp = { ...block.op, x: p.x, y: p.y, text: p.lines.join("\n") };
+    if (block.math) {
+      const ex = expandMathText(op);
+      return this.drawGroup(ex.ops, this.resolveId(op.id), ex.label, page, turn, signal);
     }
-    if (op.op === "erase") {
-      const ids = new Set<string>();
-      for (const id of op.ids ?? []) ids.add(this.idMap.get(id) ?? id);
-      this.deleteIds(ids);
-      return [];
+    return this.drawFree(op, page, turn, signal);
+  }
+
+  /** A figure, sketch or fixed block at the position the engine gave it. */
+  private async drawBoxAt(
+    block: BoxBlock,
+    p: Extract<Placement, { kind: "box" }>,
+    page: Page,
+    turn: number,
+    signal: AbortSignal,
+  ): Promise<ExcalidrawElement[]> {
+    let ops = block.ops;
+    let bbox = block.bbox;
+    if (p.scale !== 1) {
+      ops = ops.map((o) => scaleOp(o, p.scale));
+      bbox = this.measureOps(ops);
     }
-
-    // Carry forward any shift collision avoidance made earlier in this turn.
-    const carried = this.turnShift.turn === turn ? this.turnShift : { dx: 0, dy: 0 };
-    // High-level primitives lay themselves out perfectly, then dodge as one unit.
-    // A text op written with ^/_ notation joins them: it becomes several runs at
-    // different sizes and baselines, which must move together.
-    if (PRIMITIVES[op.op] || isMathText(op)) return this.applyGroup(op, carried, turn, signal);
-
-    // A bare `arrow` op is a pointing gesture by default: it fades on its own
-    // unless the model explicitly marks it permanent (temp:false). The model
-    // routinely forgets temp:true on "look here" arrows, and a forgotten flag
-    // used to leave a permanent arrow that piled up over the turns. Structural
-    // arrows come from primitives (vector/axes/optics), not raw `arrow` ops,
-    // so treating raw arrows as transient is safe. Marking it temp here also
-    // keeps it from acting as a collision obstacle for later content.
-    const ephemeral = op.op === "arrow" ? op.temp !== false : op.temp === true;
-    if (ephemeral !== Boolean(op.temp)) op = { ...op, temp: ephemeral };
-
-    const page = this.ensurePage();
-    // The page origin is added HERE and never stored, so turnShift stays
-    // page-local and its clamp keeps measuring the right quantity.
-    const ox = page.x;
-    const oy = page.y + this.pageAnchorDy;
-    const elementId = this.resolveId(op.id);
-    // Latch the page onto the math font BEFORE converting, so the op that forces
-    // the switch is itself drawn in it along with everything that follows.
-    if (!page.mathFont && needsMathFont(op.text)) {
-      page.mathFont = true;
-      this.adoptMathFont(page.index); // bring the lines already written over too
+    // Labels keep their size when a figure shrinks, so the real box can be a
+    // little wider than the engine's estimate: keep it inside the page.
+    const px = Math.max(CONTENT_LEFT, Math.min(p.x, CONTENT_RIGHT - bbox.w));
+    const dx = px - bbox.x;
+    const dy = p.y - bbox.y;
+    if (block.kind === "sketch") ops = this.spreadSketchText(ops);
+    const created: ExcalidrawElement[] = [];
+    for (const op of ops) {
+      if (signal.aborted) break;
+      if (PRIMITIVES[op.op]) {
+        const ex = this.expand(op);
+        const groupId = this.resolveId(op.id);
+        created.push(...(await this.drawGroup(ex.ops.map((c) => shiftOp(c, dx, dy)), groupId, ex.label, page, turn, signal)));
+        if (ex.anchors) {
+          const id = op.id ?? groupId;
+          const labelBoxes = ex.ops
+            .filter((c) => c.op === "text")
+            .map((c) => {
+              let r: Rect = { x: 0, y: 0, w: 0, h: 0 };
+              this.measureLow(shiftOp(c, dx, dy), (x1, y1, x2, y2) => (r = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }));
+              return r;
+            });
+          this.figures.set(id, { id, page: page.index, turn, anchors: transformAnchors(ex.anchors, 1, dx, dy), labelBoxes, markedVertices: [], segments: [] });
+          page.lastFigure = id;
+        }
+      } else if (isMathText(op)) {
+        const ex = expandMathText(shiftOp(op, dx, dy));
+        created.push(...(await this.drawGroup(ex.ops, this.resolveId(op.id), ex.label, page, turn, signal)));
+      } else {
+        created.push(...(await this.drawFree(shiftOp(op, dx, dy), page, turn, signal)));
+      }
+      await sleep(40, signal);
     }
-    const skeleton = opToSkeleton(shiftOp(op, carried.dx + ox, carried.dy + oy), turn, elementId, page.index, page.mathFont);
-    if (!skeleton) return [];
+    return created;
+  }
 
-    const converted = convertToExcalidrawElements([skeleton], { regenerateIds: false });
-    if (!converted.length) return [];
+  /**
+   * The text labels of a free-form sketch, nudged apart where the model gave
+   * two of them the same spot. Shapes and lines stay exactly where they were
+   * drawn — only a label that would print over an earlier label moves, and only
+   * downward, by the overlap. The one hand-placed case the flow layout cannot
+   * see inside.
+   */
+  private spreadSketchText(ops: DrawOp[]): DrawOp[] {
+    const placed: Rect[] = [];
+    return ops.map((op) => {
+      if (op.op !== "text" || !op.text) return op;
+      let box: Rect = { x: op.x ?? 0, y: op.y ?? 0, w: 0, h: 0 };
+      this.measureLow(op, (x1, y1, x2, y2) => (box = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }));
+      let shift = 0;
+      for (let pass = 0; pass < 6; pass++) {
+        const hit = placed.find(
+          (r) => box.x < r.x + r.w + 4 && box.x + box.w > r.x - 4 && box.y + shift < r.y + r.h + 4 && box.y + shift + box.h > r.y - 4,
+        );
+        if (!hit) break;
+        shift = hit.y + hit.h + 6 - box.y;
+      }
+      placed.push({ ...box, y: box.y + shift });
+      return shift ? { ...op, y: (op.y ?? 0) + shift } : op;
+    });
+  }
 
-    // Shapes with labels come back as [container, boundText].
-    let rest = converted.slice(1);
-    let primary: ExcalidrawElement = converted[0];
-    if (primary.type === "text") {
-      // Keep free-standing text from landing on top of anything already drawn.
-      const { dx, dy } = this.collisionPush(primary, page.index);
-      if (dx || dy) primary = newElementWith(primary, { x: primary.x + dx, y: primary.y + dy });
-    } else if (op.op === "rect" || op.op === "ellipse" || op.op === "diamond") {
-      // Shapes dodge existing content too — and drag the rest of the turn with
-      // them, so arrows drawn next still connect where the model expected.
-      const { dx, dy } = this.collisionPush(primary, page.index);
-      if (dx || dy) {
-        primary = newElementWith(primary, { x: primary.x + dx, y: primary.y + dy });
-        rest = rest.map((e) => newElementWith(e, { x: e.x + dx, y: e.y + dy }));
-        // A transient shape is about to vanish, so don't make the rest of the
-        // turn inherit a shift caused by something that won't stay on the board.
-        // Clamp upward/leftward accumulation so a shape escaping up can't march
-        // the rest of the turn off the top/left of the work area.
-        if (!op.temp)
-          this.turnShift = {
-            turn,
-            dx: Math.max(carried.dx + dx, -120),
-            dy: Math.max(carried.dy + dy, -120),
-          };
+  /**
+   * A polygon with the same labelled vertices as one already on this page is
+   * the same figure drawn again — the model does this when it wants to add
+   * side labels, despite being told to annotate. The copy is not drawn; its
+   * side labels become anchored labels on the figure that is already there.
+   */
+  private dedupeFigure(op: DrawOp, turn: number): DrawOp[] {
+    if (op.op !== "polygon" || !op.points || op.points.length < 3) return [op];
+    const labels = op.points.map((p) => (p.label ?? "").trim());
+    if (labels.some((l) => !l)) return [op];
+    const key = labels.join("");
+    const page = this.activeIndex;
+    const existing = [...this.figures.values()].reverse().find((f) => {
+      // The same step, or the same page (a doubt annotating the lesson's figure).
+      if (f.turn !== turn && f.page !== page) return false;
+      const names = Object.keys(f.anchors.vertexIndex).filter((n) => !/^v\d+$/.test(n));
+      return names.length === labels.length && names.join("") === key;
+    });
+    if (!existing) return [op];
+    console.warn(`[board] figure ${key} is already on this page; its side labels are added to it instead`, op);
+    const out: DrawOp[] = [];
+    (op.sides ?? []).forEach((side, i) => {
+      const t = (side ?? "").trim();
+      if (!t) return;
+      out.push({ op: "text", id: op.id ? `${op.id}.s${i}` : undefined, at: `${labels[i]}${labels[(i + 1) % labels.length]}`, of: existing.id, text: t, color: "blue" });
+    });
+    return out;
+  }
+
+  /** The elements drawn for a model id (an op, or a whole primitive by its group). */
+  private elementsFor(modelId: string): ExcalidrawElement[] {
+    const rid = this.idMap.get(modelId) ?? modelId;
+    return this.all().filter((e) => !e.isDeleted && (e.id === rid || (e.customData as TutorMeta | undefined)?.group === rid));
+  }
+
+  /**
+   * An op that names what it belongs to: an angle at a vertex, a label beside
+   * a side, a highlight on a side or over an element, a construction line
+   * between two named points, a pointer at an element. Resolved against the
+   * committed geometry and drawn on that content's page; a name that resolves
+   * to nothing is dropped, never guessed.
+   */
+  private async drawAnchored(op: DrawOp, turn: number, signal: AbortSignal, frameIt: boolean): Promise<ExcalidrawElement[]> {
+    const targetId = op.at ?? op.to ?? null;
+    // Pointing at an element the board already holds, by its id.
+    if (targetId && (op.op === "highlight" || op.op === "arrow") && !op.from) {
+      const els = this.elementsFor(targetId);
+      if (els.length) {
+        const page = this.pages[this.pageOf(els[0])];
+        if (!page) return [];
+        const [x1, y1, x2, y2] = getCommonBounds(els);
+        const b = { x: x1 - page.x, y: y1 - page.y, w: x2 - x1, h: y2 - y1 };
+        const d = op.op === "highlight" ? elementHighlight(b, op) : pointerArrow(b, op);
+        if (frameIt) this.frameForWriting(page, turn);
+        return this.drawFree(d, page, turn, signal);
       }
     }
-    // Highlights and arrows/lines are not nudged when drawn — highlights overlay
-    // content on purpose, arrows/lines deliberately touch what they point at — but
-    // they still act as obstacles (above) so later text/shapes dodge them.
+    const ref = splitAnchorRef(op.at ?? "");
+    const figId = op.of ?? ref.of ?? this.pages[this.activeIndex]?.lastFigure ?? this.latestFigureId();
+    const fig = figId ? this.figures.get(figId) : undefined;
+    if (!fig) {
+      console.warn("[board] annotation names no figure on the board", op);
+      return [];
+    }
+    // A construction line may join two figures on the same page (a line of
+    // sight from the eye in one triangle to the treetop in another): each end
+    // is looked up in the named figure first, then in the page's other figures.
+    if ((op.op === "line" || op.op === "arrow" || op.op === "curvearrow") && op.from && op.to) {
+      const a = this.resolveAcross(op.from, fig);
+      const b = this.resolveAcross(op.to, fig);
+      if (a && b && a.fig.page === b.fig.page) {
+        const page = this.pages[a.fig.page];
+        if (!page) return [];
+        if (frameIt) this.frameForWriting(page, turn);
+        const d: DrawOp = {
+          op: op.op === "arrow" ? "arrow" : "line",
+          id: op.id ?? undefined,
+          x: a.pt.x,
+          y: a.pt.y,
+          x2: b.pt.x,
+          y2: b.pt.y,
+          color: op.color ?? "red",
+          dash: op.dash ?? undefined,
+          temp: op.temp ?? false, // a construction on a figure is notes unless the model says otherwise
+        };
+        if (a.fig === b.fig) a.fig.segments.push([a.pt, b.pt]);
+        const drawn = await this.drawFree(d, page, turn, signal);
+        // Its text goes beside the midpoint, clear of the figure and of every
+        // label already on it, and is remembered so later labels avoid it.
+        const lbl = op.text ? segmentLabel(a.fig, a.pt, b.pt, { id: op.id, text: op.text, color: op.color ?? "blue" }) : null;
+        if (lbl) {
+          a.fig.labelBoxes.push(lbl.box);
+          drawn.push(...(await this.drawGroup(lbl.ops, this.resolveId(lbl.ops[0].id), lbl.label, page, turn, signal)));
+        }
+        return drawn;
+      }
+      console.warn("[board] construction line names a point no figure on the page has", op);
+      return [];
+    }
+    const page = this.pages[fig.page];
+    if (!page) return [];
+    if (frameIt) this.frameForWriting(page, turn);
+    switch (op.op) {
+      case "angle": {
+        const ex = anchoredAngle(fig, ref.name, op);
+        if (!ex) break;
+        fig.markedVertices.push(ref.name.trim());
+        if (ex.box) fig.labelBoxes.push(ex.box);
+        return this.drawGroup(ex.ops, this.resolveId(op.id), ex.label, page, turn, signal);
+      }
+      case "text": {
+        // "hypotenuse" goes opposite the right angle, "opposite"/"adjacent"
+        // follow the marked angle — whichever side the model named.
+        const r = anchoredLabel(fig, retargetSide(fig, ref.name, op.text ?? ""), op);
+        if (!r) break;
+        fig.labelBoxes.push(r.box);
+        return this.drawGroup(r.ops, this.resolveId(op.id), r.label, page, turn, signal);
+      }
+      case "highlight": {
+        const d = anchoredHighlight(fig, ref.name, op);
+        if (!d) break;
+        return this.drawFree(d, page, turn, signal);
+      }
+      default:
+        break;
+    }
+    console.warn("[board] annotation names a part the figure does not have", op);
+    return [];
+  }
 
+  /** A named point in `preferred`, else in the most recent other figure on its page that has it. */
+  private resolveAcross(name: string, preferred: Figure): { fig: Figure; pt: Pt } | null {
+    const ref = splitAnchorRef(name);
+    const named = ref.of ? this.figures.get(ref.of) : undefined;
+    const order = [named, preferred, ...[...this.figures.values()].reverse().filter((f) => f.page === preferred.page)];
+    for (const f of order) {
+      if (!f) continue;
+      const pt = resolvePoint(f, ref.name);
+      if (pt) return { fig: f, pt };
+    }
+    return null;
+  }
+
+  private latestFigureId(): string | null {
+    let last: string | null = null;
+    for (const id of this.figures.keys()) last = id;
+    return last;
+  }
+
+  /**
+   * Draw one free-standing op at page-local coordinates. A bare `arrow` op is
+   * a pointing gesture by default: it fades on its own unless the model marks
+   * it permanent (temp:false).
+   */
+  private async drawFree(opIn: DrawOp, page: Page, turn: number, signal: AbortSignal): Promise<ExcalidrawElement[]> {
+    const ephemeral = isGesture(opIn);
+    let op = ephemeral !== Boolean(opIn.temp) ? { ...opIn, temp: ephemeral } : opIn;
+    // Excalidraw binds a label to an arrow but not to a plain line, so a line's
+    // text ("line of sight") is written beside its midpoint as its own element.
+    let sideLabel: DrawOp | null = null;
+    if (op.op === "line" && op.text && typeof op.x === "number" && typeof op.y === "number") {
+      const x2 = op.x2 ?? op.x + 120;
+      const y2 = op.y2 ?? op.y;
+      const dx = x2 - op.x;
+      const dy = y2 - op.y;
+      const len = Math.hypot(dx, dy) || 1;
+      // Square to the line, on the upper side; the box is centred on that point.
+      let nx = dy / len;
+      let ny = -dx / len;
+      if (ny > 0) {
+        nx = -nx;
+        ny = -ny;
+      }
+      const w = measureText(op.text, 16);
+      const off = 10 + Math.abs(nx) * (w / 2) + Math.abs(ny) * 10;
+      const mx = (op.x + x2) / 2 + nx * off;
+      const my = (op.y + y2) / 2 + ny * off;
+      sideLabel = { op: "text", id: op.id ? `${op.id}.t` : undefined, x: mx - w / 2, y: my - 10, text: op.text, size: "sm", color: op.color, temp: op.temp };
+      op = { ...op, text: undefined };
+    }
+    const elementId = this.resolveId(op.id);
+    const skeleton = opToSkeleton(shiftOp(op, page.x, page.y), turn, elementId, page.index);
+    if (!skeleton) return [];
+    const converted = convertToExcalidrawElements([skeleton], { regenerateIds: false });
+    if (!converted.length) return [];
+    // Shapes with labels come back as [container, boundText].
+    const rest = converted.slice(1);
+    const primary = converted[0];
     if (primary.type === "text") {
       await this.typeText(primary as ExcalidrawTextElement, signal);
     } else if (primary.type === "arrow" || primary.type === "line") {
@@ -964,57 +1306,28 @@ export class BoardPlayer {
     // Transient pointing gestures linger briefly, then gracefully fade and remove
     // themselves — so repeated "look here" arrows never pile up on the board.
     if (op.temp) this.scheduleEphemeralFade([primary.id, ...rest.map((e) => e.id)]);
-    return [primary, ...rest];
+    const label = sideLabel ? await this.drawFree(sideLabel, page, turn, signal) : [];
+    return [primary, ...rest, ...label];
   }
 
   /**
-   * Renders a high-level primitive (currently `numberline`) by lowering it to
-   * low-level ops whose geometry is computed by code, so the structure can never
-   * overlap itself. The whole group dodges pre-existing content as ONE unit
-   * (reusing collisionPush on its bounding box); its children are pre-solved, so
-   * they skip per-child collision — otherwise the axis line would shove its own
-   * tick numbers around.
+   * Draw the children of a primitive (or of a scripted text line) at page-local
+   * coordinates, tagged with one group id so the summary collapses them, an
+   * erase removes them together, and `isLive` can find them.
    */
-  private async applyGroup(
-    op: DrawOp,
-    carried: { dx: number; dy: number },
+  private async drawGroup(
+    children: DrawOp[],
+    groupId: string,
+    label: string,
+    page: Page,
     turn: number,
     signal: AbortSignal,
   ): Promise<ExcalidrawElement[]> {
-    const page = this.ensurePage();
-    const ox = page.x;
-    const oy = page.y + this.pageAnchorDy;
-    const { ops: children, bbox, label } = this.expand(op);
-    // Dodge existing content as a single block (carried = shift from earlier ops
-    // this turn). The combined shift is applied to the children, so it works for
-    // every primitive — including ones positioned by `points` (polygon), not x/y.
-    // We do NOT feed the group's own placement back into turnShift.
-    const probe = {
-      id: "__group__",
-      x: bbox.x + carried.dx + ox,
-      y: bbox.y + carried.dy + oy,
-      width: bbox.w,
-      height: bbox.h,
-    } as unknown as ExcalidrawElement;
-    const { dx, dy } = this.collisionPush(probe, page.index);
-    const tx = carried.dx + dx + ox;
-    const ty = carried.dy + dy + oy;
-    const placed = tx || ty ? children.map((c) => shiftOp(c, tx, ty)) : children;
-
-    const groupId = this.resolveId(op.id); // one stable id for the whole group
-    // A primitive is one figure: if ANY of its labels needs the math font, the
-    // whole figure (and the rest of the page) uses it, so a diagram's own labels
-    // never disagree with each other.
-    if (!page.mathFont && placed.some((c) => needsMathFont(c.text))) {
-      page.mathFont = true;
-      this.adoptMathFont(page.index);
-    }
     const created: ExcalidrawElement[] = [];
-    for (const child of placed) {
+    for (const child of children) {
       if (signal.aborted) break;
-      const base = opToSkeleton(child, turn, this.resolveId(child.id), page.index, page.mathFont);
+      const base = opToSkeleton(shiftOp(child, page.x, page.y), turn, this.resolveId(child.id), page.index);
       if (!base) continue;
-      // Tag children so the summary collapses the group and erase can target it.
       const skel = { ...base, customData: { ...(base.customData as object), group: groupId, groupLabel: label } };
       const converted = convertToExcalidrawElements([skel], { regenerateIds: false });
       if (!converted.length) continue;
@@ -1023,12 +1336,13 @@ export class BoardPlayer {
       if (primary.type === "text") {
         await this.typeText(primary as ExcalidrawTextElement, signal);
       } else if (primary.type === "arrow" || primary.type === "line") {
-        // Short segments (ticks) snap in instantly; the long axis grows.
+        // Short segments (ticks, arcs, radical strokes) snap in instantly; a long axis grows.
         if (Math.abs(primary.width) + Math.abs(primary.height) <= 24) this.placeInstant(primary, rest);
         else await this.growLine(primary as ExcalidrawLinearElement, rest, signal);
       } else {
         await this.fadeIn(primary, rest, signal);
       }
+      if (child.temp) this.scheduleEphemeralFade([primary.id, ...rest.map((e) => e.id)]);
       created.push(primary, ...rest);
       await sleep(18, signal); // snappier than free-form ops — a group has many children
     }
@@ -1040,193 +1354,12 @@ export class BoardPlayer {
     this.commit([...this.all(), el, ...bound]);
   }
 
-  /** Near-zero-area segments (thin lines/arrows) get this much effective thickness. */
-  private static MIN_THICK = 6;
-  /** Slack when judging containment, so a hand-picked radius that lands a few
-   *  px proud of its neighbour still counts as nested rather than colliding. */
-  private static NEST_TOL = 8;
-  /** A single nudge never moves an element farther than this, so nothing is flung away. */
-  private static MAX_TRAVEL = 400;
-
-  /** Axis-aligned collision box for an obstacle; a thin segment is inflated into a band. */
-  private obstacleBox(e: ExcalidrawElement): { x1: number; y1: number; x2: number; y2: number; thin: boolean } {
-    const t = Math.max((e as { strokeWidth?: number }).strokeWidth ?? 2, BoardPlayer.MIN_THICK);
-    let x1 = e.x;
-    let y1 = e.y;
-    let x2 = e.x + e.width;
-    let y2 = e.y + e.height;
-    let thin = false;
-    if (e.width < t) {
-      const c = e.x + e.width / 2;
-      x1 = c - t / 2;
-      x2 = c + t / 2;
-      thin = true; // vertical line / tick
-    }
-    if (e.height < t) {
-      const c = e.y + e.height / 2;
-      y1 = c - t / 2;
-      y2 = c + t / 2;
-      thin = true; // horizontal line / number line / axis
-    }
-    return { x1, y1, x2, y2, thin };
-  }
-
-  private overlaps(el: ExcalidrawElement, b: { x1: number; y1: number; x2: number; y2: number }, gap: number): boolean {
-    return el.x < b.x2 + gap && el.x + el.width > b.x1 - gap && el.y < b.y2 + gap && el.y + el.height > b.y1 - gap;
-  }
-
-  /** True when `el` sits entirely within `b` — the new shape nests inside an old one. */
-  private contains(b: { x1: number; y1: number; x2: number; y2: number }, el: ExcalidrawElement): boolean {
-    const t = BoardPlayer.NEST_TOL;
-    return (
-      el.x >= b.x1 - t && el.y >= b.y1 - t && el.x + el.width <= b.x2 + t && el.y + el.height <= b.y2 + t
-    );
-  }
-
-  /** True when `b` sits entirely within `el` — the new shape encloses an old one. */
-  private containedBy(el: ExcalidrawElement, b: { x1: number; y1: number; x2: number; y2: number }): boolean {
-    const t = BoardPlayer.NEST_TOL;
-    return (
-      b.x1 >= el.x - t && b.y1 >= el.y - t && b.x2 <= el.x + el.width + t && b.y2 <= el.y + el.height + t
-    );
-  }
-
-  /** Large penalty for a move that would push the element off its own page. */
-  private boundsPenalty(el: ExcalidrawElement, dx: number, dy: number, pageIndex: number): number {
-    const r = this.pageSceneRect(pageIndex);
-    const y1 = el.y + dy;
-    const y2 = y1 + el.height;
-    const x1 = el.x + dx;
-    const x2 = x1 + el.width;
-    return y1 < r.y + CONTENT_TOP - 40 || y2 > r.y + PAGE_H - 20 || x1 < r.x + 24 || x2 > r.x + PAGE_W - 24 ? 1e6 : 0;
-  }
-
   /** The page an element belongs to — its tag, or its grid cell as a last resort. */
   private pageOf(e: ExcalidrawElement): number {
     const p = (e.customData as TutorMeta | undefined)?.page;
     if (typeof p === "number") return p;
     const { row, col } = cellAtScene(e.x + e.width / 2, e.y + e.height / 2);
     return this.pages.find((q) => q.row === row && q.col === col)?.index ?? 0;
-  }
-
-  /**
-   * Collision avoidance. If this element's box overprints content already on the
-   * board, return the smallest nudge that frees it as a {dx, dy} vector (0,0 when
-   * it is already clear). It weighs four escapes — up, down, left, right — and
-   * prefers moving UP into free space, then DOWN, then sideways, by the least
-   * distance that clears everything. Models pick absolute coordinates and misjudge
-   * rendered sizes; this keeps the board readable without reflowing anything.
-   *
-   * Structural lines AND arrows (number lines, axes, ticks, fraction bars) are
-   * obstacles now, but a thin segment is only inflated to a ~6px band, so a tick
-   * label is nudged just off the line and stays hugging it. Highlights (translucent
-   * overlays) and transient 'temp' gestures are never obstacles.
-   */
-  private collisionPush(el: ExcalidrawElement, pageIndex: number): { dx: number; dy: number } {
-    // Only this page's own content is an obstacle: pages are separate sheets,
-    // so content on the previous one must never push this beat around.
-    const obstacles = this.all().filter(
-      (e) => !e.isDeleted && e.id !== el.id && isPermanentNote(e) && this.pageOf(e) === pageIndex,
-    );
-    if (!obstacles.length) return { dx: 0, dy: 0 };
-    const boxes = obstacles.map((o) => this.obstacleBox(o));
-
-    // Only move for a REAL overprint; a near-miss within the gap keeps the model's coords.
-    const hit = boxes.filter((b) => this.overlaps(el, b, 0));
-    if (!hit.length) return { dx: 0, dy: 0 };
-    // Nesting is deliberate, not a collision: a shape drawn wholly inside an
-    // existing one (concentric circles, a box inside a box, a shaded region in
-    // a figure) means the model placed it there on purpose. Pushing it "clear"
-    // is what made concentric circles impossible to draw by hand. Containment
-    // must hold against EVERY box it touches, so a shape straddling the edge of
-    // a neighbour is still dodged normally.
-    if (hit.every((b) => this.contains(b, el) || this.containedBy(el, b))) return { dx: 0, dy: 0 };
-    const onlyThin = hit.every((b) => b.thin);
-    const gap = onlyThin ? 7 : 16; // keep tick labels snug to their line
-
-    const up = this.clearDistance(el, boxes, gap, "y", -1);
-    const down = this.clearDistance(el, boxes, gap, "y", 1);
-    const left = this.clearDistance(el, boxes, gap, "x", -1);
-    const right = this.clearDistance(el, boxes, gap, "x", 1);
-
-    // Default: prefer up, then down, then sideways. For a thin-line overprint, keep
-    // the label on whichever side of the line its centre already leans — so numbers
-    // the model put above the line stay above and tick labels below stay below.
-    // "Up" now means "toward the top of a fixed page", where there is far less
-    // room to give, so the preference flips: dodge downward by default.
-    let wUp = 1.15;
-    let wDown = 1.0;
-    if (onlyThin) {
-      const bandCy = (hit[0].y1 + hit[0].y2) / 2;
-      if (el.y + el.height / 2 >= bandCy) {
-        wDown = 0.9;
-        wUp = 1.2;
-      } else {
-        wUp = 0.9;
-        wDown = 1.2;
-      }
-    }
-
-    const cands: { dx: number; dy: number; w: number }[] = [];
-    if (up !== null) cands.push({ dx: 0, dy: up, w: wUp });
-    if (down !== null) cands.push({ dx: 0, dy: down, w: wDown });
-    if (left !== null) cands.push({ dx: left, dy: 0, w: 1.5 });
-    if (right !== null) cands.push({ dx: right, dy: 0, w: 1.5 });
-
-    // Lowest score wins; the fixed up→down→left→right order makes ties deterministic.
-    let best: { dx: number; dy: number } | null = null;
-    let bestScore = Infinity;
-    for (const c of cands) {
-      const score = Math.abs(c.dx || c.dy) * c.w + this.boundsPenalty(el, c.dx, c.dy, pageIndex);
-      if (score < bestScore - 0.01) {
-        bestScore = score;
-        best = { dx: c.dx, dy: c.dy };
-      }
-    }
-    // Fully boxed in (no direction clears within MAX_TRAVEL): leave the model's
-    // coordinates rather than fling the element across the board.
-    return best ?? { dx: 0, dy: 0 };
-  }
-
-  /**
-   * Signed distance the box must travel along one axis+direction to clear every
-   * obstacle: axis "y"/"x", sign +1 (down/right) or -1 (up/left). Returns null if
-   * it cannot clear within 32 iterations or MAX_TRAVEL. Iterates because clearing
-   * one obstacle can slide the box into the next.
-   */
-  private clearDistance(
-    el: ExcalidrawElement,
-    boxes: { x1: number; y1: number; x2: number; y2: number }[],
-    gap: number,
-    axis: "x" | "y",
-    sign: 1 | -1,
-  ): number | null {
-    let x1 = el.x;
-    let y1 = el.y;
-    let x2 = el.x + el.width;
-    let y2 = el.y + el.height;
-    for (let iter = 0; iter < 32; iter++) {
-      let bestEdge = sign > 0 ? -Infinity : Infinity;
-      for (const b of boxes) {
-        const hits = x1 < b.x2 + gap && x2 > b.x1 - gap && y1 < b.y2 + gap && y2 > b.y1 - gap;
-        if (!hits) continue;
-        const edge = axis === "y" ? (sign > 0 ? b.y2 : b.y1) : sign > 0 ? b.x2 : b.x1;
-        if (sign > 0 ? edge > bestEdge : edge < bestEdge) bestEdge = edge;
-      }
-      if (!Number.isFinite(bestEdge)) return axis === "y" ? y1 - el.y : x1 - el.x; // clear
-      let step: number;
-      if (axis === "y") step = sign > 0 ? bestEdge + gap - y1 : bestEdge - gap - y2;
-      else step = sign > 0 ? bestEdge + gap - x1 : bestEdge - gap - x2;
-      if (axis === "y") {
-        y1 += step;
-        y2 += step;
-      } else {
-        x1 += step;
-        x2 += step;
-      }
-      if (Math.abs(axis === "y" ? y1 - el.y : x1 - el.x) > BoardPlayer.MAX_TRAVEL) return null;
-    }
-    return null; // did not converge
   }
 
   /** Text: insert with empty text, then reveal characters. */
@@ -1340,7 +1473,6 @@ export class BoardPlayer {
     this.commit(next);
     this.idMap.clear();
     this.minted.clear();
-    this.turnShift = { turn: 0, dx: 0, dy: 0 };
     this.resetPages();
   }
 }
@@ -1352,37 +1484,46 @@ export class BoardPlayer {
  * cannot hold runs of two sizes, so its scripts are flattened to ordinary
  * characters ("x²" -> "x2") — plain, but readable, which mojibake is not.
  */
-function withNormalizedScripts(op: DrawOp): DrawOp {
+function normalizeBoardText(opIn: DrawOp): DrawOp {
+  let op = opIn;
+  if (op.rows) op = { ...op, rows: op.rows.map((r) => r.map((c) => symbolsForWords(String(c ?? "")))) };
+  if (op.sides) op = { ...op, sides: op.sides.map((s) => symbolsForWords(String(s ?? ""))) };
   if (!op.text) return op;
+  const text = symbolsForWords(op.text);
   if (op.op === "text") {
-    if (!HAS_UNICODE_SCRIPT.test(op.text)) return op;
-    return { ...op, text: normalizeScripts(op.text) };
+    const scripted = HAS_UNICODE_SCRIPT.test(text) ? normalizeScripts(text) : text;
+    return scripted === op.text ? op : { ...op, text: scripted };
   }
   // A label: flatten both notations so neither a stray caret nor a missing
   // glyph is drawn literally inside the shape.
-  const flat = flattenMath(normalizeScripts(op.text));
+  const flat = flattenMath(normalizeScripts(text));
   return flat === op.text ? op : { ...op, text: flat };
 }
+
 
 const HAS_UNICODE_SCRIPT = /[²³¹⁰-₟ⁱ]/;
 
 /**
- * True for a `text` op that needs superscript/subscript layout. Such an op is
- * drawn as a GROUP of differently-sized runs rather than one element, so it
- * takes the same path as the diagram primitives: laid out by code, moved as one
- * unit by collision avoidance, erased by its single id.
+ * True for a `text` op that needs superscript/subscript/radical layout. Such an
+ * op is drawn as a GROUP of positioned runs and strokes rather than one
+ * element, so it takes the same path as the diagram primitives.
  */
 function isMathText(op: DrawOp): boolean {
-  return op.op === "text" && hasMathScript(op.text);
+  return op.op === "text" && hasMathNotation(op.text);
 }
+
 
 /** A copy of the op moved by (dx, dy) — start and end points alike. */
 function shiftOp(op: DrawOp, dx: number, dy: number): DrawOp {
   if (!dx && !dy) return op;
   const out: DrawOp = { ...op, x: (op.x ?? 0) + dx, y: (op.y ?? 0) + dy };
-  if (op.op === "arrow" || op.op === "line") {
+  if (op.op === "arrow" || op.op === "line" || op.op === "curvearrow") {
     if (typeof op.x2 === "number") out.x2 = op.x2 + dx;
     if (typeof op.y2 === "number") out.y2 = op.y2 + dy;
   }
+  if (op.points) out.points = op.points.map((p) => ({ ...p, x: p.x + dx, y: p.y + dy }));
+  if (op.atoms) out.atoms = op.atoms.map((a) => ({ ...a, x: a.x + dx, y: a.y + dy }));
+  if (op.items) out.items = op.items.map((a) => ({ ...a, x: a.x + dx, y: a.y + dy }));
+  if (op.nodes) out.nodes = op.nodes.map((a) => (typeof a.x === "number" && typeof a.y === "number" ? { ...a, x: a.x + dx, y: a.y + dy } : a));
   return out;
 }

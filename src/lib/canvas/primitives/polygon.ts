@@ -30,6 +30,64 @@ import {
 const FONT = 16;
 const HEADING_FONT = 24;
 
+/**
+ * The numeric value of a side label — "13", "1.5", "√2", "2√3", "1/2", "5 cm",
+ * "AC = √2" — or null when it is not a plain length ("x", "a+b", "hyp").
+ */
+export function sideLabelValue(label: string): number | null {
+  const t = label
+    .replace(/^\s*[A-Za-z]{1,3}\s*=\s*/, "") // "AC = √2" -> "√2"
+    .replace(/\s*(cm|mm|km|m|units?)\.?\s*$/i, "")
+    .replace(/\s+/g, "");
+  const m = t.match(/^(\d+(?:\.\d+)?)?(?:√\(?(\d+(?:\.\d+)?)\)?)?(?:\/(\d+(?:\.\d+)?))?$/);
+  if (!m || (!m[1] && !m[2])) return null;
+  let v = (m[1] ? Number(m[1]) : 1) * (m[2] ? Math.sqrt(Number(m[2])) : 1);
+  if (m[3]) v /= Number(m[3]);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/**
+ * A right triangle's hypotenuse is its longest side, so it must carry the
+ * largest numeric label. The model hands `sides` in edge order (p0→p1, p1→p2,
+ * p2→p0) and regularly gets that order wrong — a 45° triangle came out with
+ * the hypotenuse labelled 1 and a leg labelled √2, contradicting the working
+ * written right beside it. When the edge opposite the right angle is labelled
+ * with a number smaller than another side's, the two labels are swapped.
+ *
+ * Only that one invariant is enforced, because it is the only one that holds
+ * however the figure was drawn: a sketch is rarely to scale, so the legs'
+ * drawn lengths say nothing about which leg is which.
+ */
+export function fixHypotenuseLabel(pts: Pt[], closed: boolean, sides: readonly string[]): string[] {
+  const out = [...sides];
+  if (!closed || pts.length !== 3 || out.length < 3) return out;
+  let right = -1;
+  for (let i = 0; i < 3; i++) {
+    const v = pts[i];
+    const a = pts[(i + 2) % 3];
+    const b = pts[(i + 1) % 3];
+    const ua = unit({ x: a.x - v.x, y: a.y - v.y });
+    const ub = unit({ x: b.x - v.x, y: b.y - v.y });
+    if (Math.abs(ua.x * ub.x + ua.y * ub.y) <= 0.09) right = i;
+  }
+  if (right < 0) return out;
+  const hyp = (right + 1) % 3; // the edge from the vertex after the right angle to the one before it
+  const vals = out.slice(0, 3).map((s) => sideLabelValue(s ?? ""));
+  // A leg labelled "hypotenuse" by name is as wrong as one labelled with the
+  // biggest number: swap it onto the side opposite the right angle.
+  const named = out.findIndex((s, i) => i < 3 && i !== hyp && /hypot/i.test(s ?? ""));
+  if (named >= 0 && !/hypot/i.test(out[hyp] ?? "")) {
+    [out[hyp], out[named]] = [out[named], out[hyp]];
+    return out;
+  }
+  const hv = vals[hyp];
+  if (hv == null) return out;
+  let max = hyp;
+  for (let i = 0; i < 3; i++) if (vals[i] != null && vals[i]! > vals[max]!) max = i;
+  if (max !== hyp) [out[hyp], out[max]] = [out[max], out[hyp]];
+  return out;
+}
+
 export function expandPolygon(op: DrawOp): Expanded {
   const pid = (op.id || "poly").replace(/[^a-zA-Z0-9_-]/g, "_");
   // A closed shape is closed by `closed`, not by repeating its first vertex. Models
@@ -89,7 +147,7 @@ export function expandPolygon(op: DrawOp): Expanded {
   // Every label is requested up front so they are placed against one another
   // as well as against the strokes — a side label never lands on a vertex
   // letter, and two side labels never land on each other.
-  const sides = op.sides ?? [];
+  const sides = fixHypotenuseLabel(pts, closed, op.sides ?? []);
   const sideText: string[] = [];
   const vertexText: string[] = [];
   const requests: LabelRequest[] = [];
@@ -188,7 +246,31 @@ export function expandPolygon(op: DrawOp): Expanded {
   // layout reserves room for labels that had to travel.
   const all = unionRects([shape, ...reserved, ...boxes]) ?? shape;
   const bbox = { x: all.x - 16, y: all.y - 16, w: all.w + 32, h: all.h + 32 };
-  return { ops, bbox, label: `polygon (${n} pts)` };
+
+  // The named parts of the figure, so a later op can say "the angle at A" or
+  // "label side BC" and land on the committed geometry (lib/canvas/anchors).
+  const points: Record<string, Pt> = {};
+  const vertexIndex: Record<string, number> = {};
+  const edgeIndex: Record<string, number> = {};
+  const names = pts.map((_, i) => (wholeShapeName ? "" : vertexText[i]) || `v${i}`);
+  pts.forEach((p, i) => {
+    points[names[i]] = { x: p.x, y: p.y };
+    points[`v${i}`] = { x: p.x, y: p.y };
+    vertexIndex[names[i]] = i;
+    vertexIndex[`v${i}`] = i;
+  });
+  for (let i = 0; i < edgeCount; i++) {
+    const a = names[i];
+    const b = names[(i + 1) % n];
+    edgeIndex[`${a}${b}`] = i;
+    edgeIndex[`${b}${a}`] = i;
+    edgeIndex[`e${i}`] = i;
+  }
+  points.centroid = { x: pts.reduce((s, p) => s + p.x, 0) / n, y: pts.reduce((s, p) => s + p.y, 0) / n };
+  const vertexNames = names.filter((nm) => !/^v\d+$/.test(nm));
+  const anchors = { points, vertexIndex, edgeIndex, outline: pts.map((p) => ({ x: p.x, y: p.y })), closed };
+  const label = vertexNames.length === n ? `polygon ${vertexNames.join("")}` : `polygon (${n} pts)`;
+  return { ops, bbox, label, anchors };
 }
 
 function unit(v: Pt): Pt {

@@ -23,7 +23,15 @@ import {
   roadmapIntro,
   voicePrompts,
 } from "@/lib/languages";
-import { blankPageCanvas, CONTENT_BOTTOM, CONTENT_LEFT, CONTENT_RIGHT, CONTENT_TOP } from "@/lib/canvas/page";
+import {
+  CONTENT_BOTTOM,
+  CONTENT_LEFT,
+  CONTENT_RIGHT,
+  CONTENT_TOP,
+  FIT_MARGIN,
+  headedPageCanvas,
+  STEP_RULE_OFFSET,
+} from "@/lib/canvas/page";
 import { downloadBoardPdf, pdfPageList } from "@/lib/canvas/pdf";
 import type {
   AnswerGrade,
@@ -89,7 +97,19 @@ export type LessonPhase = "none" | "awaitFamiliarity" | "teaching" | "checkpoint
 const isQuestionEnding = (t: string) => /[?？]\s*$/.test(t.trim());
 // Hidden user turn that asks the model to teach the next small step. Phrased as
 // plain language so the model (which mirrors the student's language) just carries on.
-const CONTINUE_NUDGE = "Continue to the next step.";
+/**
+ * The request that opens a lesson step. It NAMES the step rather than saying
+ * "continue": a step that ended on a promise ("Let us now compute all six
+ * ratios") read "Continue to the next step." as "finish that", and the fast
+ * model then stayed one step behind its headings for the rest of the lesson —
+ * the 30°/60° triangle under "7. Ratios for 0° and 90°", 0° taught twice, and
+ * the last three steps never taught at all.
+ */
+function stepNudge(plan: LessonPlan, i: number): string {
+  if (i === 0) return "Begin the lesson.";
+  const title = stripStepNumber(plan.steps[i]?.title ?? "") || `step ${i + 1}`;
+  return `Now teach step ${i + 1} of ${plan.steps.length}: "${title}". Step ${i} is over, even if it stopped short — do not finish it or repeat it. Start "${title}" from its beginning.`;
+}
 export type Config = {
   llm: string | null;
   stt: SttMode;
@@ -116,7 +136,13 @@ const FALLBACK_CONFIG: Config = {
  * roadmap) and `turn` tags what it draws, so one step can be wiped and re-taught
  * after a doubt without touching the others.
  */
-type QueuedBeat = { beat: Beat; audio: Promise<Blob | null> | null };
+type QueuedBeat = {
+  beat: Beat;
+  audio: Promise<Blob | null> | null;
+  /** The server-laid question block of a solve turn: drawn with
+   *  `drawQuestionBlock`, which keeps the model's solution below it. */
+  question?: boolean;
+};
 /** A queued beat inside a lesson run, tagged with where it belongs. */
 type QueuedStepBeat = QueuedBeat & { step: number; turn: number };
 
@@ -174,6 +200,8 @@ const AGENDA_STEP = -1;
  * ahead is likely to be thrown away by the next doubt.
  */
 const LOOKAHEAD_STEPS = 1;
+/** Requests per lesson step before an empty answer stops the lesson. */
+const STEP_ATTEMPTS = 2;
 
 const STATUS_LABEL: Record<Status, string> = {
   idle: "Ready",
@@ -741,7 +769,7 @@ export default function Tutor() {
       const player = boardRef.current?.player;
       if (!player) return;
       let first = true;
-      for await (const { beat, audio } of queue) {
+      for await (const { beat, audio, question } of queue) {
         if (signal.aborted) break;
         if (first) {
           setStatus(speaking);
@@ -753,7 +781,10 @@ export default function Tutor() {
         // Mirror the accumulating reply into a ref so the voice loop can inspect
         // how this turn ended without waiting on the messages state to settle.
         turnTextRef.current = turnTextRef.current ? `${turnTextRef.current} ${beat.say}` : beat.say;
-        await Promise.all([player.applyBeat(beat.draw ?? [], turn, signal), speakBeat(beat, audio, signal)]);
+        const draw = question
+          ? player.drawQuestionBlock(beat.draw ?? [], turn, signal)
+          : player.applyBeat(beat.draw ?? [], turn, signal);
+        await Promise.all([draw, speakBeat(beat, audio, signal)]);
       }
     },
     [speakBeat],
@@ -843,7 +874,7 @@ export default function Tutor() {
               // silently, so the board shows the problem while the model works.
               solveRef.current.question = ev.question;
               solveRef.current.label = ev.label;
-              queue.push({ beat: ev.beat, audio: null });
+              queue.push({ beat: ev.beat, audio: null, question: true });
             } else if (ev.type === "beat") {
               // Prefetch speech the moment a beat arrives so audio is ready when its turn comes.
               const audio =
@@ -1380,37 +1411,57 @@ export default function Tutor() {
           const turn = ++turnCounter.current;
           const page = basePage + (i - from);
           catchUp();
-          history.push({ role: "user", text: i === 0 ? "Begin the lesson." : CONTINUE_NUDGE });
+          history.push({ role: "user", text: stepNudge(plan, i) });
           let said = "";
           let beats = 0;
-          try {
-            await postTutorTurn(
-              {
-                messages: history.slice(-12),
-                canvas: blankPageCanvas(page, page + 1),
-                language: lang,
-                grade: gradeRef.current,
-                subject: subjectRef.current,
-                mode: "teach",
-                plan,
-                step: i,
-                familiarity: lessonRef.current.familiarity ?? undefined,
-              },
-              signal,
-              (ev) => {
-                if (ev.type === "beat") {
-                  beats++;
-                  said = said ? `${said} ${ev.beat.say}` : ev.beat.say;
-                  run.queue.push({ beat: ev.beat, audio: voiceFor(ev.beat), step: i, turn });
-                } else if (ev.type === "error") {
-                  setError(ev.message);
-                }
-              },
-            );
-          } catch (err) {
-            if (!signal.aborted) setError(err instanceof Error ? err.message : String(err));
+          // A step that comes back EMPTY is asked for again before the lesson
+          // gives up. The single lesson model sometimes misses the server's
+          // first-beat watchdog (15s) on one request and answers the next one
+          // fine; without a retry, one slow request ended a 12-step lesson at
+          // step 5 for good. Only an empty step is retried: once a beat has
+          // been queued, re-asking would teach the step twice.
+          let failure: string | null = null;
+          for (let attempt = 0; attempt < STEP_ATTEMPTS && beats === 0 && !signal.aborted; attempt++) {
+            failure = null;
+            try {
+              await postTutorTurn(
+                {
+                  messages: history.slice(-12),
+                  // Not blank: the step heading is drawn across its top before
+                  // these beats play. Told the truth, the model plans its page
+                  // for the room it really has instead of spilling the last third.
+                  canvas: headedPageCanvas(page, page + 1),
+                  language: lang,
+                  grade: gradeRef.current,
+                  subject: subjectRef.current,
+                  mode: "teach",
+                  plan,
+                  step: i,
+                  familiarity: lessonRef.current.familiarity ?? undefined,
+                },
+                signal,
+                (ev) => {
+                  if (ev.type === "beat") {
+                    beats++;
+                    said = said ? `${said} ${ev.beat.say}` : ev.beat.say;
+                    run.queue.push({ beat: ev.beat, audio: voiceFor(ev.beat), step: i, turn });
+                  } else if (ev.type === "error") {
+                    // Mid-step errors are real news; an empty attempt's error
+                    // is only shown if the retry fails too.
+                    if (beats > 0) setError(ev.message);
+                    else failure = ev.message;
+                  }
+                },
+              );
+            } catch (err) {
+              failure = err instanceof Error ? err.message : String(err);
+            }
+            if (beats === 0 && failure && attempt + 1 < STEP_ATTEMPTS) {
+              console.warn(`[lesson] step ${i + 1} came back empty (${failure}); asking again`);
+            }
           }
           if (signal.aborted) break;
+          if (beats === 0 && failure) setError(failure);
           history.push({ role: "assistant", text: said || "(drew on the board)" });
           // Nothing came back: this step will never reach the consumer, so the
           // slot it took has to be given back by hand. Stop there rather than
@@ -1940,6 +1991,20 @@ export default function Tutor() {
         return;
       }
 
+      // The lesson STOPPED — a step the model never answered, even on retry —
+      // and the student says "continue". That is a request to carry on, not a
+      // doubt: routing it to the doubt model answered "please continue the
+      // lesson" on a side page and skipped the step that had failed.
+      if (L.phase === "teaching" && L.plan && L.step < L.plan.steps.length && isDoubtCleared(text)) {
+        const run = runRef.current;
+        const stalled = !turnRef.current && (!run || (run.done && !run.queue.size && !run.held));
+        if (stalled && statusRef.current === "idle") {
+          setError(null);
+          await startLessonRun();
+          return;
+        }
+      }
+
       // Otherwise it's a conceptual doubt → the doubt model on a new page, lesson paused.
       // Reached from "teaching" (barged in mid-step) or from a "doubt" that was
       // not cleared (a second question). Only the first of those changes how the
@@ -1953,7 +2018,7 @@ export default function Tutor() {
       setLesson("doubt");
       await runTurn({ text, mode: "doubt", interrupt: true });
     },
-    [clearCheckpoint, gradeAnswer, playLocalBeats, resumeLesson, runTurn, setLesson, startLesson],
+    [clearCheckpoint, gradeAnswer, playLocalBeats, resumeLesson, runTurn, setLesson, startLesson, startLessonRun],
   );
 
   // Voice-loop hooks: if a teaching run ended with steps still to go (a step the
@@ -2983,11 +3048,12 @@ class StepGate {
  * merely grazes the title stays exactly where the model put it.
  */
 function stepHeadingOps(step: number, title: string): DrawOp[] {
-  const ruleY = CONTENT_TOP + 56; // clears the 36px lg heading plus a little air
+  const ruleY = CONTENT_TOP + STEP_RULE_OFFSET; // clears the 36px lg heading plus a little air
   return [
     {
       op: "text",
       id: `step_head_${step}`,
+      layout: "fixed",
       x: CONTENT_LEFT,
       y: CONTENT_TOP,
       text: `${step + 1}. ${stripStepNumber(title)}`,
@@ -2999,6 +3065,7 @@ function stepHeadingOps(step: number, title: string): DrawOp[] {
     ...[0, 1.5, 3].map((dy, i) => ({
       op: "line" as const,
       id: `step_rule_${step}_${i}`,
+      layout: "fixed" as const,
       x: CONTENT_LEFT,
       y: ruleY + dy,
       x2: CONTENT_RIGHT,
@@ -3021,8 +3088,16 @@ function agendaBeats(plan: LessonPlan, lang: string): Beat[] {
   // Tighten the line pitch to fit however many there are. A 12-step plan at the
   // old fixed 56px ran 56px past CONTENT_BOTTOM and off the page; this keeps the
   // list inside the page and leaves the common 8-step case looking as it did.
+  //
+  // The LAST line's top must leave room for its own height plus the player's
+  // FIT_MARGIN, or the fit test spills that one line onto a page of its own —
+  // which is what a 12-step trigonometry plan did (step 12 alone on page 2).
+  // Dividing the whole height by n placed the last top at ~620 and its box at
+  // ~650, over the 636 the fit test allows.
   const listTop = CONTENT_TOP + 100;
-  const pitch = steps.length > 1 ? Math.min(56, (CONTENT_BOTTOM - listTop) / steps.length) : 56;
+  const LINE_BOX = 34; // an `sm` line with a superscript (sin²θ) in it
+  const lastTop = CONTENT_BOTTOM - FIT_MARGIN - LINE_BOX;
+  const pitch = steps.length > 1 ? Math.min(56, (lastTop - listTop) / (steps.length - 1)) : 56;
   const beats: Beat[] = [
     {
       say: plan.intro?.trim() || roadmapIntro(lang),
@@ -3031,6 +3106,7 @@ function agendaBeats(plan: LessonPlan, lang: string): Beat[] {
         {
           op: "text",
           id: "agenda_title",
+          layout: "fixed",
           x: CONTENT_LEFT,
           y: CONTENT_TOP,
           text: plan.topic?.trim() || "Our plan",
@@ -3048,6 +3124,7 @@ function agendaBeats(plan: LessonPlan, lang: string): Beat[] {
         {
           op: "text",
           id: `agenda_${i + 1}`,
+          layout: "fixed",
           x: CONTENT_LEFT + 30,
           y: listTop + i * pitch,
           text: `${i + 1}. ${stripStepNumber(s.title)}`,

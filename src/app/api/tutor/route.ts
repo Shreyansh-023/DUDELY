@@ -20,7 +20,7 @@ import {
   buildTeachSystemPrompt,
   buildUserTurn,
 } from "@/lib/prompt";
-import { questionBeat } from "@/lib/question-board";
+import { canvasWithQuestion, questionBeat } from "@/lib/question-board";
 import { retrieveTextbookContext, type Passage } from "@/lib/rag";
 import { retrieveSolutions, type Solution } from "@/lib/solutions";
 import {
@@ -164,7 +164,6 @@ export async function POST(req: Request) {
                   solutions,
                   exactSolution,
                   dataInFigure,
-                  startY: written?.nextY,
                   boardQuestion: written?.lines,
                 })
               : mode === "solvedoubt"
@@ -198,7 +197,7 @@ export async function POST(req: Request) {
     mode === "doubt" || mode === "solvedoubt"
       ? "\n\n---\nReply with NDJSON beats only: 1-4 lines, each a complete JSON object. No prose."
       : mode === "teach"
-        ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Teach this step properly: 4-8 beats, and draw on the board — one short sentence is not a step. Full granularity: one elementary move per line, the arithmetic written out, the rule named before you use it, and the reasoning said aloud, not just the result. The page heading is already written for you — do not repeat the step title."
+        ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Your reply starts with {\"say\": — a sentence that DESCRIBES a drawing (\"Draw a right triangle…\") is not a beat and is discarded; emit the figure as a draw op instead. Teach this step properly: 4-10 beats, and draw on the board — one short sentence is not a step. Full granularity: one elementary move per line, the arithmetic written out, the rule named before you use it, and the reasoning said aloud, not just the result. The page heading is already written for you — do not repeat the step title. Teach ONLY the step named in this message, and finish its working before you stop."
         : mode === "explain"
           ? "\n\n---\nReply with NDJSON beats only, each line one complete JSON object, no prose. Work the item at full granularity: one elementary move per line, every bit of arithmetic written out, and the rule named before you use it. Never skip a step because it looks obvious."
           : mode === "solve"
@@ -220,7 +219,8 @@ Mark it. Reply with the JSON object only.`
     if (m.role === "assistant") return { role: "assistant", content: m.text || "(drew on the board)" };
     if (i !== last) return { role: "user", content: m.text };
     if (decisionTurn) return { role: "user", content: decisionTurn };
-    return { role: "user", content: buildUserTurn({ text: m.text, canvas }) + formatNudge };
+    const turnCanvas = written ? canvasWithQuestion(canvas) : canvas;
+    return { role: "user", content: buildUserTurn({ text: m.text, canvas: turnCanvas }) + formatNudge };
   });
 
   // Doubt mode talks to a 1M-token window, and a doubt turn is normally a few

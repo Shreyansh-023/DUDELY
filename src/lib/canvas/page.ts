@@ -111,32 +111,56 @@ export function fitPage(
 
 export function pageHeaderLine(f: PageFrame): string {
   const kind = f.kind === "doubt" ? " (doubt page)" : "";
-  return `Page ${f.index + 1} of ${f.count}${kind}. This page is ${PAGE_W} x ${PAGE_H}. Draw inside x ${CONTENT_LEFT}..${CONTENT_RIGHT} and y ${CONTENT_TOP}..${CONTENT_BOTTOM}.`;
+  return `Page ${f.index + 1} of ${f.count}${kind}. The board places everything for you: text flows down the notes column, figures sit beside or below it.`;
 }
 
 export function roomLine(remaining: number): string {
   const r = Math.max(0, Math.round(remaining));
-  return `Room left on this page: ${r} px (about ${Math.floor(r / MD_PITCH)} md text lines).`;
+  return `Room left on this page: about ${Math.floor(r / MD_PITCH)} md text lines, or a figure up to ${r} px tall. What does not fit continues on a fresh page by itself.`;
 }
 
 /** Appended when room is low but the page is still usable. */
 export function lowRoomLine(remaining: number): string {
-  return `Only ${Math.floor(Math.max(0, remaining) / MD_PITCH)} md text lines fit here — keep this turn to one or two short beats and stop cleanly; the next turn starts on a fresh blank page at (${CONTENT_LEFT}, ${CONTENT_TOP}).`;
+  return `Only ${Math.floor(Math.max(0, remaining) / MD_PITCH)} md text lines fit here — keep this turn to one or two short beats and stop cleanly; the next turn starts on a fresh blank page.`;
 }
 
 export const PAGE_FULL_LINES: readonly string[] = [
-  "This page is FULL — do not place anything else on it.",
-  `You will be given a fresh page: start again at the top-left, (${CONTENT_LEFT}, ${CONTENT_TOP}).`,
+  "This page is FULL — stop cleanly; the next turn starts on a fresh blank page.",
 ];
 
 /** Below this much room, append lowRoomLine to the suggestion. */
 export const LOW_ROOM = 240;
 
-export function blankPageCanvas(index = 0, count = 1, kind: PageKind = "teach"): string {
+/** Page-local y of a lesson step's heading rule, below CONTENT_TOP's 36px title. */
+export const STEP_RULE_OFFSET = 56;
+/**
+ * Where a lesson step's own working starts: under the heading rule (three
+ * hairlines, ~4px deep) plus HEADING_GAP. The player measures the real heading
+ * and sets the cursor under it; this is only the room estimate the model hears.
+ */
+export const STEP_BODY_TOP = CONTENT_TOP + STEP_RULE_OFFSET + 4 + HEADING_GAP;
+
+/**
+ * A fresh lesson-step page: the client writes the step's numbered heading
+ * across the top before any of the model's beats, and the beats flow under it.
+ */
+export function headedPageCanvas(index = 0, count = 1): string {
+  return [
+    pageHeaderLine({ ...pageRect(index), row: index, col: 0, index, count, kind: "teach" }),
+    "(the step's numbered heading and a rule are already written across the top — do not write a title; your content flows under them automatically)",
+    roomLine(CONTENT_BOTTOM - STEP_BODY_TOP),
+  ].join("\n");
+}
+
+/**
+ * A blank page, or one whose only content is client-drawn furniture named by
+ * `furniture` (e.g. the question block of a solve turn), which the model must
+ * not rewrite.
+ */
+export function blankPageCanvas(index = 0, count = 1, kind: PageKind = "teach", furniture?: string): string {
   return [
     pageHeaderLine({ ...pageRect(index), row: index, col: 0, index, count, kind }),
-    "(this page is blank — start at the top-left)",
-    `Suggested top-left for new content: (${CONTENT_LEFT}, ${CONTENT_TOP})`,
+    furniture ? `(${furniture} — do not write it again; your content flows under it automatically)` : "(this page is blank)",
     roomLine(CONTENT_BOTTOM - CONTENT_TOP),
   ].join("\n");
 }

@@ -34,85 +34,66 @@ export const FONT_PX: Record<SizeName, number> = { sm: 16, md: 24, lg: 36 };
 export const HIGHLIGHT_FILL = "#ffec99";
 
 // Excalidraw font-family ids (the numbers used by appState.currentItemFontFamily).
-// The board's default is the hand-drawn Excalifont (5); family 2 is the plain
-// Helvetica substitute (LiberationSans). We keep everything hand-drawn EXCEPT
-// text that contains a math glyph the hand-drawn fonts can't render (see below).
+// The board's default is the hand-drawn Excalifont (5); family 2 is Excalidraw's
+// "Helvetica", which is a LOCAL font lookup — Arial on a Windows machine. We
+// keep everything hand-drawn EXCEPT a text element that contains a glyph the
+// hand-drawn fonts cannot render (see below), and only that one element.
 const FONT_HANDDRAWN = 5;
 const FONT_MATH = 2;
 
 /**
  * Characters that NONE of Excalidraw's hand-drawn fonts (Excalifont/Virgil/
  * Comic Shanns/Nunito/Lilita) have a glyph for, so the browser substitutes a
- * fallback and they come out as mojibake on the board — e.g. "√2" rendered as
- * "Ã2", "x²" as garbage. Every character listed here DOES exist in the bundled
- * Helvetica substitute (LiberationSans), so any string containing one is drawn
- * in that font instead. Verified against the bundled woff2 cmaps.
+ * fallback and they come out as mojibake on the board — e.g. "x²" as garbage.
+ * A string containing one is drawn in the Helvetica family instead.
  *
  * Symbols the hand-drawn font CAN draw are deliberately left out so ordinary
  * text keeps its hand-drawn feel: × ÷ · − ± ° π θ Σ µ λ α β ½ ¼ ¾ – — …
- * Covered here: √∛ Δ Ω ≤ ≥ ≠ ≈ ≡ ∝ ∞ → ← ↔ ⇒ ∫ ∏ ∂ ∇ ∈∉ ∠ ∥ ∩∪ ⊂⊃ ∅ ∴ ∵ △ ′ ″.
+ * Covered here: Δ Ω ≤ ≥ ≠ ≈ ≡ ∝ ∞ → ← ↔ ⇒ ∫ ∏ ∂ ∇ ∈∉ ∠ ∥ ∩∪ ⊂⊃ ∅ ∴ ∵ △ ′ ″.
  *
- * NOT covered, because no bundled font has them: superscripts beyond ¹ ² ³ ⁿ,
- * and subscripts at ALL (checked every shipped woff2 cmap — Excalifont 0/10,
- * Virgil 0/10, ComicShanns 0/10, Nunito 0/10, LiberationSans 0/10). Raised and
- * lowered type is therefore produced geometrically instead: see mathtext.ts,
- * which lays "x^2" out as two separate text elements. `normalizeScripts` below
- * rewrites any Unicode script character into that notation before it is drawn.
+ * NOT covered, because they are drawn as GEOMETRY instead (see mathtext.ts):
+ * the square root sign, which becomes two strokes and a bar over the radicand,
+ * and superscripts/subscripts (no bundled font has them: Excalifont 0/10,
+ * Virgil 0/10, ComicShanns 0/10, Nunito 0/10, LiberationSans 0/10), which are
+ * laid out as separate smaller text elements. `normalizeScripts` rewrites any
+ * Unicode script character into that notation before it is drawn, so the
+ * script characters listed here only matter for a bound label that cannot be
+ * split into runs.
  */
 const MATH_GLYPHS_NEEDING_FALLBACK =
-  /[²³¹⁰-₟√-∜ΔΩ∂∇∏∈-∍∠∥∩∪⊂⊃∅∫-∮∴∵≈≠≡≤≥∝∞←-⇿′″△]/;
+  /[²³¹⁰-₟ΔΩ∂∇∏∈-∍∠∥∩∪⊂⊃∅∫-∮∴∵≈≠≡≤≥∝∞←-⇿′″△]/;
 
 /**
  * Indic/Arabic scripts (Devanagari, Bengali, Tamil, Telugu, …, Arabic/Urdu).
- * The math fallback font (LiberationSans) is Latin-only, so a string that mixes
- * one of these scripts with a math glyph must STAY hand-drawn — switching fonts
- * would drop the letters entirely, which is worse than one mis-rendered symbol.
- * Pure "√2" / "x²" labels have no such letters and are still fixed.
+ * The math fallback font is Latin-only, so a string that mixes one of these
+ * scripts with a math glyph must STAY hand-drawn — switching fonts would drop
+ * the letters entirely, which is worse than one mis-rendered symbol.
  */
 const COMPLEX_SCRIPT = /[؀-ۿऀ-෿]/;
 
 /**
  * Font family for a piece of board text: the Helvetica fallback (family 2) when
  * the string contains a math glyph the hand-drawn font lacks, otherwise the
- * hand-drawn default (family 5). Excalidraw text is single-font per element, so
- * a short label like "√2" renders wholly in Helvetica — clean, and far better
- * than the "Ã2" mojibake the hand-drawn font produced.
+ * hand-drawn default (family 5). Decided per element: one line with a ≤ in it
+ * is set in the fallback, and nothing around it follows.
  */
-export function boardFontFamily(
-  text: string | null | undefined,
-  /** True once something else on this page has already switched: the rest of the
-   *  page follows so one board does not mix two typefaces (see Page.mathFont).
-   *  Text carrying a complex script still stays hand-drawn — the fallback font
-   *  has no Devanagari and would drop the letters entirely. */
-  pageUsesMathFont = false,
-): typeof FONT_HANDDRAWN | typeof FONT_MATH {
+export function boardFontFamily(text: string | null | undefined): typeof FONT_HANDDRAWN | typeof FONT_MATH {
   if (!text) return FONT_HANDDRAWN;
   if (COMPLEX_SCRIPT.test(text)) return FONT_HANDDRAWN;
-  if (pageUsesMathFont) return FONT_MATH;
   return MATH_GLYPHS_NEEDING_FALLBACK.test(text) ? FONT_MATH : FONT_HANDDRAWN;
 }
 
 /**
- * Whether this text is what MAKES a page switch to the math font — it carries a
- * glyph the hand-drawn font cannot render and no script that the fallback lacks.
- * The player asks this to latch `Page.mathFont`.
+ * Whether this text is drawn in the math font — it carries a glyph the
+ * hand-drawn font cannot render and no script that the fallback lacks. The
+ * math layout asks this to measure such a line in the right font's widths.
  */
 export function needsMathFont(text: string | null | undefined): boolean {
   return !!text && MATH_GLYPHS_NEEDING_FALLBACK.test(text) && !COMPLEX_SCRIPT.test(text);
 }
 
-/** The fallback family id, for the player's retroactive restyle. */
+/** The fallback family id, for tests. */
 export const MATH_FONT_FAMILY = FONT_MATH;
-
-/**
- * Whether text already committed to a latched page may be moved to the math
- * font. Anything in a complex script must stay hand-drawn (the fallback has no
- * Devanagari); everything else on that page follows, glyph or not, because the
- * point is that the board reads as one typeface.
- */
-export function needsHandToMathSwitch(text: string | null | undefined): boolean {
-  return !!text && !COMPLEX_SCRIPT.test(text);
-}
 
 export type TutorMeta = {
   tutor: true;
@@ -125,14 +106,23 @@ export type TutorMeta = {
   // of the parent removes the whole group.
   group?: string;
   groupLabel?: string;
-  /** Index of the page this element belongs to. Set at draw time: collision
-   *  avoidance can move an element up to 400px AFTER the page origin was
-   *  applied, so the page is not recoverable from e.y. */
+  /** Index of the page this element belongs to. Set at draw time; an anchored
+   *  annotation can land on an earlier page than the one being written. */
   page?: number;
+  /** Client-authored furniture (a step heading, the agenda, a question block)
+   *  drawn at fixed coordinates: not part of the flowed body of the page. */
+  fixed?: true;
 };
 
-function meta(turn: number, opId?: string | null, temp?: boolean | null, page?: number): TutorMeta {
-  return { tutor: true, turn, opId: opId ?? undefined, temp: temp ? true : undefined, page };
+function meta(turn: number, op: DrawOp, page?: number): TutorMeta {
+  return {
+    tutor: true,
+    turn,
+    opId: op.id ?? undefined,
+    temp: op.temp ? true : undefined,
+    page,
+    fixed: op.layout === "fixed" ? true : undefined,
+  };
 }
 
 /**
@@ -156,8 +146,6 @@ export function opToSkeleton(
   turn: number,
   elementId: string,
   page?: number,
-  /** The page this op lands on has already fallen back to the math font. */
-  pageUsesMathFont = false,
 ): ExcalidrawElementSkeleton | null {
   const color = op.color ?? "black";
   const stroke = STROKE[color];
@@ -174,10 +162,12 @@ export function opToSkeleton(
         // `px` is the exact size a superscript/subscript run was laid out at;
         // everything else uses one of the three named sizes.
         fontSize: op.px ?? FONT_PX[op.size ?? "md"],
-        fontFamily: boardFontFamily(op.text, pageUsesMathFont),
+        // A run of a line laid out in the fallback font stays in it, so the
+        // widths it was positioned by are the widths it is drawn with.
+        fontFamily: op.font === "math" && !COMPLEX_SCRIPT.test(op.text) ? FONT_MATH : boardFontFamily(op.text),
         strokeColor: stroke,
         textAlign: "left",
-        customData: meta(turn, op.id, op.temp, page),
+        customData: meta(turn, op, page),
       };
     }
     case "rect":
@@ -198,8 +188,8 @@ export function opToSkeleton(
         fillStyle: "hachure",
         roughness: 1,
         roundness: type === "rectangle" ? { type: 3 } : null,
-        customData: meta(turn, op.id, op.temp, page),
-        ...(op.text ? { label: { text: op.text, fontSize: 20, fontFamily: boardFontFamily(op.text, pageUsesMathFont) } } : {}),
+        customData: meta(turn, op, page),
+        ...(op.text ? { label: { text: op.text, fontSize: 20, fontFamily: boardFontFamily(op.text) } } : {}),
       };
     }
     case "arrow":
@@ -225,8 +215,8 @@ export function opToSkeleton(
         roughness: 1,
         endArrowhead: op.op === "arrow" ? "arrow" : null,
         startArrowhead: null,
-        customData: meta(turn, op.id, op.temp, page),
-        ...(op.text ? { label: { text: op.text, fontSize: 16, fontFamily: boardFontFamily(op.text, pageUsesMathFont) } } : {}),
+        customData: meta(turn, op, page),
+        ...(op.text ? { label: { text: op.text, fontSize: 16, fontFamily: boardFontFamily(op.text) } } : {}),
       } as ExcalidrawElementSkeleton;
     }
     case "highlight": {
@@ -237,6 +227,8 @@ export function opToSkeleton(
         y: op.y ?? 0,
         width: Math.max(op.w ?? 160, 20),
         height: Math.max(op.h ?? 60, 20),
+        // A band laid along a figure's side: rotated about its centre.
+        ...(op.rot ? { angle: op.rot } : {}),
         strokeColor: "transparent",
         backgroundColor: HIGHLIGHT_FILL,
         fillStyle: "solid",
@@ -245,7 +237,7 @@ export function opToSkeleton(
         roundness: { type: 3 },
         // Tagged so collision avoidance never treats a translucent highlight as an
         // obstacle — it is meant to overlay the very content it points at.
-        customData: { ...meta(turn, op.id, op.temp, page), highlight: true },
+        customData: { ...meta(turn, op, page), highlight: true },
       };
     }
     case "numberline":

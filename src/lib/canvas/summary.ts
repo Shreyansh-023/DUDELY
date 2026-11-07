@@ -6,8 +6,6 @@ import { isPermanentNote } from "./ops";
 import {
   CLEARANCE,
   CONTENT_BOTTOM,
-  CONTENT_LEFT,
-  CONTENT_RIGHT,
   CONTENT_TOP,
   LOW_ROOM,
   PAGE_FULL_LINES,
@@ -29,6 +27,7 @@ type Meta =
       group?: string;
       groupLabel?: string;
       page?: number;
+      fixed?: true;
     }
   | undefined;
 
@@ -36,33 +35,41 @@ export function isTutorElement(e: ExcalidrawElement): boolean {
   return Boolean((e.customData as Meta)?.tutor);
 }
 
-const r = (n: number) => Math.round(n);
-
 /** True bounds. `e.y + e.height` is wrong for a line or arrow drawn up or left. */
 const boxOf = (e: NonDeleted<ExcalidrawElement>) => getCommonBounds([e]);
 
-function describe(e: NonDeleted<ExcalidrawElement>, tag: string, frame: PageFrame): string {
+/**
+ * One line for one element. No coordinates: the model never places anything,
+ * so a position would only tempt it to. What it needs is the id (to point at
+ * or erase the element) and what the element says.
+ */
+function describe(e: NonDeleted<ExcalidrawElement>, tag: string): string {
   const id = (e.customData as Meta)?.opId ?? e.id.slice(0, 6);
-  const ex = e.x - frame.x;
-  const ey = e.y - frame.y;
-  const pos = `@(${r(ex)},${r(ey)}) ${r(e.width)}x${r(e.height)}`;
-  if (e.type === "text") return `- [${id}] text ${pos} "${e.text.replace(/\n/g, " / ").slice(0, 80)}" (${tag})`;
-  if (e.type === "freedraw") return `- [${id}] pen stroke ${pos} (${tag})`;
-  if (e.type === "arrow" || e.type === "line") {
-    const [ldx, ldy] = e.points[e.points.length - 1] ?? [0, 0];
-    return `- [${id}] ${e.type} from (${r(ex)},${r(ey)}) to (${r(ex + ldx)},${r(ey + ldy)}) (${tag})`;
+  if (e.type === "text") return `- [${id}] text "${e.text.replace(/\n/g, " / ").slice(0, 80)}" (${tag})`;
+  if (e.type === "freedraw") return `- [${id}] pen stroke (${tag})`;
+  if (e.type === "arrow" || e.type === "line") return `- [${id}] ${e.type} (${tag})`;
+  return `- [${id}] ${e.type} (${tag})`;
+}
+
+/**
+ * A figure's summary line from the label its children carry. A polygon's
+ * label names its vertices ("polygon ABC"), from which the model can name any
+ * part: `at:"A"`, `at:"BC"`, `from:"A", to:"mid BC"`.
+ */
+function describeGroup(id: string, label: string): string {
+  const m = /^polygon ([A-Za-z0-9]+)$/.exec(label);
+  if (m && m[1].length >= 3) {
+    const v = [...m[1]];
+    const sides = v.map((a, i) => `${a}${v[(i + 1) % v.length]}`);
+    return `- [${id}] polygon with vertices ${v.join(", ")} and sides ${sides.join(", ")} (tutor; annotate it by name with at/of)`;
   }
-  return `- [${id}] ${e.type} ${pos} (${tag})`;
+  return `- [${id}] ${label} (tutor)`;
 }
 
 /**
  * Builds the CANVAS block the LLM reads: which page it is writing on, what is
- * already on THAT page (in the page-local frame the model draws in), which
- * parts the student just added, where free space begins and how much room is
- * left before the page is full.
- *
- * Everything is reported relative to the page's own origin, so the model always
- * works in top-left ≈ (80,80) coordinates and never sees another page.
+ * already on THAT page (by id and content, never by position), which parts the
+ * student just added, and how much room is left before the page is full.
  */
 export function summarizeScene(
   elements: readonly NonDeleted<ExcalidrawElement>[],
@@ -94,51 +101,35 @@ export function summarizeScene(
   const tutorLines: string[] = [];
   for (const e of tutor) {
     if (e.type === "text" && e.containerId) continue;
-    const g = (e.customData as Meta)?.group;
+    const meta = e.customData as Meta;
+    const g = meta?.group;
     if (g) {
       if (seenGroups.has(g)) continue;
       seenGroups.add(g);
-      const label = (e.customData as Meta)?.groupLabel ?? "numberline";
-      // A group's size matters: the model cannot judge the room left on the page
-      // if a 350px-tall axes reports itself as a point.
-      const kids = tutor.filter((c) => (c.customData as Meta)?.group === g);
-      const [gx1, gy1, gx2, gy2] = getCommonBounds(kids);
-      tutorLines.push(
-        `- [${g}] ${label} @(${r(gx1 - frame.x)},${r(gy1 - frame.y)}) ${r(gx2 - gx1)}x${r(gy2 - gy1)} (tutor)`,
-      );
+      tutorLines.push(describeGroup(g, meta?.groupLabel ?? "figure"));
       continue;
     }
-    tutorLines.push(describe(e, "tutor", frame));
+    tutorLines.push(describe(e, meta?.fixed ? "tutor, heading" : "tutor"));
   }
   lines.push(...tutorLines.slice(-40));
   if (tutorLines.length > 40) lines.push(`- ... and ${tutorLines.length - 40} more tutor elements`);
 
-  const studentLines = student.map((e) =>
-    describe(e, changedStudentIds.has(e.id) ? "student, NEW" : "student", frame),
-  );
+  const studentLines = student.map((e) => describe(e, changedStudentIds.has(e.id) ? "student, NEW" : "student"));
   lines.push(...studentLines.slice(-15));
   if (studentLines.length > 15) lines.push(`- ... and ${studentLines.length - 15} more student strokes`);
 
   if (changedStudentIds.size) {
     const changed = student.filter((e) => changedStudentIds.has(e.id));
-    const [sx1, sy1, sx2, sy2] = getCommonBounds(changed);
-    lines.push(
-      `Student just drew/changed ${changed.length} element(s) inside (${r(sx1 - frame.x)},${r(sy1 - frame.y)})-(${r(sx2 - frame.x)},${r(sy2 - frame.y)}).`,
-    );
+    lines.push(`Student just drew/changed ${changed.length} element(s) on this page; your reply is placed beside their work.`);
   }
 
-  // Where to carry on, and how much of the page is left. The suggestion is
-  // clamped into the content box: on a fixed page there is no "just keep going
-  // downward" any more.
-  const [minX, , , maxY] = getCommonBounds(visible);
+  // How much of the page is left. The board places the next content itself.
+  const [, , , maxY] = getCommonBounds(visible);
   const rawNextY = maxY - frame.y + CLEARANCE;
   const remaining = Math.max(0, CONTENT_BOTTOM - Math.max(CONTENT_TOP, rawNextY));
   if (remaining < PAGE_FULL_ROOM) {
     lines.push(...PAGE_FULL_LINES);
   } else {
-    const nextY = Math.min(Math.max(CONTENT_TOP, rawNextY), CONTENT_BOTTOM);
-    const nextX = Math.min(Math.max(CONTENT_LEFT, minX - frame.x), CONTENT_RIGHT - 200);
-    lines.push(`Suggested top-left for new content: (${r(nextX)}, ${r(nextY)})`);
     lines.push(roomLine(remaining));
     if (remaining < LOW_ROOM) lines.push(lowRoomLine(remaining));
   }

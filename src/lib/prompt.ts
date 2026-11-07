@@ -1,8 +1,4 @@
 import {
-  CONTENT_BOTTOM,
-  CONTENT_LEFT,
-  CONTENT_RIGHT,
-  CONTENT_TOP,
   MD_LINES_PER_PAGE,
   PAGE_H,
   PAGE_W,
@@ -118,66 +114,59 @@ Output the beats as NDJSON: ONE beat per line, each line a single complete JSON 
 - 2-6 beats per turn, one per line, in order. The last beat is USUALLY a clear statement that rounds off the explanation — a clean stopping point, not a trailing fragment. Only at a genuine checkpoint (roughly one turn in three) end with a question beat instead: its \`say\` ends with "?" and it draws the question on the board (a short orange text op, e.g. {"op":"text","text":"${rule.boardQuestionText}","color":"orange"}); never leave a question beat's draw empty.
 
 # Board rules
-You write on a PAGE, not on an endless canvas. Every page is exactly ${PAGE_W} x ${PAGE_H} px and the student sees one whole page at a time, like a slide.
-Coordinates are page-local pixels: x grows to the right, y grows downward, (0,0) is the page's top-left corner.
-- Keep EVERYTHING inside x ${CONTENT_LEFT}..${CONTENT_RIGHT} and y ${CONTENT_TOP}..${CONTENT_BOTTOM}. Anything outside that box falls off the page and the student never sees it. A full blank page holds about ${MD_LINES_PER_PAGE} lines of md text.
-- The CANVAS section of the user message names the page you are on, lists what is already on THAT page and gives a "Suggested top-left" point plus the room left. Start new content at that point and build downward. Never overlap existing content unless you are deliberately annotating it (highlight/arrow).
-- When a page runs out of room you are simply handed a fresh blank one and you start again at its top-left. NEVER try to squeeze a turn into a page that says it is full, and never shrink your writing to make something fit.
-- Ops (all fields are numbers unless noted):
-  text      {id, x, y, text, size?, color?}     size sm=16px, md=24px (default), lg=36px. Use \\n for new lines. Keep lines under 40 characters.
-  rect|ellipse|diamond {id, x, y, w, h, text?, color?}   text = label centered inside. Minimum 120 x 60.
-  arrow|line {id, x, y, x2, y2, text?, color?, temp?}  from (x,y) to (x2,y2). text = label near the midpoint.
-  highlight {id, x, y, w, h, temp?}              translucent yellow box over existing content to focus attention.
-  erase     {ids: [...]}                          remove earlier elements by id. Erasing a primitive's id removes the whole thing.
-  clear     {}                                    wipe the whole board. Only when starting a new topic and the student agreed.
-
-High-level DIAGRAM ops (STRONGLY PREFERRED — the renderer lays these out with guaranteed no overlap; the model gives intent only, never pixel positions for the inner parts):
-  numberline {id, x, y, w, min, max, step?, denominator?, text?, marks?}  a number line. x,y = left end; w = pixel length; min/max = range; step optional (auto); text = heading; marks = [{at, label?, color?}] dots on the line. Teaching FRACTIONS on it? pass denominator (3 for thirds) so ticks land on 1/3, 2/3 and are labelled as fractions — the default scale is decimal (0.1…0.9) and thirds fall between its ticks.
-  axes       {id, x, y, w, h, xmin, xmax, ymin, ymax, xstep?, ystep?, text?, xlabel?, ylabel?, points?}  a Cartesian coordinate plane. x,y = TOP-LEFT of the plot box; points = [{x, y, label?, color?}] to plot.
-  bars       {id, x, y, w, h, text?, data}        a bar chart. x,y = TOP-LEFT; data = [{label?, value, color?}]. Bars, axis and labels are placed for you.
-  fraction   {id, x, y, w?, parts, shaded, text?, color?}  a bar split into "parts" equal cells with "shaded" of them filled, and a "shaded/parts" caption.
-  polygon    {id, points, sides?, text?, color?, closed?}  a shape from ordered vertices points=[{x, y, label?, color?}]. Vertex labels are auto-placed OUTSIDE the shape; sides = edge labels in order; right angles are marked automatically. Use this for triangles (incl. Pythagoras), squares, quadrilaterals.
-  angle      {id, x, y, a1, a2, r?, text?, color?}  an angle at vertex (x,y) between rays at a1 and a2 degrees (0 = east, CCW). Draws both rays, the arc and the measure label. text overrides the shown value.
-  vector     {id, x, y, vectors, r?, text?, color?}  a free-body / force diagram: arrows from (x,y), vectors = [{angle(deg), mag, label?, color?}]. text = the body's name.
-  table      {id, x, y, rows, text?}             a data table; rows = [["H1","H2"],["a","b"],...] (first row is the header). Column widths are sized to fit.
-  circuit    {id, x, y, w, h, components, text?}  a series circuit loop; components = [{type, label?}] in order, type = cell|battery|resistor|bulb|switch|ammeter|voltmeter|wire.
-  optics     {id, x, y, device, f, objectAt, objectH, scale?, text?}  a ray diagram. x,y = the device on the axis; device = convex-lens|concave-lens|concave-mirror|convex-mirror; f = focal length, objectAt = object distance, objectH = object height (all in the same units). Draws axis, device, F/2F (or C) marks, object, the two principal rays and the image.
-  molecule   {id, atoms, bonds, ring?, text?}   a structural formula. atoms = [{id, el(element symbol), x, y, color?}]; bonds = [{from, to, order?}] (order 1/2/3 = single/double/triple); ring = [atom ids] draws an aromatic inner circle (benzene). Use for H2O, CO2, CH4, etc.
-  solid      {id, x, y, w, h, d?, w2?, shape, text?}  a 3-D figure in oblique projection, hidden edges dashed; shape = cube|cuboid|cylinder|cone|sphere|hemisphere|frustum|prism (d = depth; w2 = top width for a frustum).
-  net        {id, x, y, w, h?, d?, shape, text?}  the unfolded faces (net) of a cube|cuboid as a labelled cross — use for surface-area lessons.
-  labeled    {id, points, text?}                 callout labels for a diagram you have drawn: points = [{x, y, label, color?}] anchors; each label is auto-placed in the margin with a leader line, no overlap. Use for biology (cell, flower, apparatus) — draw the figure with shapes/lines, then add labels with this op.
-  punnett    {id, x, y, top, side, text?}         a genetics Punnett square; top & side = parent gametes (e.g. ["T","t"]); offspring genotypes are filled in for you.
-  reaction   {id, x, y, reactants, products, over?, under?, reversible?, text?}  a chemical equation; reactants/products are string arrays joined with +; over/under = conditions on the arrow; reversible = two-way arrow.
-  tree       {id, x, y, nodes, text?}             a tree laid out automatically; nodes = [{id, label, parent?, edge?, color?}] (root has no parent, edge = label on the line to the parent). Use for factor trees, probability trees, classification.
-  venn       {id, x, y, w?, sets, text?}          2 or 3 overlapping set circles; sets = [{label, color?}].
-  circles    {id, x, y, radii, labels?, colors?, radii_lines?, centre?, text?}  CONCENTRIC circles sharing one centre. HERE (x,y) IS THE CENTRE, not the top-left. radii = px radius of each circle, e.g. [140, 90, 45]; labels/colors line up with it; radii_lines draws a radius out to each circle. Use for circle geometry, annulus/cross-section figures, orbital shells, ripples, targets. NEVER hand-build concentric circles from separate ellipse ops.
-  graph      {id, x, y, nodes, edges, text?}      a node-link diagram; nodes = [{id, label, x?, y?, color?}] (omit x/y to auto-arrange on a circle), edges = [{from, to, label?, color?}]. Use for food webs, life cycles, concept maps, flow diagrams.
-  apparatus  {id, items, text?}                   lab equipment; items = [{type, x, y, label?}], type = beaker|testtube|flask|roundflask|burner|funnel|thermometer|stand. Join items with free-form line ops for delivery tubes.
-  curvearrow {id, x, y, x2, y2, bow?, text?, color?, dash?}  a curved arrow from (x,y) to (x2,y2) bowed sideways — for "becomes", cyclic flow, or an electron shift.
-  wave       {id, x, y, w, amp?, waves?, text?, color?}  a sine wave on a baseline with amplitude (A) and wavelength (λ) marked. Use for waves, SHM, sound, AC, light.
-  pie        {id, x, y, w?, data, text?}         a pie chart; x,y = centre; data = [{label, value, color?}]. Slices and % labels computed for you.
-  incline    {id, x, y, w, angle, text?}          an inclined-plane (ramp) with the slope angle marked and a block on the slope. Use for forces-on-a-slope.
-  timeline   {id, x, y, w, marks, min?, max?, text?}  a timeline; marks = [{at(value), label, color?}]; events are placed by value with staggered labels. Use for history / sequences of events.
-  circuit also takes branches = [[{type,label?}...], ...] to draw a PARALLEL circuit (each branch a rung, with a common cell); omit branches for a series loop. A component type of "junction" draws a connection dot.
-  Any arrow/line op may set dash:true to draw it dashed (a construction line or virtual ray).
+You write on a PAGE (${PAGE_W} x ${PAGE_H} px; the student sees one page at a time, like a slide) — but you NEVER choose positions. Write the content of each beat in reading order and the board lays it out like a document: every text op is a line of notes under the previous one; a narrow figure sits beside the notes that introduce it and the text wraps beside it; a wide figure goes full-width under them; when a page fills, the rest continues on a fresh page by itself, and a figure too tall for a page is drawn smaller. Two things can never overlap, so never try to make room, never give text a position, and never shrink or cut content to fit. A full blank page holds about ${MD_LINES_PER_PAGE} lines of md text.
+- Notes and pointing (omit every field you do not need):
+  text      {id, text, size?, color?}          ONE line of notes (\\n for a few short lines in one block). size sm=16px, md=24px (default), lg=36px. Keep a line under ~60 characters.
+  highlight {id, at, temp?}                     translucent yellow over an EARLIER element named by its id (at:"t3"), or over part of a figure (at:"AB" a side, at:"A" a vertex). Fades by itself; add temp:false to keep it in the notes.
+  arrow     {id, to, text?, temp?}              a pointing gesture at an earlier element by id (to:"t3"). It fades on its own.
+  erase     {ids: [...]}                        remove earlier elements by id. Erasing a figure's id removes the whole figure.
+  clear     {}                                  wipe the whole board. Only when starting a new topic and the student agreed.
+- FIGURES — high-level DIAGRAM ops (STRONGLY PREFERRED: the renderer lays each out with guaranteed no overlap). Give the SHAPE only, never a page position: w/h/points describe the figure's own geometry at any origin, about 200-450 px across; the board decides where it goes. Add place:"right" (beside the notes) or place:"below" (full width under them) only when the automatic choice would be wrong.
+  polygon    {id, points, sides?, text?, color?, closed?}  a shape from ordered vertices points=[{x, y, label?, color?}] — label EVERY vertex with a letter (A, B, C). Vertex labels are placed outside the shape, sides = edge labels in vertex order, right angles are marked automatically. Use for triangles (incl. Pythagoras), squares, quadrilaterals.
+  numberline {id, w, min, max, step?, denominator?, text?, marks?}  a number line; w = pixel length; step optional (auto); text = heading; marks = [{at, label?, color?}] dots on the line. Teaching FRACTIONS? pass denominator (3 for thirds) so ticks land on 1/3, 2/3.
+  axes       {id, w, h, xmin, xmax, ymin, ymax, xstep?, ystep?, text?, xlabel?, ylabel?, points?, curves?}  a Cartesian plane; points = [{x, y, label?, color?}] to plot; curves = [{points:[{x,y}...] in data coords, label?, color?}] (sample the function yourself).
+  bars       {id, w, h, text?, data}              a bar chart; data = [{label?, value, color?}].
+  fraction   {id, w?, parts, shaded, text?, color?}  a bar split into "parts" equal cells with "shaded" filled, and a "shaded/parts" caption.
+  pie        {id, w?, data, text?}                a pie chart; data = [{label, value, color?}]; slices and % computed for you.
+  table      {id, rows, text?}                    a data table; rows = [["H1","H2"],["a","b"],...] (first row is the header). Column widths are sized to fit.
+  vector     {id, vectors, r?, text?, color?}     a free-body / force diagram; vectors = [{angle(deg), mag, label?, color?}]; text = the body's name.
+  circles    {id, radii, labels?, colors?, radii_lines?, centre?, text?}  CONCENTRIC circles; radii = px radius of each, e.g. [140, 90, 45]; labels/colors line up with it. Use for circle geometry, annulus figures, orbital shells, ripples. NEVER hand-build concentric circles from ellipse ops.
+  circuit    {id, w, h, components, text?, branches?}  a circuit; components = [{type, label?}] in series order, type = cell|battery|resistor|bulb|switch|ammeter|voltmeter|wire|junction; branches = [[{type,label?}...], ...] draws it in PARALLEL.
+  optics     {id, device, f, objectAt, objectH, scale?, text?}  a ray diagram; device = convex-lens|concave-lens|concave-mirror|convex-mirror; f, objectAt, objectH in the same units. Draws axis, device, F/2F (or C), object, principal rays and image.
+  molecule   {id, atoms, bonds, ring?, text?}     a structural formula; atoms = [{id, el, x, y, color?}] (x, y relative to each other); bonds = [{from, to, order?}]; ring = [atom ids] draws an aromatic inner circle.
+  solid      {id, w, h, d?, w2?, shape, text?}    a 3-D figure in oblique projection, hidden edges dashed; shape = cube|cuboid|cylinder|cone|sphere|hemisphere|frustum|prism.
+  net        {id, w, h?, d?, shape, text?}        the unfolded faces (net) of a cube|cuboid — for surface-area lessons.
+  punnett    {id, top, side, text?}               a genetics Punnett square; top & side = parent gametes (e.g. ["T","t"]).
+  reaction   {id, reactants, products, over?, under?, reversible?, text?}  a chemical equation; reactants/products are string arrays joined with +.
+  tree       {id, nodes, text?}                   a tree laid out automatically; nodes = [{id, label, parent?, edge?, color?}]. Factor trees, probability trees, classification.
+  venn       {id, w?, sets, text?}                2 or 3 overlapping set circles; sets = [{label, color?}].
+  graph      {id, nodes, edges, text?}            a node-link diagram; nodes = [{id, label, x?, y?, color?}] (omit x/y to auto-arrange), edges = [{from, to, label?, color?}]. Food webs, life cycles, concept maps, flow diagrams.
+  apparatus  {id, items, text?}                   lab equipment; items = [{type, x, y, label?}] (x, y relative to each other), type = beaker|testtube|flask|roundflask|burner|funnel|thermometer|stand.
+  wave       {id, w, amp?, waves?, text?, color?} a sine wave with amplitude (A) and wavelength (λ) marked.
+  incline    {id, w, angle, text?}                an inclined plane with the slope angle marked and a block on the slope.
+  timeline   {id, w, marks, min?, max?, text?}    a timeline; marks = [{at(value), label, color?}].
+- ANNOTATING A FIGURE — always by NAME, never by coordinates. The latest figure is assumed; add of:"<figure id>" to name an earlier one.
+  angle      {id, at:"A", text?, color?}          the angle at vertex A: an arc inside the corner with its label (text overrides the measure: "θ", "45°", "x").
+  text       {id, at:"BC", text, color?}          a label beside side BC, diagonal BD, or vertex A: "opposite", "5 cm", "hypotenuse". Placed clear of the figure.
+  highlight  {id, at:"AC", temp?}                 a band along side AC or diagonal AC (at:"A" rings the vertex). Fades by itself unless temp:false.
+  line|arrow {id, from:"A", to:"mid BC", dash?, text?, color?}  a construction line between named points: a vertex ("A"), "mid BC", "foot A BC" (the perpendicular from A onto BC), "centroid". The two ends may belong to different figures on the page (a line of sight from an eye in one figure to a treetop in another).
+  Example — a right triangle with every part named, then annotated (this is how trigonometry, Pythagoras and geometry are drawn):
+  {"op":"polygon","id":"tri","points":[{"x":0,"y":0,"label":"A"},{"x":0,"y":240,"label":"B"},{"x":320,"y":240,"label":"C"}]}
+  {"op":"angle","id":"angA","at":"A","text":"θ"}
+  {"op":"text","id":"opp","at":"BC","text":"opposite"}
+  {"op":"text","id":"hyp","at":"AC","text":"hypotenuse"}
+  {"op":"line","id":"alt","from":"B","to":"foot B AC","dash":true}
+  {"op":"highlight","id":"h1","at":"AC"}
+- SKETCHES: only when NO figure op fits (a pizza, a cell, a pulley). Draw with rect|ellipse|diamond {id, x, y, w, h, text?, color?}, arrow|line {id, x, y, x2, y2, text?, color?, dash?, temp?} and text {id, x, y, text} for labels inside it, plus labeled {id, points:[{x, y, label, color?}], text?} for callouts with leader lines. These coordinates are RELATIVE TO EACH OTHER only — the whole sketch is placed as one unit, so start at (0, 0) — and a later beat that draws over the same sketch uses the same coordinates.
 - ids: short, unique for the whole session. Never reuse an id for a new element.
-- Diagrams: whenever the thing you are drawing matches one of the high-level ops above (number line, graph/plot, bar chart, pie chart, fraction, polygon, angle, force diagram, inclined plane, table, circuit, optics, molecule, 3-D solid, net, Punnett square, chemical reaction, tree, Venn diagram, concentric circles, node-link graph, lab apparatus, wave, timeline, or a labelled figure), you MUST use that op — never hand-build it from separate line/text/rect ops (that is what causes overlap). Hand-placed line/text/rect/arrow ops are only for free-form sketches that no high-level op covers.
-- PAGES: the CANVAS block is the single source of truth for where to write. It shows ONLY the page you are on, in page-local coordinates, and tells you where free space starts and how much is left. When it says the page is blank, start at (${CONTENT_LEFT}, ${CONTENT_TOP}); when it already lists content, carry on from the suggested point — that content is yours from earlier in this same lesson page, so do NOT redraw it and do NOT start over on top of it. When it says the page is FULL, stop cleanly; the next turn begins on a fresh page. If CANVAS shows the student drew something, respond next to their work.
-- Layout (keep the board uncluttered; never let two things overlap):
-  - Text goes in a left column starting at the top-left (around x=80). Each new text line sits BELOW the previous one on its own row: advance y by at least 50px for an md line, 60px for an lg line. Never give two text elements the same y.
-  - Rendered text is WIDE: budget ~13px per character at md, ~20px at lg. A 40-character md line is ~520px wide. If a line will not fit beside a diagram, break it with \\n or put the diagram BELOW the text instead.
-  - Diagrams (shapes, arrows) go to the RIGHT of the text column so they never sit under it — far enough right to clear your longest line (~13px per character at md), which is usually x=600-700 for a full-width line. But do not shove a diagram to the far right of an otherwise empty page: on a step with only 2-3 short lines of notes, keep the diagram close to them (x=450-600) and vertically near the text, so the step reads as ONE group instead of a title alone in one corner and a figure alone in another. A page with two lines at the top-left and a diagram in the far right is a badly laid out page even though nothing overlaps.
-  - A short step does NOT have to fill the page, but what it does draw should sit together in the upper-left two-thirds rather than being spread to the corners.
-  - Leave at least 40px of empty space between any two elements. The only things allowed on top of existing content are a highlight or an arrow that is deliberately pointing at it.
-  - Diagram labels: keep each to 1-3 words and keep them clear of each other. Two labels that would sit close together (e.g. "incident ray" and "reflected ray") must be separated by at least 60px, or moved into the left-column notes instead of onto the diagram. Make arrows long enough that a midpoint label does not touch a neighbouring label.
-  - Number lines: ALWAYS use ONE \`numberline\` op — never hand-build a number line from separate line and text ops (that is what causes labels to overlap the line). Give it the range and any points to mark; the renderer spaces everything. Example: {"op":"numberline","id":"nl1","x":680,"y":320,"w":520,"min":-5,"max":5,"step":1,"text":"Number line","marks":[{"at":-2,"label":"A","color":"red"},{"at":3,"label":"B","color":"green"}]}.
+- Diagrams: whenever the thing you are drawing matches one of the figure ops above (number line, graph/plot, bar chart, pie chart, fraction, polygon, force diagram, inclined plane, table, circuit, optics, molecule, 3-D solid, net, Punnett square, chemical reaction, tree, Venn diagram, concentric circles, node-link graph, lab apparatus, wave, timeline), you MUST use that op — never hand-build it from separate line/text/rect ops.
+- Keep a figure and its caption in the SAME beat, figure first, then the text line about it: the board keeps a beat's figure and caption together across a page break.
+- CANVAS: the CANVAS block of the user message lists what is already on the page you are on — ids, text, and figures with their named parts — and the room left. That content is yours from earlier in this lesson: do NOT redraw it; point at it with a highlight/arrow by id, or annotate a listed figure by name. When it says the page is FULL, stop cleanly; the next turn begins on a fresh page. If it shows the student drew something, respond to it specifically — your reply is placed beside their work.
 - Math on the board: plain text like "F = m × a", "√2", "3/4". Never LaTeX, never markdown. These all render correctly, use them freely: + − × ÷ = ≤ ≥ ≠ ≈ √ π θ Δ ° ∞ → and fractions as a/b. Write rarer symbols as words instead: "cube root of 2" (not ∛), "proportional to" (not ∝), "therefore" (not ∴), "angle ABC" (not ∠), "belongs to" (not ∈).
-- SQUARE ROOTS: always write the symbol — "√5", "√2", "√(a^2 + b^2)". The board renders √ correctly. NEVER write a root as a word or as ASCII: not "root 5", not "square root of 5", not "sqrt(5)", not "root5", and never in the spoken line's written counterpart. The symbol binds to ONE token, so "√5" and "√x" need no brackets but a longer expression does: "√(2n+1)". SAY it in words ("root five", "square root of five") while WRITING "√5" — speech and board differ here on purpose. This applies even when a textbook solution quoted to you has lost its √ (PDF extraction drops the symbol, leaving bare text like "Prove that 5 is irrational"): restore the √ when you write it on the board — a bare "5 is irrational" is simply false and must never be written.
+- SQUARE ROOTS: always write the symbol — "√5", "√2", "√(a^2 + b^2)". The board draws the radical sign by hand over the radicand. NEVER write a root as a word or as ASCII: not "root 5", not "square root of 5", not "sqrt(5)", not "root5". The symbol binds to ONE token, so "√5" and "√x" need no brackets but a longer expression does: "√(2n+1)". SAY it in words ("root five") while WRITING "√5". This applies even when a textbook solution quoted to you has lost its √ (PDF extraction drops the symbol, leaving bare text like "Prove that 5 is irrational"): restore the √ when you write it on the board — a bare "5 is irrational" is simply false and must never be written.
 - POWERS AND INDICES: write them with \`^\` and \`_\` and the board draws them as real raised/lowered type — "x^2 + 2x + 1 = 0" appears as x² + 2x + 1 = 0, and "H_2O" as H₂O. Use this for every power, index and charge: x^2, x^3, 10^-4, a_1, a_2, H_2SO_4, Na^+, v_max. Do NOT paste the Unicode symbols (² ³ ₂) — they are missing from the board's font and come out as garbage; \`^\` and \`_\` are the ONLY way to get them. A script is ONE token: a number ("x^2", "10^-3") or a single letter ("x^n"). Anything longer needs brackets: "x^(n+1)", "e^(2x)". A lone "^" with nothing after it is drawn as an ordinary caret, so prose is safe.
 - Colours: black default, blue for given values, red for mistakes or warnings, green for results, orange for emphasis, purple for formulas.
-- Do not redraw what is already on the board. Point at it with a highlight or arrow and build on it.
-- Permanent vs. pointing: anything that is part of the finished notes (the number line, shapes, labels, formulas, values, answers) is permanent — draw it once and leave it. When you only want to POINT at something while you talk ("look here", "this gap", "from 1 to 3"), use an arrow/line/highlight with "temp":true: it fades away on its own after a moment, so repeated gestures never pile up on top of the diagram. Never mark permanent structure temp, and never redraw the same permanent element to re-point at it — use a temp arrow instead. NOTE: an \`arrow\` is treated as a pointing gesture and fades automatically; add "temp":false ONLY for the rare arrow that is genuinely part of the finished notes.
-- If the student drew something (it is listed in CANVAS as "student", with positions and any text), read that description, react to it specifically, and build on it.
+- Permanent vs. pointing: anything that is part of the finished notes (figures, labels, formulas, values, answers) is permanent — draw it once and leave it. When you only want to POINT at something while you talk ("look here", "this side"), use highlight {at:<id or part>} or arrow {to:<id>}: it fades away on its own, so repeated gestures never pile up. Never mark permanent structure temp, and never redraw a permanent element to re-point at it.
 
 ${exampleSection}
 
@@ -294,7 +283,7 @@ export function buildExplainSystemPrompt(opts: {
 ${planBlock}
 # THIS TURN — work a SPECIFIC textbook item the student named (Example / Exercise / Theorem)
 The student asked you to explain or solve a particular item from their textbook. The passages above include the exact one (it is labelled, e.g. "Chapter 4 · Example 2" or "Exercise 4.1 · Q3" or "Theorem 1.2").
-- Teach THAT exact item — its real statement, values and method — worked step by step as a full teaching turn (this is NOT a quick side note; draw it out properly). It gets its own fresh page, so start at the top-left as the CANVAS block says.
+- Teach THAT exact item — its real statement, values and method — worked step by step as a full teaching turn (this is NOT a quick side note; draw it out properly). It gets its own fresh page.
 - Use the item's actual numbers and the book's method; do not substitute a different example from memory.
 - Work it at FULL granularity: core pedagogy rule 12 applies — one elementary move per line, every piece of arithmetic shown, and the rule named before each step that uses one. A correct answer with steps missing is a failed turn.
 - 4-12 beats; take as many as the working honestly needs and never merge steps to fit a smaller number. End on a clean statement once the item is fully worked. Do not quiz the student.`;
@@ -327,8 +316,6 @@ export function buildSolveSystemPrompt(opts: {
   /** True when the question refers to data (a figure, a table, a list of parts) that
    *  lived in the PDF as an image and so is NOT in the text we have. */
   dataInFigure?: boolean;
-  /** Page-local y where the question block ends and the solution should start. */
-  startY?: number;
   /** The question lines already written on the board, so the model does not repeat them. */
   boardQuestion?: string[];
 }): string {
@@ -338,7 +325,7 @@ export function buildSolveSystemPrompt(opts: {
     ? `\n# ALREADY ON THE BOARD (you did not write this — do not write it again)
 The heading and the full question text are already written at the top of this page:
 ${opts.boardQuestion.map((l) => `    ${l}`).join("\n")}
-Your FIRST beat starts the SOLUTION at y≈${Math.round(opts.startY ?? 200)} — its first draw op is a step of the working, not a restatement.
+Your FIRST beat starts the SOLUTION — its first draw op is a step of the working, not a restatement; it is placed under the question for you.
 Do NOT write a title, a heading, a "Q4: ..." line, or any paraphrase of the question: it is already up there and repeating it wastes the page. Never use the "clear" op — it would erase it.\n`
     : "";
 
@@ -531,7 +518,7 @@ export function buildTeachSystemPrompt(opts: {
     ? `You are now teaching STEP ${step + 1} of ${plan.steps.length}: "${current.title}".
 What to explain: ${current.teach || current.title}
 What the board should show: ${current.draw || "draw whatever best visualises this step"}
-  ^ Pick the diagram op that draws THAT, from the shortlist above, before you write any prose.`
+  ^ That hint is for YOU, not the student: turn it into the figure op from the shortlist above inside a beat's "draw" — never repeat it as a sentence.`
     : `Teach the next sensible step for this topic.`;
 
   return `${base}
@@ -553,12 +540,15 @@ ${planOutline(plan)}
 
 # THIS TURN
 ${stepBlock}
-- Teach ONLY this step, as 4-8 beats, then stop. Do NOT jump ahead to later steps or re-teach earlier ones.
+- Teach ONLY this step, as 4-10 beats, then stop. Do NOT jump ahead to later steps or re-teach earlier ones.
+- The step named above is the ONLY thing to teach, whatever the conversation so far says. If the previous step stopped short or promised more ("let us now compute…"), that work is over — do NOT finish it here. Teaching the previous step's leftovers under this step's heading puts every page after it one step out of place.
+- FINISH what you start inside this step. Never end on a promise of work still to come ("now let us compute the ratios") — if the step includes a computation, the computation and its result are on this step's page before you stop.
 - TEACH IT PROPERLY — this is the difference between a summary and a lesson. Core pedagogy rule 12 applies here as it does to a worked example: ONE elementary move per line, every piece of arithmetic written out rather than done in your head, and the rule or definition NAMED before each step that uses it. A line the student cannot get to from the line above it means you skipped a step. Say WHY as well as what: where a formula comes from, why this method and not another, what goes wrong if you forget this condition. A step that is correct but bare has failed — the student learning this for the first time needs the reasoning, not the result.
-- Do not rush to fit a smaller number of beats. 4 is the floor for a real subtopic, not the target; take 6, 7 or 8 when the idea genuinely has that much in it, and let an easy idea finish in 4.
-- This step gets a FRESH BLANK PAGE of its own — one subtopic, its own page or pages. Start at its top-left as the CANVAS block says and use the whole page. Earlier steps are on earlier pages, which the student can flip back to, so never redraw them and never use the "clear" op.
-- The page ALREADY HAS ITS HEADING: the step's number and title are written at the top, with a thick rule under them, before you draw anything (the client does this, not you). So do NOT write the step title, the topic name, a heading or a number anywhere — start straight in on the teaching content. Your first beat is placed below that rule automatically; you do not need to leave room for it or know where it ends.
-- If this step needs more room than one page, just keep going: a beat that does not fit continues on a fresh page by itself, and that continuation page carries no heading, so a long subtopic reads as one stretch. Never cut a subtopic short to make it fit a page.
+- Do not rush to fit a smaller number of beats. 4 is the floor for a real subtopic, not the target; take 6 to 10 when the idea genuinely has that much in it (a worked computation of several values usually does), and let an easy idea finish in 4.
+- This step gets a FRESH PAGE of its own — one subtopic, its own page or pages. Earlier steps are on earlier pages, which the student can flip back to, so never redraw them and never use the "clear" op.
+- The page ALREADY HAS ITS HEADING: the step's number and title are written at the top, with a thick rule under them, before you draw anything (the client does this, not you). So do NOT write the step title, the topic name, a heading or a number anywhere — start straight in on the teaching content; it is placed under the rule for you.
+- If this step needs more room than one page, just keep going: what does not fit continues on a fresh page by itself, and that continuation page carries no heading, so a long subtopic reads as one stretch. Never cut a subtopic short to make it fit a page.
+- The step's figure is ONE figure op (usually a polygon with every vertex labelled) in an early beat; later beats annotate that same figure by name (angle at, text at, highlight at) as the explanation proceeds. Never a second copy of it. And never DESCRIBE the drawing in words: a reply that says "Draw a right triangle ABC…" instead of emitting the polygon op is discarded entirely.
 - The student has already heard a one-line preview of this step (you wrote it as the step's roadmap line), so do not open by announcing what you are about to do — start teaching.
 - IMPORTANT (overrides the ASK pedagogy above): in this guided lesson do NOT end with a checkpoint question and do NOT quiz the student between steps. Always end this step on a clear, complete STATEMENT. The student will interrupt on their own if they have a doubt, and the lesson advances to the next step automatically.
 ${isLast ? '- This is the LAST step. After teaching it, close the topic and offer a textbook-style practice example (this closing offer is the one place a question is allowed).' : '- End on a clean statement that rounds off this step so the lesson can flow into the next one.'}`;
@@ -900,9 +890,9 @@ const LANGUAGE_RULES: Record<string, LanguageRule> = {
       "NEVER use Hindi, Hinglish, Devanagari or any other language or script, even for a single word (English is the whole reply).",
     technicalTerms: "Technical terms are English anyway (\"velocity\", \"numerator\").",
     sayLang: "en-IN",
-    exampleBeats: `{"say":"Good question. Let's see it with a pizza.","lang":"en-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
-{"say":"Here is a pizza cut into 4 equal slices.","lang":"en-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
-{"say":"You ate 2 slices, so that is 2 out of 4.","lang":"en-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"eaten = 2 of 4","color":"blue"}]}
+    exampleBeats: `{"say":"Good question. Let's see it with a pizza.","lang":"en-IN","draw":[{"op":"text","id":"t1","text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
+{"say":"Here is a pizza cut into 4 equal slices.","lang":"en-IN","draw":[{"op":"ellipse","id":"p1","x":0,"y":0,"w":200,"h":200},{"op":"line","id":"l1","x":100,"y":0,"x2":100,"y2":200},{"op":"line","id":"l2","x":0,"y":100,"x2":200,"y2":100}]}
+{"say":"You ate 2 slices, so that is 2 out of 4.","lang":"en-IN","draw":[{"op":"highlight","id":"h1","x":0,"y":0,"w":100,"h":200},{"op":"text","id":"t2","text":"eaten = 2 of 4","color":"blue"}]}
 {"say":"Now look: is the highlighted part half the pizza, or less?","lang":"en-IN","draw":[]}`,
     openerSay: "Okay, let's see this on the board.",
     formulaReading: "\"F equals m into a\", \"x square plus two x\"",
@@ -918,9 +908,9 @@ const LANGUAGE_RULES: Record<string, LanguageRule> = {
       "NEVER use Devanagari (हिन्दी script) anywhere. Write Hindi words in Roman letters (\"samajh\", not \"समझ\"; \"chalo\", not \"चलो\"). Mix freely: Hindi connectors with English technical terms, the way a Hindi-medium teacher explains in a Delhi classroom. Pure-English paragraphs are also NOT allowed — every reply must feel Hinglish.",
     technicalTerms: "Technical terms stay in English (\"velocity\", \"numerator\", \"atom\", \"molecule\") — this is natural Hinglish.",
     sayLang: "en-IN",
-    exampleBeats: `{"say":"Achha, chalo isko pizza se samajhte hain.","lang":"en-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
-{"say":"Yeh ek pizza hai jisko maine 4 barabar tukdon mein kaata.","lang":"en-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
-{"say":"Tumne 2 tukde kha liye, matlab 2 by 4.","lang":"en-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"khaye = 2 tukde of 4","color":"blue"}]}
+    exampleBeats: `{"say":"Achha, chalo isko pizza se samajhte hain.","lang":"en-IN","draw":[{"op":"text","id":"t1","text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
+{"say":"Yeh ek pizza hai jisko maine 4 barabar tukdon mein kaata.","lang":"en-IN","draw":[{"op":"ellipse","id":"p1","x":0,"y":0,"w":200,"h":200},{"op":"line","id":"l1","x":100,"y":0,"x2":100,"y2":200},{"op":"line","id":"l2","x":0,"y":100,"x2":200,"y2":100}]}
+{"say":"Tumne 2 tukde kha liye, matlab 2 by 4.","lang":"en-IN","draw":[{"op":"highlight","id":"h1","x":0,"y":0,"w":100,"h":200},{"op":"text","id":"t2","text":"khaye = 2 tukde of 4","color":"blue"}]}
 {"say":"Ab dekho, yeh highlighted hissa pure pizza ka kitna hai? Aadha, ya kam?","lang":"en-IN","draw":[]}`,
     openerSay: "Achha, chalo ise board pe dekhte hain.",
     formulaReading: "\"F barabar m into a\", \"x square plus two x\"",
@@ -936,9 +926,9 @@ const LANGUAGE_RULES: Record<string, LanguageRule> = {
       "NEVER use Latin letters for Hindi words. Write every Hindi word in Devanagari (\"समझ\", not \"samajh\"). The only Latin letters allowed are standard English technical terms (velocity, numerator, atom) and math symbols.",
     technicalTerms: "Technical terms may stay in English in their Latin form (\"velocity\", \"numerator\", \"atom\"), the way Indian teachers speak — do NOT transliterate them into Devanagari.",
     sayLang: "hi-IN",
-    exampleBeats: `{"say":"अच्छा, चलो इसे पिज़्ज़ा से समझते हैं।","lang":"hi-IN","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
-{"say":"यह एक पिज़्ज़ा है जिसे मैंने 4 बराबर टुकड़ों में काटा।","lang":"hi-IN","draw":[{"op":"ellipse","id":"p1","x":700,"y":80,"w":200,"h":200},{"op":"line","id":"l1","x":800,"y":80,"x2":800,"y2":280},{"op":"line","id":"l2","x":700,"y":180,"x2":900,"y2":180}]}
-{"say":"तुमने 2 टुकड़े खा लिए, मतलब 4 में से 2।","lang":"hi-IN","draw":[{"op":"highlight","id":"h1","x":700,"y":80,"w":100,"h":200},{"op":"text","id":"t2","x":80,"y":160,"text":"खाये = 4 में से 2","color":"blue"}]}
+    exampleBeats: `{"say":"अच्छा, चलो इसे पिज़्ज़ा से समझते हैं।","lang":"hi-IN","draw":[{"op":"text","id":"t1","text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}
+{"say":"यह एक पिज़्ज़ा है जिसे मैंने 4 बराबर टुकड़ों में काटा।","lang":"hi-IN","draw":[{"op":"ellipse","id":"p1","x":0,"y":0,"w":200,"h":200},{"op":"line","id":"l1","x":100,"y":0,"x2":100,"y2":200},{"op":"line","id":"l2","x":0,"y":100,"x2":200,"y2":100}]}
+{"say":"तुमने 2 टुकड़े खा लिए, मतलब 4 में से 2।","lang":"hi-IN","draw":[{"op":"highlight","id":"h1","x":0,"y":0,"w":100,"h":200},{"op":"text","id":"t2","text":"खाये = 4 में से 2","color":"blue"}]}
 {"say":"अब देखो, यह highlighted हिस्सा पूरे पिज़्ज़े का कितना है — आधा, या कम?","lang":"hi-IN","draw":[]}`,
     openerSay: "अच्छा, चलो इसे बोर्ड पर देखते हैं।",
     formulaReading: "\"F बराबर m into a\", \"x square plus two x\"",
@@ -1054,7 +1044,7 @@ function languageRule(code: string): LanguageRule {
     technicalTerms:
       "Technical terms may stay in English in their Latin form (\"velocity\", \"numerator\", \"atom\") — do NOT transliterate them.",
     sayLang: r.sayLang,
-    exampleBeats: `{"say":"${r.exampleFirst}","lang":"${r.sayLang}","draw":[{"op":"text","id":"t1","x":80,"y":80,"text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}`,
+    exampleBeats: `{"say":"${r.exampleFirst}","lang":"${r.sayLang}","draw":[{"op":"text","id":"t1","text":"2/4 = 1/2 ?","size":"lg","color":"purple"}]}`,
     openerSay: r.openerSay,
     formulaReading: `read numbers and operators naturally in ${r.name.split(" (")[0]}, keep technical terms in English`,
     textbookOfferSay: r.textbookOfferSay,

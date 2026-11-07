@@ -16,6 +16,13 @@
  * exponent on top of the word before it.
  */
 const EXCALIDRAW_FONT = '16px Excalifont, Virgil, "Segoe UI", Helvetica, Arial, sans-serif';
+/**
+ * Excalidraw's "Helvetica" family (id 2), which a page switches to once it needs
+ * a glyph Excalifont lacks (√, θ, ≤ …). It is markedly narrower than the hand
+ * font, so a superscript placed from Excalifont widths floats away from its
+ * base ("AB ²") once the page is drawn in this one.
+ */
+const MATH_FONT = '16px Helvetica, Arial, sans-serif';
 
 let ctx: CanvasRenderingContext2D | null | undefined;
 function context(): CanvasRenderingContext2D | null {
@@ -77,12 +84,16 @@ export function fontsReady(): Promise<void> {
   return readyPromise;
 }
 
-/** Approximate rendered width (px) of `text` at the given font size. */
-export function measureText(text: string, fontPx: number): number {
+/**
+ * Approximate rendered width (px) of `text` at the given font size, in the hand
+ * font — or in the math fallback font when `math` is set (a page that has
+ * latched onto it; see BoardPlayer.adoptMathFont).
+ */
+export function measureText(text: string, fontPx: number, math = false): number {
   if (!text) return 0;
   const c = context();
-  if (c && excalifontLoaded()) {
-    c.font = EXCALIDRAW_FONT.replace("16px", `${fontPx}px`);
+  if (c && (math || excalifontLoaded())) {
+    c.font = (math ? MATH_FONT : EXCALIDRAW_FONT).replace("16px", `${fontPx}px`);
     const w = c.measureText(text).width;
     if (w > 0) return w;
   }

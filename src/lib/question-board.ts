@@ -204,6 +204,23 @@ export function layoutQuestion(opts: {
 }
 
 /**
+ * Rewrite the client's board summary to admit the question block is there.
+ *
+ * The client summarises the page BEFORE the question lands on it, so a solve
+ * turn's CANVAS said "this page is blank" while the system prompt said the
+ * question was already written. The fast tier believes the CANVAS, which is the
+ * last thing it reads. The client keeps the solution under the block regardless
+ * (BoardPlayer.drawQuestionBlock); this just stops the two instructions
+ * contradicting each other.
+ */
+export function canvasWithQuestion(canvas: string): string {
+  return canvas.replace(
+    "(this page is blank)",
+    "(the heading and question are already written at the top of this page — do not write them again; your solution flows under them automatically)",
+  );
+}
+
+/**
  * The question as a single opening beat: nothing spoken, the board written.
  *
  * `say` is empty on purpose — the model's first beat does the talking, and this

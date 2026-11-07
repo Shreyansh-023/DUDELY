@@ -1,4 +1,5 @@
 import type { DrawOp } from "../../schema";
+import { hasMathNotation } from "../mathtext";
 import { expandAngle } from "./angle";
 import { expandApparatus } from "./apparatus";
 import { expandAxes } from "./axes";
@@ -10,6 +11,7 @@ import { expandFraction } from "./fraction";
 import { expandGraph } from "./graph";
 import { expandIncline } from "./incline";
 import { expandLabeled } from "./labeled";
+import { expandMathText } from "./mathline";
 import { expandMolecule } from "./molecule";
 import { expandNet } from "./net";
 import { expandNumberLine } from "./numberline";
@@ -61,5 +63,27 @@ export const PRIMITIVES: Record<string, (op: DrawOp) => Expanded> = {
   incline: expandIncline,
   timeline: expandTimeline,
 };
+
+/**
+ * A figure's own labels can carry notation too — a side marked "√2", a table
+ * cell "√3/2", an axis titled "x^2" — and a plain text element cannot draw
+ * any of it. Each such child is lowered to its runs and strokes, exactly as a
+ * free text op would be, so the figure's labels read like the notes around it.
+ */
+export function lowerMathChildren(ex: Expanded): Expanded {
+  if (!ex.ops.some((o) => o.op === "text" && hasMathNotation(o.text))) return ex;
+  const ops: DrawOp[] = [];
+  for (const o of ex.ops) {
+    if (o.op === "text" && hasMathNotation(o.text)) ops.push(...expandMathText(o).ops);
+    else ops.push(o);
+  }
+  return { ...ex, ops };
+}
+
+/** Expand a primitive op, with its labels' notation lowered. Null for a non-primitive. */
+export function expandPrimitive(op: DrawOp): Expanded | null {
+  const fn = PRIMITIVES[op.op];
+  return fn ? lowerMathChildren(fn(op)) : null;
+}
 
 export type { Expanded };

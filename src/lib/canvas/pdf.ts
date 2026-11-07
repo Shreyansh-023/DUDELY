@@ -107,12 +107,22 @@ async function renderPage(
   // its PAGE-LOCAL position on a full 1280x720 sheet, which keeps every page
   // the same size and keeps the lesson's own margins.
   const rect = player.pageSceneRect(index);
+  // `getDimensions` returns the CANVAS size, not the scene size: Excalidraw does
+  // `canvas.width = ret.width` and then renders the scene at `ret.scale`. So the
+  // width/height must already include the scale. Returning the unscaled (w, h)
+  // with scale 2 draws a 2x scene into a 1x canvas, and only the top-left
+  // quarter of every page survives: lines cut off halfway across, and the
+  // lower half of the page missing entirely.
   const src = await exportToCanvas({
     elements,
     files: null,
     exportPadding: 0,
     appState: { exportBackground: false, viewBackgroundColor: "transparent" },
-    getDimensions: (w, h) => ({ width: w, height: h, scale: RASTER_SCALE }),
+    getDimensions: (w, h) => ({
+      width: Math.ceil(w * RASTER_SCALE),
+      height: Math.ceil(h * RASTER_SCALE),
+      scale: RASTER_SCALE,
+    }),
   });
 
   // Where that crop sits inside the page.
