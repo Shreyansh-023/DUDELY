@@ -9,6 +9,10 @@ const nextConfig: NextConfig = {
   cacheComponents: true,
   partialPrefetching: true,
   reactCompiler: true,
+  experimental: {
+    // Keep agent-driven upgrades scoped to security advisories.
+    agentUpgrade: "security",
+  },
   turbopack: {
     rules: {
       "*.css": {

@@ -2755,7 +2755,8 @@ export default function Tutor() {
                   setChatPanelOpen(true);
                 } else {
                   setChatPanelOpen(false);
-                  if (voicePhaseRef.current === "paused") voice.resume();
+                  // Don't grab the mic on the way back — wait for Enter.
+                  if (voicePhaseRef.current === "paused") voice.standBy();
                 }
               }}
               title={chatPanelOpen ? "Back to voice" : "Type instead"}
